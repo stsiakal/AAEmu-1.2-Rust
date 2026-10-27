@@ -70,12 +70,23 @@ Scripts/lane.sh land                        # merge into main, then delete the w
   untracked `rust/.cargo/config.toml`). Memory, not CPU, is the limit with three sessions; stop
   stacks and clients you no longer need.
 
-## Workflow: Claude orchestrates and reviews, Sonnet subagents run the tasks
+## Workflow: Opus orchestrates, DeepSeek workers implement, Sonnet reviews
 
-- The orchestrating Claude session (Opus) scopes, coordinates and verifies the work. It hands
-  almost all tasks — research and inspection, implementation, routine command/validation runs and
-  live verification — to **Claude Sonnet subagents** (the `Agent` tool with `model: sonnet`). Do not
-  use OpenCode/DeepSeek workers.
+- The orchestrating Claude session (Opus) scopes, coordinates and verifies the work and reads every
+  diff itself before accepting it.
+- **Implementation, captures and live verification go to OpenCode DeepSeek workers**: provider
+  `opencode-go`, model `deepseek-v4.1-flash`, variant `max`, one worker per lane, started with
+  `--dir` set to that lane's worktree. Use the supervisor `D:\aaemu-lanes\workers\run-worker.ps1`
+  (`-Name <n> -Dir <worktree> -TaskFile <file>`, or `-Session <id>` to resume with `run\nudge.txt`);
+  it restarts hung model calls. `stall-watch.ps1` (`-Names 'name=wt\dir,...'`) catches the rest and
+  `done-watch.sh <names>` exits when a worker finishes. After each launch, check with
+  `opencode export <session>` that it runs on opencode-go / deepseek-v4.1-flash / max. Sessions
+  above ~250k tokens of context start hanging: continue in a fresh session with a short handover.
+  In PowerShell, variable names are case-insensitive (`$j` overwrites `$J`): give loop variables
+  distinct names.
+- **Research and the independent review of every change go to Claude Sonnet subagents** (the `Agent`
+  tool with `model: sonnet`); a reviewer never wrote the change it reviews, and workers never start
+  their own reviewers or agents.
 - Make prompts actionable: the concrete question or objective, the relevant files/data with
   `file:line` pointers, constraints (read-only for research), the citations required in the report,
   known uncertainty, the acceptance checks, and the expected concise report. The orchestrator reviews
@@ -91,8 +102,9 @@ Scripts/lane.sh land                        # merge into main, then delete the w
   another session has uncommitted changes in. The orchestrator reviews each worker's lane, runs
   `lane.sh sync` / `check` / `land` (which merges into `main` and removes the lane), and
   confirms with `lane.sh list` that nothing is left behind.
-- Continue a worker with `SendMessage` for sequential small tasks in the same subject (it keeps its
-  context); start a fresh worker with a concise handoff when the subject changes. Keep follow-ups and
+- Continue a worker in the same session for sequential small tasks in the same subject (OpenCode
+  `--session <id>`, Sonnet `SendMessage`); start a fresh worker with a concise handoff when the
+  subject changes. Keep follow-ups and
   reports brief: changes or findings, commands run with results, citations, commit SHA, open issues.
 - Workers do only their assigned task: no sub-agents, no choosing further tasks, no pushing; research
   workers stay read-only. Implementation workers commit to their own branch (Conventional Commits).
@@ -511,8 +523,8 @@ When asked to modify, fix, or improve code, **do not invent conventions**. Inspe
 - Port **1234** often conflicted (e.g. ManyCam): remap Login `InternalNetwork` + Game `LoginNetwork` together or the client shows **Maintenance**.
 - A running `aaemu-game.exe` / `aaemu-login.exe` locks its binary; stop it before `cargo build` rebuilds it.
 - **The owner games on this PC.** Run the original 1.2 client (`D:\AA1.2`, read-only) hidden only and Bevy clients
-  with `--mute` (headless/offscreen); never send real mouse or keyboard input; stop every client you start by its pid;
-  keep compilers at low priority. A debug Bevy client can use about 10 GB of RAM.
+  with `--mute` (headless/offscreen); never send real mouse or keyboard input; stop every client you start by its pid.
+  A debug Bevy client can use about 10 GB of RAM. Workers never start servers outside their own lane.
 - **Never commit real-client screenshots** (copyright): captures stay local; commit text/CSV/JSON evidence only.
 
 ---
