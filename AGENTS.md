@@ -4,10 +4,10 @@ Guidance for coding agents working in this repository.
 
 ## Git remotes: push only to the fork
 
-- **Never push to `origin` or `upstream`** (both are `https://github.com/AAEmu/AAEmu.git`, the
-  upstream project). This covers every branch and tag, including branch deletions.
-- **Only ever push to `fork`** (`https://github.com/NickMesser/AAEmu.git`):
-  `git push -u fork <branch>`. Open pull requests from the fork.
+- **Never push to `origin` or `upstream`** (both are `https://github.com/AAEmu/AAEmu-1.2-Rust.git`,
+  the upstream project). This covers every branch and tag, including branch deletions.
+- **Only ever push to `fork`** (`git@github.com:stsiakal/AAEmu-1.2-Rust.git`, the owner's fork):
+  `git push -u fork <branch>`. Open pull requests from the fork against `AAEmu/AAEmu-1.2-Rust` `main`.
 - This overrides `CONTRIBUTING.md`, which assumes your fork is called `origin`; in this checkout it
   is not.
 - The push URLs of `origin` and `upstream` are disabled in the local git config (`no_push`). Do not
@@ -16,8 +16,11 @@ Guidance for coding agents working in this repository.
   repositories (this one became [`AAEmu/AAEmu-1.2-Rust`](https://github.com/AAEmu/AAEmu-1.2-Rust)).
   Until the owner explicitly says to delete the original repository, never delete, archive, rename
   or transfer `AAEmu/AAEmu`, and never delete any of its branches or tags, by any route (git, `gh`,
-  REST or GraphQL). Copy branches out; never move them. On this machine a Claude Code PreToolUse
-  hook (`~/.claude/hooks/protect-aaemu-upstream.py`) enforces this; do not disable or bypass it.
+  REST or GraphQL). Copy branches out; never move them. (On Nick's machine a Claude Code hook enforces
+  this; on this machine the disabled push URLs are the guard, so never re-enable them.)
+- The previous checkout `C:\Users\stsiakal\AAEmu` (fork `stsiakal/AAEmu`, branch `rust-rewrite-bots`:
+  player bots, ArcheAge Classic addon research, test tooling) is a read-only archive: never delete or
+  rewrite anything there.
 
 ## Sessions work in lanes (mandatory, every session)
 
@@ -28,16 +31,16 @@ locks, ports or processes, so sessions cannot collide.
 
 ```sh
 Scripts/lane.sh gc                          # first: report leftovers of finished sessions
-Scripts/lane.sh new <name> --type fix       # D:/aaemu-wt/<name> on fix/<name>, from rust-rewrite
+Scripts/lane.sh new <name> --type fix       # D:/aaemu-wt/<name> on fix/<name>, from main
 cd D:/aaemu-wt/<name>                       # edit, build, test and run servers ONLY here
 #   ...focused checks while working, commit (Conventional Commits)...
-Scripts/lane.sh sync                        # merge the latest rust-rewrite into the lane
+Scripts/lane.sh sync                        # merge the latest main into the lane
 Scripts/lane.sh check                       # cargo xtask ci, once, in the lane's warm target dir
-Scripts/lane.sh land                        # merge into rust-rewrite, then delete the whole lane
+Scripts/lane.sh land                        # merge into main, then delete the whole lane
 ```
 
-- **Never work in the integration checkout** (`C:\Users\messe\Documents\GitHub\AAEmu-rust-1.2`,
-  branch `rust-rewrite`): no edits, builds, tests or servers there. It only receives `lane.sh land`
+- **Never work in the integration checkout** (`C:\Users\stsiakal\AAEmu-1.2-Rust`,
+  branch `main`): no edits, builds, tests or servers there. It only receives `lane.sh land`
   merges, which refuse a dirty checkout.
 - **One lane = one worktree = one target dir.** Never point two worktrees at the same target dir:
   identical artifact names make cargo's mtime fingerprints miss edits and tests silently run the
@@ -46,10 +49,11 @@ Scripts/lane.sh land                        # merge into rust-rewrite, then dele
 - **Focused checks while working**: `cargo clippy -p <crate> --all-targets -- -D warnings` and
   `cargo test -p <crate> <filter>`. Do not run `cargo xtask ci` per edit or per worker. The full CI
   runs once per lane in `lane.sh check`; `land` refuses a HEAD that was not checked or does not
-  contain the current `rust-rewrite`, so the merged tree is exactly the tested tree and
-  `rust-rewrite` needs no re-run.
-- **Cleanup is part of done — the bloat is real** (target dirs reach 10–90 GB each and D: is
-  nearly full). Work is not finished until `lane.sh land` or `lane.sh done` has run and
+  contain the current `main`, so the merged tree is exactly the tested tree and
+  `main` needs no re-run. Lane settings for this machine (base `main`, push remote `fork`, MySQL 8.4 on
+  port 3317) are in the untracked `D:/aaemu-lanes/machine.conf`.
+- **Cleanup is part of done — the bloat is real** (target dirs reach 10–90 GB each; keep about
+  30 GB free on D:). Work is not finished until `lane.sh land` or `lane.sh done` has run and
   `Scripts/lane.sh list` no longer shows the lane:
   - landed → `land` already removed it; abandoned → `lane.sh done --force`;
   - branch must survive (pushed for review) → `lane.sh done --keep-branch` (deletes everything else);
@@ -79,13 +83,13 @@ Scripts/lane.sh land                        # merge into rust-rewrite, then dele
   lightweight orientation, coordination, diff/evidence review and the checks needed to verify a
   worker for itself.
 - Run **one small task per worker at a time**; launch as many workers in parallel as the work's
-  independence and the machine allow (~7 GB free RAM, C: nearly full, limited space on D:).
+  independence and the machine allow (62 GB RAM shared with the owner's games, limited space on D:).
   Give each worker one independently reviewable objective.
 - Give parallel workers non-overlapping file ownership. Each parallel implementation worker gets
   its **own lane** (`Scripts/lane.sh new <task>`, see above) and works only in it. D: has room for
   only a few target dirs, so limit concurrent implementation workers accordingly. Never edit files
   another session has uncommitted changes in. The orchestrator reviews each worker's lane, runs
-  `lane.sh sync` / `check` / `land` (which merges into `rust-rewrite` and removes the lane), and
+  `lane.sh sync` / `check` / `land` (which merges into `main` and removes the lane), and
   confirms with `lane.sh list` that nothing is left behind.
 - Continue a worker with `SendMessage` for sequential small tasks in the same subject (it keeps its
   context); start a fresh worker with a concise handoff when the subject changes. Keep follow-ups and
@@ -100,8 +104,6 @@ Scripts/lane.sh land                        # merge into rust-rewrite, then dele
 - The orchestrator independently reviews each diff, checks scope and correctness, and runs focused
   validation before accepting it. `lane.sh check` (`cargo xtask ci` in the lane) must pass before
   `lane.sh land`; the change is complete only once it has landed and the lane is gone.
-- Bug reports from testers come from the shared server on NICK-SERVER; its log paths
-  (`C:\Users\nick server\...`) are not readable from this machine without the owner's SSH login.
 
 > **Starting the servers or the real client?** Read [`AGENT-QUICKSTART.md`](AGENT-QUICKSTART.md)
 > first: lanes, `Scripts/live-stack.sh build|sync|start|client|status|shot|stop`, machine paths,
@@ -456,7 +458,7 @@ When asked to modify, fix, or improve code, **do not invent conventions**. Inspe
 1. **Neighboring code** in the same module and subsystem — this is the primary style guide.
 2. **[`rust/crates/aaemu-game/CONTRIBUTING-PORT.md`](rust/crates/aaemu-game/CONTRIBUTING-PORT.md)** — module layout, shared-file rules, object model, locking rules, testing conventions.
 3. **`rustfmt` + `clippy`** — `cargo fmt --all` and `cargo clippy --workspace --all-targets -- -D warnings` (0 warnings).
-4. **[`CONTRIBUTING.md`](CONTRIBUTING.md)** — branch from `develop`, Conventional Commits, tests with changes.
+4. **[`CONTRIBUTING.md`](CONTRIBUTING.md)** — branch from `main`, Conventional Commits, tests with changes.
 5. **`Docs/wiki/`** — domain language and architecture context:
    - [`Code-Terminology.md`](Docs/wiki/Code-Terminology.md) — game-object hierarchy, in-game terms.
    - [`Components.md`](Docs/wiki/Components.md) — Login/Game roles and data stores.
@@ -508,6 +510,10 @@ When asked to modify, fix, or improve code, **do not invent conventions**. Inspe
 - Detach long-lived GUIs (launcher, server consoles) from the agent shell Job Object or they die when the command ends.
 - Port **1234** often conflicted (e.g. ManyCam): remap Login `InternalNetwork` + Game `LoginNetwork` together or the client shows **Maintenance**.
 - A running `aaemu-game.exe` / `aaemu-login.exe` locks its binary; stop it before `cargo build` rebuilds it.
+- **The owner games on this PC.** Run the original 1.2 client (`D:\AA1.2`, read-only) hidden only and Bevy clients
+  with `--mute` (headless/offscreen); never send real mouse or keyboard input; stop every client you start by its pid;
+  keep compilers at low priority. A debug Bevy client can use about 10 GB of RAM.
+- **Never commit real-client screenshots** (copyright): captures stay local; commit text/CSV/JSON evidence only.
 
 ---
 
