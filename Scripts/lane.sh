@@ -286,7 +286,7 @@ stop_lane_procs() { # stop_lane_procs <live dir> <login port> <target dir or emp
   [ -z "$ids" ] || { echo "stopped processes: $(echo $ids)"; sleep 2; }
 }
 
-cmd_done() {
+cmd_done() (
   local name="" force=0 keep_branch=0
   for a in "$@"; do case "$a" in --force) force=1 ;; --keep-branch) keep_branch=1 ;; *) name=$a ;; esac; done
   allocation_lock
@@ -314,7 +314,7 @@ cmd_done() {
   rm -f "$(reg "$n")"
   [ -d "$WT" ] && echo "note: $WT is still open in some process (a shell's cwd?); gc removes the empty folder later"
   echo "lane $n removed (worktree, target dir, runtime dir, databases$( [ $keep_branch = 1 ] || echo ', branch'))"
-}
+)
 
 cmd_gc() (
   local apply=0 min_age=24
