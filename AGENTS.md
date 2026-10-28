@@ -16,8 +16,10 @@ Guidance for coding agents working in this repository.
   repositories (this one became [`AAEmu/AAEmu-1.2-Rust`](https://github.com/AAEmu/AAEmu-1.2-Rust)).
   Until the owner explicitly says to delete the original repository, never delete, archive, rename
   or transfer `AAEmu/AAEmu`, and never delete any of its branches or tags, by any route (git, `gh`,
-  REST or GraphQL). Copy branches out; never move them. (On Nick's machine a Claude Code hook enforces
-  this; on this machine the disabled push URLs are the guard, so never re-enable them.)
+  REST or GraphQL). Copy branches out; never move them. On this machine a user-level Claude Code
+  PreToolUse hook (`~/.claude/hooks/protect-aaemu-upstream.py`) enforces this and also blocks pushes
+  to, and re-enabling of, the `no_push` remotes; never disable or bypass it, and never re-enable the
+  disabled push URLs.
 - The previous checkout `C:\Users\stsiakal\AAEmu` (fork `stsiakal/AAEmu`, branch `rust-rewrite-bots`:
   player bots, ArcheAge Classic addon research, test tooling) is a read-only archive: never delete or
   rewrite anything there.
