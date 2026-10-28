@@ -8,7 +8,82 @@ use futures::future::BoxFuture;
 
 use crate::error::Result;
 use crate::net::connection::GameConnection;
+use crate::packets::c2g_world::CSMoveUnitPacket;
 use crate::server::GameServer;
+use crate::systems::housing::packets::{CSConstructHouseTaxPacket, CSCreateHousePacket};
+use crate::systems::skills::handlers::{CSCreateSkillControllerPacket, CSStartSkillPacket};
+use crate::systems::vehicles::packets::{
+    CSBindSlavePacket, CSChangeMateTargetPacket, CSDespawnSlavePacket, CSDiscardSlavePacket,
+    CSMountMatePacket, CSUnMountMatePacket,
+};
+
+/// Packets whose decoded fields are added to the opt-in
+/// [`crate::net::FIELDS_TRACE_TARGET`] trace. The name is the opcode's 1.2 name.
+const FIELD_TRACE_PACKETS: &[&str] = &[
+    "CSCreateHousePacket",
+    "CSConstructHouseTaxPacket",
+    "CSMoveUnitPacket",
+    "CSStartSkillPacket",
+    "CSCreateSkillControllerPacket",
+    "CSChangeMateTargetPacket",
+    "CSMountMatePacket",
+    "CSUnMountMatePacket",
+    "CSBindSlavePacket",
+    "CSDiscardSlavePacket",
+    "CSDespawnSlavePacket",
+];
+
+/// Logs the parsed fields of [`FIELD_TRACE_PACKETS`] packets. Only called when the field
+/// trace is enabled, so `Debug` formatting costs nothing otherwise.
+fn trace_fields<P: ClientPacket>(packet: &P) {
+    use std::any::Any;
+
+    if !FIELD_TRACE_PACKETS.contains(&P::NAME) {
+        return;
+    }
+    let any = packet as &dyn Any;
+    if let Some(mov) = any.downcast_ref::<CSMoveUnitPacket>() {
+        tracing::trace!(
+            target: crate::net::FIELDS_TRACE_TARGET,
+            "C->S CSMoveUnitPacket fields: obj_id={} move_type={:?} flags={:?} position={:?} rotation={:?} velocity={:?} detail={:?}",
+            mov.obj_id,
+            mov.move_type.move_type(),
+            mov.move_type.flags,
+            mov.move_type.position(),
+            mov.move_type.base_rotation(),
+            mov.move_type.velocity(),
+            mov.move_type
+        );
+        return;
+    }
+    macro_rules! log_debug {
+        ($($ty:ty),* $(,)?) => {
+            $(
+                if let Some(packet) = any.downcast_ref::<$ty>() {
+                    tracing::trace!(
+                        target: crate::net::FIELDS_TRACE_TARGET,
+                        "C->S {} fields: {:?}",
+                        P::NAME,
+                        packet
+                    );
+                    return;
+                }
+            )*
+        };
+    }
+    log_debug!(
+        CSCreateHousePacket,
+        CSConstructHouseTaxPacket,
+        CSStartSkillPacket,
+        CSCreateSkillControllerPacket,
+        CSChangeMateTargetPacket,
+        CSMountMatePacket,
+        CSUnMountMatePacket,
+        CSBindSlavePacket,
+        CSDiscardSlavePacket,
+        CSDespawnSlavePacket,
+    );
+}
 
 /// Type-erased handler: reads the packet body and runs its behaviour (`Read` + `Execute`).
 pub type HandlerFn =
@@ -35,6 +110,12 @@ fn dispatch<'a, P: ClientPacket>(
     match P::read(&mut stream) {
         Ok(packet) => {
             tracing::debug!("GamePacket: C->S {} conn={}", P::NAME, conn.id);
+            if tracing::enabled!(
+                target: crate::net::FIELDS_TRACE_TARGET,
+                tracing::Level::TRACE
+            ) {
+                trace_fields(&packet);
+            }
             packet.handle(server, conn)
         }
         Err(e) => {
@@ -105,5 +186,79 @@ impl PacketRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.packets.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trace_fields;
+    use crate::systems::housing::packets::CSCreateHousePacket;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Capture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn field_trace_logs_decoded_house_fields() {
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            trace_fields(&CSCreateHousePacket {
+                design_id: 42,
+                x: 1.5,
+                y: -2.25,
+                z: 3.0,
+                z_rot: 0.75,
+                item_id: 9,
+                money_amount: 100,
+                ht: 2,
+                auto_use_aa_point: true,
+            });
+        });
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("C->S CSCreateHousePacket fields:"),
+            "{output}"
+        );
+        assert!(output.contains("design_id: 42"), "{output}");
+        assert!(output.contains("z_rot: 0.75"), "{output}");
+        assert!(output.contains("auto_use_aa_point: true"), "{output}");
+    }
+
+    #[test]
+    fn field_trace_ignores_unlisted_packets() {
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            trace_fields(&crate::packets::c2g_world::CSNotifyInGameCompletedPacket);
+        });
+        assert!(capture.0.lock().unwrap().is_empty());
     }
 }
