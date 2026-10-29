@@ -923,10 +923,40 @@ async fn play_objective(
                     .await
                     .map_err(|e| format!("using item {item}: {e:#}"))?;
             } else {
-                let me = session.game.state.self_obj;
+                let target = match catalog.skill_targets.get(&use_skill) {
+                    Some(t) if t.npc != 0 => goto_npc(session, catalog, t.npc, anchor, deadline)
+                        .await
+                        .map_err(|e| format!("use-item npc {}: {e}", t.npc))?,
+                    Some(t) if t.npc_group != 0 => {
+                        let members = catalog
+                            .skill_npc_groups
+                            .get(&t.npc_group)
+                            .cloned()
+                            .unwrap_or_default();
+                        let npc =
+                            best_member(session, catalog, &members, anchor).ok_or_else(|| {
+                                format!("skill group {} has no spawned member", t.npc_group)
+                            })?;
+                        goto_npc(session, catalog, npc, anchor, deadline)
+                            .await
+                            .map_err(|e| format!("use-item npc {npc}: {e}"))?
+                    }
+                    _ => session.game.state.self_obj,
+                };
+                if target != session.game.state.self_obj
+                    && catalog
+                        .skill_targets
+                        .get(&use_skill)
+                        .is_some_and(|t| t.hp_max > 0)
+                {
+                    // Setup: the item only works on an injured target (< hp_max percent).
+                    let _ = session.game.change_target(target).await;
+                    let _ = gm_command(&mut session.game, "damage 60 %").await;
+                    let _ = session.pump_fast(600).await;
+                }
                 session
                     .game
-                    .start_item_skill(use_skill, stack, item, me)
+                    .start_item_skill(use_skill, stack, item, target)
                     .await
                     .map_err(|e| format!("using item {item}: {e:#}"))?;
             }

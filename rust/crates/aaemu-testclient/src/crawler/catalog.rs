@@ -184,6 +184,14 @@ pub struct ItemInfo {
     pub use_skill: u32,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SkillTarget {
+    pub npc: u32,
+    pub npc_group: u32,
+    /// The skill requires the target HP to be at most this percentage (0 = no limit).
+    pub hp_max: u32,
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct DoodadSkills {
     /// Template -> the func group the level data spawns it with.
@@ -207,6 +215,10 @@ pub struct Catalog {
     pub item_groups: HashMap<u32, Vec<u32>>,
     pub items: HashMap<u32, ItemInfo>,
     pub doodad_skills: DoodadSkills,
+    /// Use skill -> the NPC / NPC group it has to be cast on (`Skill` unit requirements).
+    pub skill_targets: HashMap<u32, SkillTarget>,
+    /// NPC groups used by skill requirements (not the quest monster groups).
+    pub skill_npc_groups: HashMap<u32, Vec<u32>>,
     pub zones: HashMap<u32, String>,
 }
 
@@ -368,6 +380,22 @@ impl Catalog {
             "quest_item_group_items",
             "quest_item_group_id",
             "item_id",
+        )?;
+        cat.skill_npc_groups = load_groups(&conn, "npc_group_members", "npc_group_id", "npc_id")?;
+        for_each_row(
+            &conn,
+            "SELECT * FROM unit_reqs WHERE owner_type = 'Skill' AND kind_id IN (26, 27, 34)",
+            [],
+            |r| {
+                let skill = r.u32("owner_id")?;
+                let entry = cat.skill_targets.entry(skill).or_default();
+                match r.u32("kind_id")? {
+                    27 => entry.npc = r.u32("value1")?,
+                    34 => entry.npc_group = r.u32("value1")?,
+                    _ => entry.hp_max = r.u32("value2")?,
+                }
+                Ok(())
+            },
         )?;
 
         // ---- quest templates / components / acts --------------------------------
@@ -960,18 +988,6 @@ impl Catalog {
             cat.items.insert(id, info);
         }
 
-        cat.npc_groups = load_groups(
-            &conn,
-            "quest_monster_npcs",
-            "quest_monster_group_id",
-            "npc_id",
-        )?;
-        cat.item_groups = load_groups(
-            &conn,
-            "quest_item_group_items",
-            "quest_item_group_id",
-            "item_id",
-        )?;
         cat.load_doodad_skills(&conn)?;
         // Doodad objectives whose template offers no skill in any func group cannot be played
         // through a real packet; report them as unsupported instead of failing at runtime.
