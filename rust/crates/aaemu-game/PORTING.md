@@ -2472,11 +2472,16 @@ Additional world-side fixes from the same audit:
   summoned hull). The exclusion is keyed on `doodad_owner_type::SLAVE` and therefore also
   covers cart equipment.
 * Summon placement probes the collision-world ground (`ground_height_probe`, mask
-  static+terrain) at the candidate centre and at the hull fore/aft points instead of trusting
+  static+terrain) at the candidate centre and around the hull footprint instead of trusting
   the heightmap alone; a probe miss (`Some(None)`) falls back to the terrain elevation (then
-  the heightmap) rather than "bottomless water". If no forward candidate is deep enough, the
-  spot 5 m in front of the owner is used when it clears the same depth test (its centre only;
-  no further placement search).
+  the heightmap) rather than "bottomless water". The fore/aft probes use the scaled hull
+  footprint the solid CryPhysics hull uses (the clipped authored collision bounds, else the
+  mass box) at the ship's FINAL yaw (owner yaw + 90°), at its asymmetric bow/stern extents and
+  beam corners; the forward search still moves the centre along the player's facing. If no
+  forward candidate is deep enough, the spot 5 m in front of the owner is used when it clears
+  the same depth test (its centre only; no further placement search), placed at the water
+  surface there rather than at the owner's z (a pier or deck must not leave the hull in the
+  air).
 
 Remaining packet stubs and table candidates are still subject to behavior review. Missing SQL
 mentions do not establish disuse (some names are selected dynamically); empty tables, client

@@ -1931,6 +1931,97 @@ fn summon_floor(probe: Option<Option<f32>>, terrain: impl FnOnce() -> f32) -> f3
     }
 }
 
+/// The hull footprint of the summon depth probes at `scale`: the authored collision bounds the
+/// CryPhysics hull uses when available, else the inertia mass box. `length` is the asymmetric
+/// (stern, bow) extent along the hull's local length axis, in metres; the mass box's `size_y`
+/// is the hull length and `size_x` its beam.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct HullFootprint {
+    /// Half extent across the hull (local X), metres.
+    pub half_beam: f32,
+    /// (stern, bow) extents along the hull's local length axis (local Y), metres.
+    pub length: (f32, f32),
+}
+
+pub(crate) fn hull_footprint(
+    bounds: Option<&aaemu_physics::geometry::primitives::BoxPrim>,
+    mass_box_size_x: f32,
+    mass_box_size_y: f32,
+    scale: f32,
+) -> HullFootprint {
+    let s = scale.max(0.01);
+    match bounds {
+        Some(b) => HullFootprint {
+            half_beam: b.size.x * s,
+            length: ((b.center.y - b.size.y) * s, (b.center.y + b.size.y) * s),
+        },
+        None => HullFootprint {
+            half_beam: mass_box_size_x * 0.5 * s,
+            length: (-mass_box_size_y * 0.5 * s, mass_box_size_y * 0.5 * s),
+        },
+    }
+}
+
+/// The XY points the summon depth probe checks for a hull centred at (`x`, `y`) and lying along
+/// `yaw` (the FINAL ship yaw, not the player's facing): both centreline ends and the four beam
+/// corners of the footprint. `yaw` rotates the local length axis to the world.
+pub(crate) fn hull_probe_points(
+    x: f32,
+    y: f32,
+    yaw: f32,
+    footprint: HullFootprint,
+) -> [(f32, f32); 6] {
+    let (fx, fy) = (-yaw.sin(), yaw.cos());
+    let (rx, ry) = (yaw.cos(), yaw.sin());
+    let mut points = [(x, y); 6];
+    for (end, l) in [footprint.length.0, footprint.length.1]
+        .into_iter()
+        .enumerate()
+    {
+        let (ox, oy) = (x + fx * l, y + fy * l);
+        points[end * 3] = (ox, oy);
+        points[end * 3 + 1] = (ox - rx * footprint.half_beam, oy - ry * footprint.half_beam);
+        points[end * 3 + 2] = (ox + rx * footprint.half_beam, oy + ry * footprint.half_beam);
+    }
+    points
+}
+
+/// The `!deep` summon fallback: 5 m in front of the owner along its facing, at the water
+/// surface there (`water_at` is queried at the returned x/y). Never the owner's height: a pier
+/// or deck z would leave the hull floating in the air.
+pub(crate) fn fallback_summon_point(
+    owner_x: f32,
+    owner_y: f32,
+    owner_yaw: f32,
+    water_at: impl FnOnce(f32, f32) -> f32,
+) -> (f32, f32, f32) {
+    let x = owner_x - 5.0 * owner_yaw.sin();
+    let y = owner_y + 5.0 * owner_yaw.cos();
+    (x, y, water_at(x, y))
+}
+
+/// The authored hull bounds `physics::add_ship` gives the CryPhysics hull: the prefab collision
+/// proxies clipped to the hull envelope. `None` when the physics uses the mass box instead
+/// (CryPhysics ships off, or the client assets/model reference are unavailable).
+fn summon_hull_bounds(
+    server: &GameServer,
+    model_id: u32,
+) -> Option<aaemu_physics::geometry::primitives::BoxPrim> {
+    if !server.config.physics.cryphysics_ships {
+        return None;
+    }
+    let ai = &server.game_data.systems.ai.ai;
+    let model = ai.ship_model(model_id)?;
+    let reference = ai.ship_model_refs.get(&model_id)?;
+    let files = crate::systems::ai::collision::files(server)?;
+    let models = crate::systems::ai::collision::model_cache(server, &files);
+    let bounds =
+        crate::systems::ai::physics::cry::model_collision_bounds(&files, &models, reference)?;
+    Some(crate::systems::ai::physics::cry::clip_hull_bounds(
+        bounds, model,
+    ))
+}
+
 // ---------------------------------------------------------------------------------------------
 // Create
 // ---------------------------------------------------------------------------------------------
@@ -2900,6 +2991,14 @@ fn create_spawn_committed(
         if owner.is_some() {
             add_distance_to_front(&mut spawn_pos, template.spawn_y_offset.clamp(5.0, 50.0));
         }
+        // Always spawn horizontal(level) and 90° CCW of the player. The probes below run along
+        // this final yaw, not the player's facing the hull is turned away from.
+        let final_yaw = match owner {
+            Some(o) => {
+                world.world_pos_rot(&WorldObject::from(o)).rot_z + std::f32::consts::PI / 2.0
+            }
+            None => spawner.map_or(0.0, |s| s.def.base.position.yaw),
+        };
         if template.is_a_boat() {
             let water = super::ship_physics::water_surface(
                 server,
@@ -2925,7 +3024,15 @@ fn create_spawn_committed(
             // Enough water for the whole hull: the actual collision-world ground (terrain,
             // rocks, piers), not just the heightmap. A shallow spot under the 30 m hull lets
             // its collision box overlap the ground and CryPhysics ejects the summoned hull.
-            let half_len = ship.mass_box_size_y * 0.5 + 1.0;
+            // The probes cover the scaled footprint the solid physics hull uses (the clipped
+            // authored collision bounds, else the mass box) at the ship's final (turned) yaw,
+            // including the asymmetric bow/stern extents.
+            let footprint = hull_footprint(
+                summon_hull_bounds(server, template.model_id).as_ref(),
+                ship.mass_box_size_x,
+                ship.mass_box_size_y,
+                1.0,
+            );
             let spawn_z = spawn_pos.z;
             let depth_ok = |x: f32, y: f32| {
                 let surface = super::ship_physics::water_surface(server, world, [x, y, spawn_z]);
@@ -2953,11 +3060,10 @@ fn create_spawn_committed(
             while in_front < 50.0 + ship.mass_box_size_x {
                 let mut check = spawn_pos;
                 add_distance_to_front(&mut check, in_front);
-                let mut fore = check;
-                add_distance_to_front(&mut fore, half_len);
-                let mut aft = check;
-                add_distance_to_front(&mut aft, -half_len);
-                if depth_ok(check.x, check.y) && depth_ok(fore.x, fore.y) && depth_ok(aft.x, aft.y)
+                if depth_ok(check.x, check.y)
+                    && hull_probe_points(check.x, check.y, final_yaw, footprint)
+                        .into_iter()
+                        .all(|(px, py)| depth_ok(px, py))
                 {
                     spawn_pos.set_position(
                         check.x,
@@ -2975,16 +3081,20 @@ fn create_spawn_committed(
             if !deep {
                 if let Some(o) = owner {
                     let w = world.world_pos_rot(&WorldObject::from(o));
+                    // The owner may stand on a pier/deck well above the sea; the hull belongs
+                    // on the water surface at the fallback point, not at the owner's height.
+                    let (fx, fy, fz) = fallback_summon_point(w.x, w.y, spawn_pos.rot_z, |x, y| {
+                        super::ship_physics::water_surface(server, world, [x, y, spawn_z])
+                    });
                     let mut fallback = spawn_pos;
                     fallback.set_position(
-                        w.x,
-                        w.y,
-                        w.z,
+                        fx,
+                        fy,
+                        fz,
                         spawn_pos.rot_x,
                         spawn_pos.rot_y,
                         spawn_pos.rot_z,
                     );
-                    add_distance_to_front(&mut fallback, 5.0);
                     if depth_ok(fallback.x, fallback.y) {
                         spawn_pos = fallback;
                     }
@@ -3014,15 +3124,9 @@ fn create_spawn_committed(
             }
         }
         // Always spawn horizontal(level) and 90° CCW of the player
-        let yaw = match owner {
-            Some(o) => {
-                world.world_pos_rot(&WorldObject::from(o)).rot_z + std::f32::consts::PI / 2.0
-            }
-            None => spawner.map_or(0.0, |s| s.def.base.position.yaw),
-        };
         spawn_pos.rot_x = 0.0;
         spawn_pos.rot_y = 0.0;
-        spawn_pos.rot_z = yaw;
+        spawn_pos.rot_z = final_yaw;
     }
 
     if let Some(committed) = &committed {
@@ -4332,5 +4436,163 @@ mod spawn_floor_tests {
         assert_eq!(summon_floor(Some(None), || 3.0), 3.0);
         // None: the collision service is off, use the fallback as well.
         assert_eq!(summon_floor(None, || 3.0), 3.0);
+    }
+}
+
+#[cfg(test)]
+mod summon_probe_tests {
+    use aaemu_physics::geometry::primitives::BoxPrim;
+    use aaemu_physics::math::Vec3;
+
+    use super::{fallback_summon_point, hull_footprint, hull_probe_points};
+
+    // The authored proxy unions of the 1.2 assets from `cry::tests`
+    // (`create_entity_builds_the_clipped_hull_for_longliner_and_cutter`).
+    fn longliner() -> (BoxPrim, f32, f32) {
+        (
+            BoxPrim::aligned(
+                Vec3::new(0.0, 1.935_895_9, 3.577_293_2),
+                Vec3::new(4.577_419, 14.026_104, 5.289_681_4),
+            ),
+            5.0,
+            11.0,
+        )
+    }
+
+    fn cutter() -> (BoxPrim, f32, f32) {
+        (
+            BoxPrim::aligned(
+                Vec3::new(0.000_734_329_2, 5.385_618, 17.994_78),
+                Vec3::new(5.960_227, 22.946_87, 23.838_594),
+            ),
+            6.5,
+            30.0,
+        )
+    }
+
+    /// (along the yaw's length axis, lateral right of it) of `p` from `origin`.
+    fn project(p: (f32, f32), origin: (f32, f32), yaw: f32) -> (f32, f32) {
+        let (dx, dy) = (p.0 - origin.0, p.1 - origin.1);
+        (
+            dx * -yaw.sin() + dy * yaw.cos(),
+            dx * yaw.cos() + dy * yaw.sin(),
+        )
+    }
+
+    #[test]
+    fn probes_lie_on_the_authored_length_axis_at_the_final_ship_yaw() {
+        let origin = (0.0, 0.0);
+        // Player yaw 0: the ship's final yaw is +90 degrees, so the hull's length axis lies on
+        // world X (the player's facing would put it on Y).
+        let final_yaw = std::f32::consts::FRAC_PI_2;
+        for (name, (bounds, beam, length)) in [("Longliner", longliner()), ("Cutter", cutter())] {
+            let fp = hull_footprint(Some(&bounds), beam, length, 1.0);
+            assert!((fp.half_beam - bounds.size.x).abs() < 1e-5, "{name}");
+            let authored = (
+                bounds.center.y - bounds.size.y,
+                bounds.center.y + bounds.size.y,
+            );
+            assert!(
+                (fp.length.0 - authored.0).abs() < 1e-4,
+                "{name}: {:?}",
+                fp.length
+            );
+            assert!(
+                (fp.length.1 - authored.1).abs() < 1e-4,
+                "{name}: {:?}",
+                fp.length
+            );
+            // Asymmetric: the authored bow/stern extents are not the mass box's half length.
+            assert!(
+                fp.length.0 < -length * 0.5 && fp.length.1 > length * 0.5,
+                "{name}: {:?}",
+                fp.length
+            );
+            let points = hull_probe_points(origin.0, origin.1, final_yaw, fp);
+            for (i, p) in points.iter().enumerate() {
+                let (along, lateral) = project(*p, origin, final_yaw);
+                let expected_along = if i < 3 { fp.length.0 } else { fp.length.1 };
+                let expected_lateral = if i % 3 == 0 { 0.0 } else { fp.half_beam };
+                assert!(
+                    (along - expected_along).abs() < 1e-4,
+                    "{name} point {i}: along {along}, expected {expected_along}"
+                );
+                assert!(
+                    (lateral.abs() - expected_lateral).abs() < 1e-4,
+                    "{name} point {i}: lateral {lateral}, expected {expected_lateral}"
+                );
+                // Final yaw +90 means the length axis is world X: these are just the hull
+                // extents mirrored by the forward direction.
+                assert!(
+                    (p.1 - (if i % 3 == 1 {
+                        -fp.half_beam
+                    } else if i % 3 == 2 {
+                        fp.half_beam
+                    } else {
+                        0.0
+                    }))
+                    .abs()
+                        < 1e-4,
+                    "{name} point {i}: {p:?}"
+                );
+                assert!(
+                    (p.0 + expected_along).abs() < 1e-4,
+                    "{name} point {i}: {p:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn probes_follow_the_rotated_final_yaw() {
+        let player_yaw = 0.3;
+        let final_yaw = player_yaw + std::f32::consts::FRAC_PI_2;
+        let origin = (120.0, -40.0);
+        let fp = hull_footprint(Some(&longliner().0), 5.0, 11.0, 1.0);
+        for (i, p) in hull_probe_points(origin.0, origin.1, final_yaw, fp)
+            .iter()
+            .enumerate()
+        {
+            let (along, lateral) = project(*p, origin, final_yaw);
+            let expected_along = if i < 3 { fp.length.0 } else { fp.length.1 };
+            assert!((along - expected_along).abs() < 1e-3, "point {i}");
+            assert!(
+                (lateral.abs() - if i % 3 == 0 { 0.0 } else { fp.half_beam }).abs() < 1e-3,
+                "point {i}"
+            );
+            // Probing along the player's facing (90 degrees off) would not hit these points.
+            let (_, player_lateral) = project(*p, origin, player_yaw);
+            assert!(
+                (player_lateral.abs() - lateral.abs()).abs() > 0.1,
+                "point {i} is ambiguous between the player's and the ship's axes"
+            );
+        }
+    }
+
+    #[test]
+    fn without_authored_bounds_the_probes_use_the_mass_box() {
+        let fp = hull_footprint(None, 5.0, 11.0, 1.0);
+        assert_eq!(fp.half_beam, 2.5);
+        assert_eq!(fp.length, (-5.5, 5.5));
+        let scaled = hull_footprint(None, 5.0, 11.0, 2.0);
+        assert_eq!(scaled.half_beam, 5.0);
+        assert_eq!(scaled.length, (-11.0, 11.0));
+    }
+
+    #[test]
+    fn fallback_uses_the_water_surface_not_the_owner_height() {
+        let pier_z = 112.0;
+        let water = 100.0;
+        let (x, y, z) = fallback_summon_point(100.0, 200.0, 0.0, |qx, qy| {
+            assert_eq!((qx, qy), (100.0, 205.0));
+            water
+        });
+        assert_eq!(z, water);
+        assert_ne!(z, pier_z);
+        assert!((x - 100.0).abs() < 1e-4 && (y - 205.0).abs() < 1e-4);
+        // Turned player: the fallback still follows the player's facing.
+        let (x, y, _) =
+            fallback_summon_point(100.0, 200.0, std::f32::consts::FRAC_PI_2, |_, _| water);
+        assert!((x - 95.0).abs() < 1e-4 && (y - 200.0).abs() < 1e-4);
     }
 }
