@@ -182,11 +182,7 @@ pub(super) async fn run(
     r.end(s, format!("CSRemoveMate({tl}) sent"));
 
     let s = r.begin("game.leave");
-    game.leave_world(0).await?;
-    game.wait_sc(sc::SCPrepareLeaveWorldPacket).await?;
-    game.drain(Duration::from_millis(300), Duration::from_secs(2))
-        .await
-        .ok();
+    super::coreloop::leave_world(game).await?;
     r.end(s, "left");
     Ok(())
 }

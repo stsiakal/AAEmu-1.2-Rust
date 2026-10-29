@@ -130,6 +130,21 @@ pub(super) fn detached(p: &Packet) -> anyhow::Result<(u32, u8)> {
     Ok((s.read_bc()?, s.read_u8()?))
 }
 
+/// `CSLeaveWorldPacket(quit)` and, for the normal logout timer, `SCLeaveWorldGranted`. Waiting
+/// keeps the next run of the same character from being denied ("enter world denied").
+pub(super) async fn leave_world(game: &mut GameClient) -> anyhow::Result<()> {
+    game.leave_world(0).await?;
+    let prep = game.wait_sc(sc::SCPrepareLeaveWorldPacket).await?;
+    let logout_ms = prep.stream().read_i32().unwrap_or(0);
+    if logout_ms <= 10_000 {
+        game.wait_sc(sc::SCLeaveWorldGrantedPacket).await?;
+    }
+    game.drain(Duration::from_millis(300), Duration::from_secs(2))
+        .await
+        .ok();
+    Ok(())
+}
+
 /// `SCLootBagDataPacket` item count and the item template ids it lists (`LootItem.Write` starts
 /// with slot type, slot, template, fake id, ...).
 pub(super) fn loot_bag_templates(body: &[u8]) -> anyhow::Result<Vec<u32>> {
