@@ -3,6 +3,17 @@
 version = 4
 
 [[package]]
+name = "aaemu-bots"
+version = "0.1.0"
+dependencies = [
+ "aaemu-game",
+ "anyhow",
+ "futures",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "aaemu-clientdriver"
 version = "0.1.0"
 dependencies = [
