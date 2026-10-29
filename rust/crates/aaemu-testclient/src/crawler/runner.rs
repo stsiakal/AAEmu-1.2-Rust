@@ -191,28 +191,35 @@ pub async fn run(cfg: &CrawlConfig, catalog: &Catalog) -> Result<()> {
         .filter(|q| cfg.from_quest.is_none_or(|from| q.id >= from))
         .collect();
     quests.sort_by_key(|q| (q.level, q.id));
-    let total = cfg.limit.map_or(quests.len(), |n| n.min(quests.len()));
+    let attemptable = quests
+        .iter()
+        .filter(|q| is_attemptable(cfg, catalog, q, &passed))
+        .count();
+    let budget = cfg.limit.map_or(attemptable, |n| n.min(attemptable));
     println!(
-        "[crawl] {}: {total} quests to visit ({} already passed)",
+        "[crawl] {}: {budget} quests to attempt ({attemptable} attemptable, {} already passed)",
         cfg.race.name(),
         passed.len()
     );
 
     let mut visited = 0usize;
     for quest in quests {
-        if visited >= total {
+        if visited >= budget {
             break;
         }
         if passed.contains(&quest.id) {
             continue;
         }
-        visited += 1;
+        let attempt = is_attemptable(cfg, catalog, quest, &passed);
+        if attempt {
+            visited += 1;
+        }
         let outcome = crawl_quest(&mut session, cfg, catalog, quest, &passed).await;
         let result = finish_result(cfg, quest, outcome, account_id);
         println!(
             "[{}/{}] {} quest {:<5} {:<24} L{:<2} {:<30} {}",
             visited,
-            total,
+            budget,
             match result.status.as_str() {
                 "passed" => "ok  ",
                 "skipped" => "skip",
@@ -226,7 +233,7 @@ pub async fn run(cfg: &CrawlConfig, catalog: &Catalog) -> Result<()> {
             result.reason
         );
         results.append(&result)?;
-        if visited.is_multiple_of(10) {
+        if attempt && visited.is_multiple_of(10) {
             if let Err(e) = super::dashboard::write(&cfg.out) {
                 println!("[crawl] dashboard: {e:#}");
             }
@@ -1315,6 +1322,21 @@ fn best_member(
                 });
             da.total_cmp(&db).then(a.cmp(b))
         })
+}
+
+fn is_attemptable(
+    cfg: &CrawlConfig,
+    catalog: &Catalog,
+    quest: &Quest,
+    completed: &HashSet<u32>,
+) -> bool {
+    quest.unsupported.is_none()
+        && !quest.instance
+        && anchor_of(catalog, quest).is_some()
+        && matches!(
+            catalog.gate_verdict(quest, cfg.race, quest.level.max(2), completed),
+            GateVerdict::Play { .. }
+        )
 }
 
 fn anchor_of(catalog: &Catalog, quest: &Quest) -> Option<(f32, f32, f32)> {
