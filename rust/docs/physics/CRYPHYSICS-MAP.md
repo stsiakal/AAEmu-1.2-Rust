@@ -581,8 +581,10 @@ x64 +12 field: x64 +16..+87 map to +12..+83, the gear pointer moves from the 8-a
 to +84, and the tail +96..+131 maps to +88..+123 (size 124; SetParams `0x35116CD0`,
 GetParams `0x35113120`). The x64 +132 engine-brake / +136 rear-steer fields do not exist,
 which is the first divergence in `p5_wheeled_settle`/`settle_ray`. Wheeled parts use
-geomparams type 1: the x64 wheel fields +112..+183 move to 1.2 +88..+159
-(`AddGeometry 0x35119FC0` reads bDriving at `param_3[0x16]`). Twelve wheeled scenarios run
+geomparams type 1: the x64 wheel fields +112..+183 move to 1.2 +88..+159 in the
+whole-struct geomparams conversion (`AddGeometry 0x35119FC0` reads bDriving at
+`param_3[0x16]`). GetParams output buffers reached through a scenario `buf:` pointer (the
+gear ratios) survive the reverse conversion. Twelve wheeled scenarios run
 (car position matches; q denormals/velocity differ by 1 ulp), `p5_wheeled_mesh` needs
 trimesh. The wheeled family is not x87-dependent: the earlier apparent 24/53 differences
 were status-5 words +100/+104/+120, which are process-specific counters in 1.2 (they change
@@ -601,7 +603,12 @@ simClass +44, recalc +48 (`FUN_3507b720` case 0). `pe_params_part`: pointer pair
 +88/+92, mass +76, density +80, minContactDist +84, idmat +96, pLattice +100, idSkeleton +104,
 pMatMapping +108, nMats +112, bAddrefGeoms +120, idParent +124 (`FUN_3507b720` case 6,
 GetParams `FUN_3505c460` case 6; the last two explain the per-part flags reset when +124 is
-left 0). `pe_params_foreign_data`: pointer +4, ints +8/+12/+16/+20. Entity: base pos +120, q
+left 0). `pe_geomparams`: mtx3x4 48->44, mtx3x3 56->48, surface 64->52, flags 68->56,
+collider 72->60, minContactDist 76->64, idmatBreakable 80->68, lattice 88->72, matMapping
+96->76, nMats 104->80, recalcBBox 108->84; car wheel block 112..183 -> 88..159 and
+articulated id_body 112->88 (`AddGeometry` 0x35061170, wheeled 0x35119FC0); scenario field
+overrides are applied to the x64 image before this translation. `pe_params_foreign_data`:
+pointer +4, ints +8/+12/+16/+20. Entity: base pos +120, q
 +132, scale +176, id +56, flags +76, parts pointer +236, nParts +240, structure +272; rigid
 body +532 (`GetRigidBody` 0x350B6E40), pending pose +276 (`ctor 0x350B69A0` sets `+0x2D` to
 `+0x114`), deferred P/L +740, gravity +412. World: simclass heads +628+4k, next link at

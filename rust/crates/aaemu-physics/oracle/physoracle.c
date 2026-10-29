@@ -766,6 +766,34 @@ static const OffMap map_particle[] = {
   {80, 80, 12}, {92, 92, 12}, {104, 104, 12}, {116, 116, 16}, {132, 132, 4}, {136, 136, 4},
   {144, 140, 4}, {152, 144, 4}, {156, 148, 4}, {160, 152, 4}
 };
+/* pe_geomparams (AddGeometry param 2): the 1.2 struct is 88 B plain, 160 B car and 92 B
+   articulated.  x64 mtx3x4 +48, mtx3x3 +56, surface +64, flags +68, collider +72,
+   minContactDist +76, idmatBreakable +80, lattice +88, matMapping +96, nMats +104,
+   recalcBBox +108 are +44, +48, +52, +56, +60, +64, +68, +72, +76, +80, +84 in 1.2.
+   Car type 1 keeps the wheel block at x64 +112..+183, which is +88..+159 in 1.2
+   (AddGeometry 0x35061170, wheeled 0x35119FC0); articulated type 2 has id_body +112 -> +88. */
+static const OffMap map_geom[] = {
+  {0, 0, 4}, {4, 4, 12}, {16, 16, 12}, {28, 28, 12}, {40, 40, 4},
+  {48, 44, 4}, {56, 48, 4}, {64, 52, 4}, {68, 56, 4}, {72, 60, 4}, {76, 64, 4},
+  {80, 68, 4}, {88, 72, 4}, {96, 76, 4}, {104, 80, 4}, {108, 84, 4}
+};
+static int x86_geomparams(int gtype, const unsigned char *src, unsigned char *dst, int to86) {
+  if (gtype < 0 || gtype > 2) return 0;
+  memset(dst, 0, 512);
+  for (int i = 0; i < (int)(sizeof map_geom / sizeof map_geom[0]); i++) {
+    int so = to86 ? map_geom[i].x64 : map_geom[i].x86;
+    int doff = to86 ? map_geom[i].x86 : map_geom[i].x64;
+    memcpy(dst + doff, src + so, map_geom[i].size);
+  }
+  if (gtype == 1) {
+    int so = to86 ? 112 : 88, doff = to86 ? 88 : 112;
+    memcpy(dst + doff, src + so, 72);
+  } else if (gtype == 2) {
+    int so = to86 ? 112 : 88, doff = to86 ? 88 : 112;
+    memcpy(dst + doff, src + so, 4);
+  }
+  return 1;
+}
 static const OffMap *x86_offmap(int type, int *n) {
   switch (type) {
   case 0: *n = (int)(sizeof map_pos / sizeof map_pos[0]); return map_pos;
@@ -928,7 +956,17 @@ static int x86_convert(int type, const unsigned char *src, unsigned char *dst, i
   int n;
   const OffMap *m = x86_offmap(type, &n);
   if (!m) return 0;
-  memset(dst, 0, 512);
+  if (to86) {
+    memset(dst, 0, 512);
+  } else {
+    /* GetParams may have written an out-parameter buffer through a scenario pointer inside
+       dst (the car pGearRatio at x64 +88 points at `buf:400`).  Clear only the x64 struct
+       image so those bytes survive the reverse conversion. */
+    int end = 0;
+    for (int i = 0; i < n; i++)
+      if (m[i].x64 + m[i].size > end) end = m[i].x64 + m[i].size;
+    memset(dst, 0, (size_t)end);
+  }
   for (int i = 0; i < n; i++) {
     int so = to86 ? m[i].x64 : m[i].x86;
     int doff = to86 ? m[i].x86 : m[i].x64;
@@ -1262,7 +1300,10 @@ static void run_line(char *line) {
     void *e = find_target(need(&t, "ent"));
     void *g = find_obj(need(&t, "geom"), 0);
     if (!g) die("unknown geom", need(&t, "geom"));
-    unsigned char gp[512];
+    unsigned char gp[512], *usep = gp;
+#ifdef ORACLE_X86
+    unsigned char gp86[512];
+#endif
     memset(gp, 0, sizeof gp);
     float *f = (float *)gp;
     SETI(gp, 0, 0);
@@ -1273,30 +1314,19 @@ static void run_line(char *line) {
     parse_fv(get(&t, "q", "0,0,0,1"), q, 4);
     memcpy(gp + 24, q, 16);
     f[10] = parse_f(get(&t, "scale", "1"));
-#ifdef ORACLE_X86
-    /* pe_geomparams 88: surface 52, flags 56, collider 60, mincontact 64, idmat 68,
-       lattice 72, matMapping 76, nMats 80, recalcBBox 84 (verified in FUN_35061170) */
-    SETI(gp, 52, UNUSED_I);
-    SETI(gp, 56, parse_u(get(&t, "flags", "0x1809F")));
-    SETI(gp, 60, parse_u(get(&t, "collider", "0x1")));
-    *(float *)(gp + 64) = parse_f(get(&t, "mincontact", "U"));
-    SETI(gp, 68, UNUSED_I); /* idmatBreakable: AddGeometry 0x35061170 tests == INT_MIN */
-    SETI(gp, 84, 1);
-#else
     SETI(gp, 64, UNUSED_I);
     SETI(gp, 68, parse_u(get(&t, "flags", "0x1809F"))); /* = DEFAULT_PART_FLAGS in the Rust crate */
     SETI(gp, 72, parse_u(get(&t, "collider", "0x1")));
     *(float *)(gp + 76) = parse_f(get(&t, "mincontact", "U"));
     SETI(gp, 80, -1);
     SETI(gp, 108, 1);
-#endif
+    /* Build the x64 scenario image first, then translate the whole struct (including type 1's
+       wheel block) to the 1.2 layout, so field overrides keep their x64 offsets. */
     apply_fields(&t, gp, 512);
 #ifdef ORACLE_X86
-    /* wheeled AddGeometry type 1: the 1.2 wheel record starts at +88 (x64 +112) and is
-       72 B, so shift the scenario's x64 wheel fields down by 24 bytes. */
-    if ((int)(intptr_t)m_call0(e, 1) == 3 && *(int *)gp == 1) memmove(gp + 88, gp + 112, 72);
+    if (x86_geomparams(*(int *)gp, gp, gp86, 1)) usep = gp86;
 #endif
-    int id = m_addg(e, E_AddGeometry, g, gp, atoi(get(&t, "id", "-1")), 1);
+    int id = m_addg(e, E_AddGeometry, g, usep, atoi(get(&t, "id", "-1")), 1);
     printf("ret part %s %d\n", need(&t, "ent"), id);
   } else if (!strcmp(c, "surface")) { /* SetSurfaceParameters(idx, bounciness, friction, flags) */
     int r = m_surf(g_world, atoi(need(&t, "idx")), parse_f(get(&t, "bounce", "0")),
