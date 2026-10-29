@@ -105,6 +105,8 @@ pub struct CrawlConfig {
     pub bugreports: Option<PathBuf>,
     pub quest_timeout: Duration,
     pub objective_timeout: Duration,
+    /// Level the crawler raises the character to before each quest (`0` = the quest level).
+    pub min_level: u8,
     /// Do not update the account's access level through MySQL.
     pub no_grant_gm: bool,
 }
@@ -129,6 +131,7 @@ impl CrawlConfig {
             bugreports: None,
             quest_timeout: Duration::from_secs(180),
             objective_timeout: Duration::from_secs(45),
+            min_level: 0,
             no_grant_gm: false,
         }
     }

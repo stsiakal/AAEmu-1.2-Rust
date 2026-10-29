@@ -23,7 +23,6 @@ use crate::stream::StreamClient;
 
 const QUIET: Duration = Duration::from_millis(400);
 const CAST_ANSWER: Duration = Duration::from_secs(8);
-const KILL_CAST_SPACING: Duration = Duration::from_millis(1200);
 
 /// One quest's verdict, appended to `<race>.jsonl` for the dashboard and resumption.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -466,6 +465,17 @@ async fn connect(cfg: &CrawlConfig, _catalog: &Catalog) -> Result<Session> {
     game.notify_in_game_completed().await?;
     game.drain(QUIET, Duration::from_secs(15)).await?;
     ensure!(game.state.self_obj != 0, "own unit state not received");
+    // Quest targets are often neutral to the race; the real client force-attacks them.
+    game.set_force_attack(true).await?;
+    // A previous run may have been stopped mid-quest (timeout, crash); start from a clean log.
+    let active: Vec<u32> = game.state.active_quests.keys().copied().collect();
+    for quest in active {
+        let _ = drop_quest(&mut game, quest).await;
+    }
+    if !game.state.active_quests.is_empty() {
+        game.state.active_quests.clear();
+        game.drain(QUIET, Duration::from_secs(4)).await?;
+    }
     let level = 1;
     Ok(Session {
         game,
@@ -516,7 +526,12 @@ async fn crawl_quest(
         evidence.outcome = Err(QuestFailure::new("unsupported", reason));
         return evidence;
     }
-    let verdict = catalog.gate_verdict(quest, cfg.race, quest.level.max(2), completed);
+    let verdict = catalog.gate_verdict(
+        quest,
+        cfg.race,
+        quest.level.max(cfg.min_level).max(2),
+        completed,
+    );
     let gate_items = match verdict {
         GateVerdict::Skip(reason) => {
             evidence.outcome = Err(QuestFailure::new("gate", reason));
@@ -589,7 +604,7 @@ async fn run_quest_body(
     deadline: Instant,
 ) -> std::result::Result<(), QuestFailure> {
     // ---- setup: level and gate items -----------------------------------------
-    let target_level = quest.level.max(2);
+    let target_level = quest.level.max(cfg.min_level).max(2);
     if session.level < target_level {
         gm_command(&mut session.game, &format!("level {target_level}"))
             .await
@@ -600,6 +615,9 @@ async fn run_quest_body(
             .map_err(|e| QuestFailure::new("setup", format!("level pump: {e:#}")))?;
         session.level = target_level;
     }
+    // A charge skill does direct damage; the auto attack alone cannot kill quest elites.
+    let _ = session.game.learn_skill(11918).await;
+    let _ = session.game.learn_skill(18131).await;
     for item in gate_items {
         let _ = ensure_item(session, *item, 1, anchor).await;
     }
@@ -982,7 +1000,24 @@ async fn hunt_once(
         }
     }
     let mut target = target.ok_or_else(|| format!("no live npc of {wanted:?} in sight"))?;
-    let until = deadline.min(Instant::now() + Duration::from_secs(35));
+    // Teleport next to the live target: a movement packet can be refused (collision / closed
+    // zone), which would leave the server-side position out of the auto attack range.
+    let near = [target.pos.0 + 1.3, target.pos.1, target.pos.2];
+    teleport(session, near)
+        .await
+        .map_err(|e| format!("teleport to target: {e}"))?;
+    session
+        .game
+        .move_to_facing((near[0], near[1], near[2]), target.pos, 400)
+        .await
+        .map_err(|e| format!("face: {e:#}"))?;
+    let _ = session.pump_fast(400).await;
+    let until = deadline.min(Instant::now() + Duration::from_secs(60));
+    // The auto attack is a scheduled skill on the server: cast it once and let it tick. Casting
+    // it again before the attack delay replaces the scheduled hit and deals no damage.
+    let mut auto_started = false;
+    let mut last_cast = Instant::now();
+    let mut last_hp = target_hp(session, target.obj_id);
     while Instant::now() < until {
         if session.game.state.dead_units.contains(&target.obj_id)
             || !session.game.state.units.contains_key(&target.obj_id)
@@ -997,6 +1032,7 @@ async fn hunt_once(
         {
             let _ = gm_command(&mut session.game, "revive").await;
             let _ = session.sleep_pump(500).await;
+            auto_started = false;
         }
         if let Some(u) = session.game.state.units.get(&target.obj_id) {
             target = u.clone();
@@ -1004,34 +1040,41 @@ async fn hunt_once(
             return Ok(());
         }
         let pos = target.pos;
-        session
-            .game
-            .move_to_facing((pos.0 + 1.3, pos.1, pos.2), pos, 1200)
-            .await
-            .map_err(|e| format!("move: {e:#}"))?;
-        session
-            .game
-            .change_target(target.obj_id)
-            .await
-            .map_err(|e| format!("target: {e:#}"))?;
-        // The always-known auto attack; learned combo skills need extra state.
-        let mut cast = false;
-        for skill in [2u32] {
+        if dist2(session.game.state.self_pos, pos).sqrt() > 3.5 {
+            teleport(session, [pos.0 + 1.3, pos.1, pos.2])
+                .await
+                .map_err(|e| format!("teleport: {e}"))?;
             session
                 .game
-                .start_skill(skill, target.obj_id)
+                .move_to_facing((pos.0 + 1.3, pos.1, pos.2), pos, 400)
                 .await
-                .map_err(|e| format!("skill {skill}: {e:#}"))?;
-            if wait_skill(session, skill, Duration::from_secs(3)).await {
-                cast = true;
-                break;
-            }
+                .map_err(|e| format!("face: {e:#}"))?;
+            let _ = session.pump_fast(400).await;
+            auto_started = false;
         }
-        if !cast {
-            let _ = session.sleep_pump(500).await;
+        if !auto_started || last_cast.elapsed() > Duration::from_secs(8) {
+            let _ = session.game.set_force_attack(true).await;
+            session
+                .game
+                .change_target(target.obj_id)
+                .await
+                .map_err(|e| format!("target: {e:#}"))?;
+            session
+                .game
+                .start_skill(2, target.obj_id)
+                .await
+                .map_err(|e| format!("skill 2: {e:#}"))?;
+            let _ = wait_skill(session, 2, Duration::from_secs(3)).await;
+            auto_started = true;
+            last_cast = Instant::now();
         }
-        tokio::time::sleep(KILL_CAST_SPACING).await;
-        let _ = session.pump_fast(900).await;
+        tokio::time::sleep(Duration::from_millis(650)).await;
+        let _ = session.pump_fast(650).await;
+        let hp = target_hp(session, target.obj_id);
+        if hp != last_hp {
+            last_hp = hp;
+            last_cast = Instant::now();
+        }
     }
     if session.game.state.dead_units.contains(&target.obj_id) {
         return Ok(());
@@ -1347,7 +1390,12 @@ fn is_attemptable(
         && !quest.instance
         && anchor_of(catalog, quest).is_some()
         && matches!(
-            catalog.gate_verdict(quest, cfg.race, quest.level.max(2), completed),
+            catalog.gate_verdict(
+                quest,
+                cfg.race,
+                quest.level.max(cfg.min_level).max(2),
+                completed
+            ),
             GateVerdict::Play { .. }
         )
 }
@@ -1385,6 +1433,10 @@ fn anchor_of(catalog: &Catalog, quest: &Quest) -> Option<(f32, f32, f32)> {
 
 fn to_pos(p: [f32; 3]) -> (f32, f32, f32) {
     (p[0], p[1], p[2])
+}
+
+fn target_hp(session: &Session, obj_id: u32) -> Option<i32> {
+    session.game.state.unit_points.get(&obj_id).map(|p| p.0)
 }
 
 fn dist2(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {

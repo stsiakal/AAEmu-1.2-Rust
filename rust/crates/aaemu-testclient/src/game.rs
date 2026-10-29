@@ -581,6 +581,8 @@ pub struct GameState {
     /// First item of the bag (`SCCharacterInvenContentsPacket`, slot type 2): `(item id, slot)`.
     pub bag_items: Vec<(u64, u8, u32)>,
     pub bag_slots: u8,
+    /// Active quests from `SCQuestsPacket`: template id -> status.
+    pub active_quests: HashMap<u32, u8>,
     /// Latest `SCUnitPointsPacket` per unit: `(hp, mp)` (the wire carries them times 100).
     pub unit_points: HashMap<u32, (i32, i32)>,
     /// Units announced dead by `SCUnitDeathPacket` (and not removed since).
@@ -759,6 +761,14 @@ impl GameState {
                 user_state: s.read_u8()?,
             });
             st.mate_spawn_count += 1;
+        } else if p.is_sc(sc::SCQuestsPacket) {
+            let count = s.read_i32()?;
+            if count > 0 {
+                for _ in 0..count {
+                    let (_id, template, status) = read_quest_row(&mut s)?;
+                    st.active_quests.insert(template, status);
+                }
+            }
         } else if p.is_sc(sc::SCCharacterInvenContentsPacket) {
             let slot_type = s.read_u8()?;
             let _num_chunks = s.read_u8()?;
@@ -1492,6 +1502,13 @@ impl GameClient {
             .await
     }
 
+    /// `CSSetForceAttackPacket` (Ctrl+F on a friendly / neutral target).
+    pub async fn set_force_attack(&mut self, on: bool) -> anyhow::Result<()> {
+        let mut s = PacketStream::new();
+        s.write_bool(on);
+        self.send_cs(cs::CSSetForceAttackPacket, s.as_bytes()).await
+    }
+
     /// Select the unit used by auto attacks, as the real client does before attacking.
     pub async fn change_target(&mut self, target_obj: u32) -> anyhow::Result<()> {
         let mut packet = PacketStream::new();
@@ -1634,6 +1651,28 @@ mod observed_position_tests {
         assert_eq!(state.self_pos, (900.0, 900.0, 900.0));
         assert_eq!(state.observation_seq, 1);
     }
+}
+
+/// One `ActiveQuest` row written by `Quest.Write` for `SCQuestsPacket`.
+fn read_quest_row(s: &mut PacketStream) -> anyhow::Result<(i64, u32, u8)> {
+    let id = s.read_i64()?;
+    let template = s.read_u32()?;
+    let status = s.read_u8()?;
+    for _ in 0..5 {
+        s.read_i32()?;
+    }
+    s.read_bool()?;
+    s.read_bc()?;
+    s.read_u32()?;
+    s.read_bc()?;
+    s.read_bc()?;
+    s.read_i32()?;
+    s.read_u32()?;
+    s.read_i64()?;
+    s.read_i64()?;
+    s.read_u8()?;
+    s.read_u32()?;
+    Ok((id, template, status))
 }
 
 fn dist2(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
