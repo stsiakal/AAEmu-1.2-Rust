@@ -41,6 +41,11 @@ twilight-gateway.workspace = true
 twilight-http.workspace = true
 twilight-model.workspace = true
 
+[features]
+# Exposes `test_support` (GameServer without MySQL, TestClient) to other crates' tests, e.g.
+# aaemu-bots' flow tests.
+test-support = []
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 

@@ -594,3 +594,86 @@ async fn private_mysql_reentry_loads_the_state_the_departure_save_committed() {
     assert_eq!(server.enter_world.character_owner(1), Some(2));
     pool.close().await;
 }
+/// The world-entry frames `session::enter_world` produces must be byte-for-byte the ones a client
+/// drives with the three individual packets. Two identical servers run both paths with the same
+/// character clone (so ids and the GUID are the same); only the elapsed time of the
+/// `SCUnitStatePacket` forced buffs is normalised, because it depends on the wall clock.
+#[tokio::test]
+async fn enter_world_matches_the_individual_client_steps_byte_for_byte() {
+    let character = test_character(7, "Sequence", 100.0, 100.0);
+    let wrapped = login_sequence(character.clone(), true).await;
+    let plain = login_sequence(character, false).await;
+    assert_eq!(wrapped.len(), 30, "select + world entry frames");
+    assert_eq!(
+        wrapped.iter().map(|f| f.0).collect::<Vec<_>>(),
+        plain.iter().map(|f| f.0).collect::<Vec<_>>(),
+        "opcode sequence"
+    );
+    for (index, (a, b)) in wrapped.iter().zip(&plain).enumerate() {
+        assert!(
+            same_frame(a, b),
+            "frame {index} (opcode {:03X}) differs between enter_world and the individual steps",
+            a.0
+        );
+    }
+}
+
+async fn login_sequence(
+    character: crate::models::character::Character,
+    wrapper: bool,
+) -> Vec<(u16, Vec<u8>)> {
+    use crate::models::char_data::VisualOptions;
+
+    let server = test_server();
+    let mut client = TestClient::new(&server, 1, 1007);
+    client.conn.characters = vec![character.clone()];
+    session::select_loaded(
+        &server,
+        &mut client.conn,
+        character,
+        SelectDbData::default(),
+    )
+    .unwrap();
+    let mut frames = client.drain();
+    let visual = VisualOptions {
+        flag: 0x1F,
+        stp: Some([0; 6]),
+        ..Default::default()
+    };
+    if wrapper {
+        session::enter_world(&server, &mut client.conn, visual);
+    } else {
+        session::spawn_character(&server, &mut client.conn, visual);
+        session::notify_in_game(&server, &mut client.conn);
+        session::notify_in_game_completed(&server, &mut client.conn);
+    }
+    frames.extend(client.drain());
+    frames
+}
+
+fn same_frame(a: &(u16, Vec<u8>), b: &(u16, Vec<u8>)) -> bool {
+    use crate::opcodes::sc;
+
+    if a == b {
+        return true;
+    }
+    if a.0 != b.0 || a.1.len() != b.1.len() || a.0 != sc::SCUnitStatePacket {
+        return false;
+    }
+    // The two forced buffs at the end carry an elapsed time (NetBuff: 47 bytes, elapsed at
+    // offset 23); it is the only wall-clock-dependent field in the burst.
+    let tail = 3 + 2 * 47;
+    let n = a.1.len();
+    if n < tail || a.1[..n - tail] != b.1[..n - tail] {
+        return false;
+    }
+    let mut ta = a.1[n - tail..].to_vec();
+    let mut tb = b.1[n - tail..].to_vec();
+    for t in [&mut ta, &mut tb] {
+        for k in 0..2 {
+            let o = 1 + k * 47 + 23;
+            t[o..o + 4].fill(0);
+        }
+    }
+    ta == tb
+}
