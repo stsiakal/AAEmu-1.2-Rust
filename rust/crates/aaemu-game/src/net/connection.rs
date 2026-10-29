@@ -17,6 +17,7 @@ use crate::models::character::Character;
 use crate::models::item::UnixTime;
 use crate::net::outbox::{outbox, Outbox, Push, MAX_QUEUED_BYTES};
 use crate::net::packet::{encode, ServerPacket, INVALID_OPCODE};
+use crate::systems::services::bugreport::packet_ring::{self, PacketRing};
 
 /// `GameState`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -90,6 +91,8 @@ pub struct ConnectionHandle {
     last_ping_ms: Arc<AtomicI64>,
     tx: mpsc::UnboundedSender<ConnCommand>,
     writer: Outbox,
+    /// Fixed-size packet ring for bug reports (`None` unless `BugReports.Enabled`).
+    packet_ring: Option<Arc<PacketRing>>,
 }
 
 impl ConnectionHandle {
@@ -105,7 +108,13 @@ impl ConnectionHandle {
             last_ping_ms: Arc::new(AtomicI64::new(i64::MIN)),
             tx,
             writer,
+            packet_ring: None,
         }
+    }
+
+    /// The bug-report packet ring of this connection, when enabled.
+    pub fn packet_ring(&self) -> Option<&Arc<PacketRing>> {
+        self.packet_ring.as_ref()
     }
 
     pub fn account_id(&self) -> u32 {
@@ -130,6 +139,7 @@ impl ConnectionHandle {
     /// [`ConnectionHandle::send`] for a borrowed / type-erased packet.
     pub fn send_dyn(&self, packet: &dyn ServerPacket) {
         if let Some(bytes) = encode_for_send(packet) {
+            packet_ring::record_outgoing(self.packet_ring.as_ref(), packet, bytes.len());
             self.send_frame(bytes);
         }
     }
@@ -263,6 +273,7 @@ pub struct GameConnection {
     writer: Outbox,
     commands: mpsc::UnboundedSender<ConnCommand>,
     closing: bool,
+    packet_ring: Option<Arc<PacketRing>>,
 }
 
 impl std::fmt::Debug for GameConnection {
@@ -288,6 +299,7 @@ impl GameConnection {
     ) -> (Self, ConnectionHandle) {
         let account_id = Arc::new(AtomicU32::new(0));
         let last_ping_ms = Arc::new(AtomicI64::new(i64::MIN));
+        let packet_ring = packet_ring::new_for_connection();
         let handle = ConnectionHandle {
             id,
             ip,
@@ -295,6 +307,7 @@ impl GameConnection {
             last_ping_ms: last_ping_ms.clone(),
             tx: commands.clone(),
             writer: writer.clone(),
+            packet_ring: packet_ring.clone(),
         };
         let conn = Self {
             id,
@@ -310,6 +323,7 @@ impl GameConnection {
             writer,
             commands,
             closing: false,
+            packet_ring,
         };
         (conn, handle)
     }
@@ -335,6 +349,7 @@ impl GameConnection {
         let Some(bytes) = encode_for_send(packet) else {
             return;
         };
+        packet_ring::record_outgoing(self.packet_ring.as_ref(), packet, bytes.len());
         match self.writer.push(bytes) {
             Push::Queued => {}
             Push::Closed => self.closing = true,
@@ -360,7 +375,13 @@ impl GameConnection {
             last_ping_ms: self.last_ping_ms.clone(),
             tx: self.commands.clone(),
             writer: self.writer.clone(),
+            packet_ring: self.packet_ring.clone(),
         }
+    }
+
+    /// The bug-report packet ring of this connection, when enabled.
+    pub fn packet_ring(&self) -> Option<&Arc<PacketRing>> {
+        self.packet_ring.as_ref()
     }
 
     /// Queues a command for this connection's own task (e.g. the logout timer).

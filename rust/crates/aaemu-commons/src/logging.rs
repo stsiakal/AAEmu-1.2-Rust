@@ -300,6 +300,15 @@ impl<'a> MakeWriter<'a> for DailyWriter {
 /// reporter ([`crate::crash`]). If the log directory cannot be created, only the console
 /// target is installed (and a warning logged).
 pub fn init(base_dir: &Path) {
+    init_with(base_dir, None::<tracing_subscriber::layer::Identity>);
+}
+
+/// [`init`] plus an extra layer (e.g. the game's bug-report capture layer). The layer sees the
+/// same events as the file targets; it is installed after them, so it can never suppress them.
+pub fn init_with<L>(base_dir: &Path, extra: Option<L>)
+where
+    L: Layer<tracing_subscriber::Registry> + Send + Sync + 'static,
+{
     let env = std::env::var("RUST_LOG").ok().filter(|s| !s.is_empty());
     let filter = |default: LevelFilter| match &env {
         Some(s) => EnvFilter::new(s),
@@ -333,13 +342,17 @@ pub fn init(base_dir: &Path) {
                 .with_filter(filter(LevelFilter::ERROR))
                 .with_filter(LevelFilter::ERROR);
             let _ = tracing_subscriber::registry()
+                .with(extra)
                 .with(console)
                 .with(server_layer)
                 .with(error_layer)
                 .try_init();
         }
         Err(e) => {
-            let _ = tracing_subscriber::registry().with(console).try_init();
+            let _ = tracing_subscriber::registry()
+                .with(extra)
+                .with(console)
+                .try_init();
             tracing::warn!("File logging disabled ({}): {e}", logs.display());
         }
     }

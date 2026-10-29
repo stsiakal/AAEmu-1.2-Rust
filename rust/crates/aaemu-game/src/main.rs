@@ -82,7 +82,10 @@ async fn run() -> anyhow::Result<()> {
     // NLog.config: console, Logs/Server.log and Logs/Error.log. Under the application
     // directory (the executable's directory in the published layout), so login and game
     // servers built into one target directory do not share (and delete) each other's logs.
-    aaemu_commons::logging::init(&app_path);
+    aaemu_commons::logging::init_with(
+        &app_path,
+        Some(aaemu_game::systems::services::bugreport::layer()),
+    );
     initialization();
 
     if args.first().map(String::as_str) == Some("compiler-check") {
@@ -185,6 +188,12 @@ async fn run() -> anyhow::Result<()> {
     // WorldManager.CreateStaticInstances (main_world) happens in GameServer::new.
     let server = Arc::new(GameServer::new(config, db, game_data));
     server.set_self();
+    // Automated bug reports: install the writer + panic hook before the DB loads so startup
+    // failures are reported too. `services::System::start` is the idempotent fallback.
+    let bug_config = server.config.bug_reports.clone();
+    if let Err(e) = aaemu_game::systems::services::bugreport::install(&server, &bug_config) {
+        tracing::error!("bug reports disabled: {e:#}");
+    }
     tracing::info!("{} packet handlers registered", server.registry.len());
 
     // ItemManager.LoadUserItems + the orchestrated DB loads (id managers, names, expeditions,
@@ -258,6 +267,8 @@ async fn run() -> anyhow::Result<()> {
     // ---- shutdown: hosted services in reverse order ----
     // (shared with the graceful `/scripts shutdown`)
     aaemu_game::systems::services::shutdown::stop_server(&server).await;
+    // Final bug-report summary (`summary.json`), then stop the writer.
+    aaemu_game::systems::services::bugreport::shutdown(std::time::Duration::from_secs(2));
     // Dispose.
     tracing::info!("Disposing...");
     Ok(())

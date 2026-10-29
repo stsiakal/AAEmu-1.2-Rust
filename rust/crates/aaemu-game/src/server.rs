@@ -152,6 +152,21 @@ impl GameServer {
                 raw.level
             )));
         }
+        if conn.packet_ring().is_some() {
+            let names = if raw.level == LEVEL_PROXY {
+                opcodes::pp::NAMES
+            } else {
+                opcodes::cs::NAMES
+            };
+            let name = opcodes::name_of(names, raw.opcode).unwrap_or("unknown");
+            crate::systems::services::bugreport::packet_ring::record_incoming(
+                conn.packet_ring(),
+                raw.level,
+                raw.opcode,
+                name,
+                raw.body.unread(),
+            );
+        }
         if tracing::enabled!(
             target: crate::net::FIELDS_TRACE_TARGET,
             tracing::Level::TRACE

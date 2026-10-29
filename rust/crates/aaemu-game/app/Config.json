@@ -42,5 +42,17 @@
             "Start": "",
             "End": ""
         }
+    },
+    "BugReports": {
+        "Enabled": false,
+        "Directory": "",
+        "MaxFullReportsPerFingerprint": 3,
+        "NearbyRadius": 40,
+        "PacketRing": 64,
+        "LogRing": 200,
+        "RatePerSecond": 5,
+        "MaxFingerprints": 2000,
+        "MaxFullReports": 2000,
+        "MaxTotalBytes": 67108864
     }
 }
