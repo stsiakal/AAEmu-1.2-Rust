@@ -122,7 +122,13 @@ precisions.
 | `p1c_rays_cgf` | blocked | trimesh `CreateMesh` / CGF loader not ported |
 
 Counts (unique scenarios): **15 identical, 61 divergent, 27 blocked, 21 not applicable**
-after group 5 triage. The 21 not-applicable scenarios are the `p1a_*` internal-function
+after group 5 triage. The traces were regenerated after the geomparams-override and
+GetParams-buffer fixes: `p5_particle_bounce`, `p5_particle_flags`, `p5_particle_slide`,
+`p7_body_add`, `p5_wheeled_gears`, `p5_wheeled_settle` and `p5_wheeled_settle_ray` changed
+(the corrected fields now match x64, e.g. the `getparams` part flags and the gear-ratio
+dumps), but their first divergences are unchanged 1-ulp float differences and the wheeled
+denormal/car-tail differences remain, so no status or count changes. The 21
+not-applicable scenarios are the `p1a_*` internal-function
 probes (`--gprobe`, `--gphysblob`, protocol/pair-function addresses): they call x64
 internal functions directly and have no 1.2 equivalent in this harness.
 
@@ -185,8 +191,15 @@ reading the wrong field. Sources are in `cryphysics.c` (x86 1.2, base `0x34FF000
   recalc 48, byte 52), `pe_params_part` (case 6 + GetParams `FUN_3505c460` case 6; two
   pointer pairs at 48/52 and 88/92, mass 76, density 80, minContactDist 84, idmat 96,
   pLattice 100, idSkeleton 104, pMatMapping 108, nMats 112, bAddrefGeoms 120, idParent
-  124), `pe_params_outer_entity` (9), `pe_params_foreign_data` (11). All other params used
-  in this group are pointer-free and keep the x64 offsets.
+  124), `pe_params_outer_entity` (9), `pe_params_foreign_data` (11). `pe_geomparams`
+  (`part`) is converted the same way, after the scenario's x64 field overrides are applied
+  to the x64 image: mtx3x4 48->44, mtx3x3 56->48, surface 64->52, flags 68->56, collider
+  72->60, minContactDist 76->64, idmat 80->68, lattice 88->72, matMapping 96->76, nMats
+  104->80, recalcBBox 108->84 (plain 88 B); car type 1 keeps the wheel block at
+  112..183 -> 88..159 (160 B), articulated type 2 has id_body 112->88 (92 B). Reverse
+  conversion clears only the x64 struct image, so GetParams output buffers written through
+  a scenario `buf:` pointer (the wheeled gear ratios at `buf:400`) are preserved. All
+  other params used in this group are pointer-free and keep the x64 offsets.
 * **entities**: x86 base pos +120, q +132, scale +176, id +56, simclass +59, flags +76,
   parts +236 (pointer), nParts +240, ground planes +256, structure +272; rigid body at
   entity+532 (`GetRigidBody` 0x350b6e40) with the pending pose at +276 (`ctor 0x350b69a0`
@@ -247,8 +260,8 @@ reading the wrong field. Sources are in `cryphysics.c` (x86 1.2, base `0x34FF000
   +84 (x64 +88), and the tail +96..+131 maps to +88..+123 (size 124; SetParams
   `0x35116CD0`, GetParams `0x35113120`). The x64 +132 engine-brake / +136 rear-steer
   fields are absent, which is the first difference in the settle scenarios. Wheeled
-  `part` records are geomparams type 1: the x64 wheel fields at +112..+183 move to the
-  1.2 +88..+159 (`memmove(gp+88, gp+112, 72)`; AddGeometry `0x35119FC0` reads bDriving at
+  `part` records are geomparams type 1: the x64 wheel block at +112..+183 moves to the
+  1.2 +88..+159 in the geomparams conversion (AddGeometry `0x35119FC0` reads bDriving at
   `param_3[0x16]`). Status 4/5 are read in the raw x64-compatible layout up to +124.
   Status 5 words +100/+104/+120 in the 1.2 output are process-specific (they change by
   millions between runs, like an rdtsc delta); the oracle zeroes them so the trace is

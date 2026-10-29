@@ -104,7 +104,12 @@ trace with its `golden` counterpart and prints one line per scenario plus counts
 
 Params `pe_params_pos`, `pe_params_part`, `pe_params_outer_entity` and
 `pe_params_foreign_data` are converted between the x64 scenario image and the 32-bit
-layout at the vtable call (dumps stay x64). `peek`, `snapdiff`, `poke`, `peekworld`,
+layout at the vtable call (dumps stay x64). `pe_geomparams` is converted the same way for
+`part` (plain 88 B, car 160 B, articulated 92 B): the scenario's x64 field overrides are
+applied to the x64 image first and the whole struct is then translated, so overrides never
+land on the wrong 1.2 field. Reverse parameter conversion clears only the x64 struct image,
+so a GetParams out-parameter buffer reached through a scenario `buf:` pointer (the car
+gear ratios) survives. `peek`, `snapdiff`, `poke`, `peekworld`,
 `peekdll` and `listwhere` map the scenario's x64 offsets/addresses to 1.2 (rigid bodies,
 the physics-vars block, the size tables, the surface tables, the simclass lists); an
 unmapped offset fails loudly. `findptr`/`rawpeek`/`addrof` are x86-only helpers for
@@ -117,7 +122,8 @@ deriving further layout offsets. Rays are ported: `SRWIParams` (64 B) and `ray_h
 block shift. `gather`/`abuoy`/`estate`/`poke` use the 1.2 addresses and 76-byte
 `global_buoyancy` records, so the p4a global-area buoyancy scenarios run. Wheeled entities
 are ported: car params (pointer at +84, no x64 +12 field, size 124), identical wheel
-params, and the type-1 geomparams wheel fields shifted from +112 to +88. The three
+params, and the type-1 geomparams wheel block shifted from +112..+183 to +88..+159 by the
+same whole-struct conversion. The three
 process-specific status-5 words (+100/+104/+120 in the 1.2 output) are zeroed so the trace
 is deterministic. See `tests/golden-12/README.md` for the evidence.
 

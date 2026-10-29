@@ -25,10 +25,10 @@ ret part brk 0
 ret getparams brk 6 1 0081809f
 ret part brk 1
 ret getparams brk 6 1 0081809f
-ret getparams brk 6 1 0081809f
+ret getparams brk 6 1 0001809f
 ret part brk 2
 ret getparams brk 6 1 00000004
 ret part brk 3
 ret getparams brk 6 1 00800002
 ret part brk 4
-ret getparams brk 6 1 00800002
+ret getparams brk 6 1 00000002
