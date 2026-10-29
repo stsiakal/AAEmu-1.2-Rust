@@ -23,7 +23,7 @@ use crate::stream::StreamClient;
 
 const QUIET: Duration = Duration::from_millis(600);
 const CAST_ANSWER: Duration = Duration::from_secs(8);
-const KILL_CAST_SPACING: Duration = Duration::from_millis(2200);
+const KILL_CAST_SPACING: Duration = Duration::from_millis(1200);
 
 /// One quest's verdict, appended to `<race>.jsonl` for the dashboard and resumption.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,6 +268,7 @@ struct QuestOutcome {
     warnings: Vec<String>,
     reports: Vec<String>,
     objectives: Vec<ObjectiveResult>,
+    duration_ms: u64,
 }
 
 fn finish_result(
@@ -287,7 +288,7 @@ fn finish_result(
         reason: String::new(),
         act_kinds: quest.objectives.iter().map(|o| o.class.clone()).collect(),
         objectives: out.objectives,
-        duration_ms: 0,
+        duration_ms: out.duration_ms,
         warnings: out.warnings,
         reports: out.reports,
         account_id,
@@ -489,6 +490,7 @@ async fn crawl_quest(
         warnings: Vec::new(),
         reports: Vec::new(),
         objectives: Vec::new(),
+        duration_ms: 0,
     };
     if let Some(reason) = &quest.unsupported {
         evidence.outcome = Err(QuestFailure::new("unsupported", reason));
@@ -533,6 +535,7 @@ async fn crawl_quest(
         .collect();
     evidence.warnings = log.warnings();
     evidence.reports = reports.new_reports();
+    evidence.duration_ms = started.elapsed().as_millis() as u64;
     if let Err(f) = &mut evidence.outcome {
         if !evidence.warnings.is_empty() {
             f.reason = format!("{} [warn: {}]", f.reason, evidence.warnings.join(" | "));
@@ -553,7 +556,6 @@ async fn crawl_quest(
     if evidence.outcome.is_err() {
         let _ = drop_quest(&mut session.game, quest.id).await;
     }
-    let _ = started;
     evidence
 }
 
@@ -581,8 +583,6 @@ async fn run_quest_body(
     for item in gate_items {
         let _ = ensure_item(session, *item, 1, anchor).await;
     }
-    // A learned combo skill kills much faster than the auto attack; it is optional.
-    let _ = session.game.learn_skill(18131).await;
 
     // ---- accept ---------------------------------------------------------------
     let accept = accept_quest(session, catalog, quest, anchor, deadline).await;
@@ -994,9 +994,9 @@ async fn hunt_once(
             .change_target(target.obj_id)
             .await
             .map_err(|e| format!("target: {e:#}"))?;
-        // 18131 is the learned combo; fall back to the always-known auto attack.
+        // The always-known auto attack; learned combo skills need extra state.
         let mut cast = false;
-        for skill in [18131u32, 2] {
+        for skill in [2u32] {
             session
                 .game
                 .start_skill(skill, target.obj_id)
