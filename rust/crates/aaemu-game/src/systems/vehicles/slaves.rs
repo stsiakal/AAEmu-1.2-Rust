@@ -1921,6 +1921,16 @@ pub fn add_distance_to_right(t: &mut Transform, distance: f32) {
     t.y += distance * t.rot_z.sin();
 }
 
+/// The floor under a summon candidate: the collision-world ground probe when it hits, the
+/// terrain elevation otherwise. A probe miss (`Some(None)`) means "no static collider here",
+/// not bottomless water, so the terrain (or the heightmap fallback) still applies.
+fn summon_floor(probe: Option<Option<f32>>, terrain: impl FnOnce() -> f32) -> f32 {
+    match probe {
+        Some(Some(h)) => h,
+        _ => terrain(),
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Create
 // ---------------------------------------------------------------------------------------------
@@ -2912,42 +2922,73 @@ fn create_spawn_committed(
             } else {
                 0.0
             }) - ship.keel_height;
+            // Enough water for the whole hull: the actual collision-world ground (terrain,
+            // rocks, piers), not just the heightmap. A shallow spot under the 30 m hull lets
+            // its collision box overlap the ground and CryPhysics ejects the summoned hull.
+            let half_len = ship.mass_box_size_y * 0.5 + 1.0;
+            let spawn_z = spawn_pos.z;
+            let depth_ok = |x: f32, y: f32| {
+                let surface = super::ship_physics::water_surface(server, world, [x, y, spawn_z]);
+                let floor = summon_floor(
+                    crate::systems::ai::collision::ground_height_probe(
+                        server, world.id, x, y, spawn_z, 2.0, 2048.0,
+                    ),
+                    || {
+                        crate::systems::ai::collision::terrain_height_or(
+                            server,
+                            world.id,
+                            x,
+                            y,
+                            || {
+                                crate::systems::npcs::heightmap::world_height(server, world, x, y)
+                                    .unwrap_or(0.0)
+                            },
+                        )
+                    },
+                );
+                surface - floor > min_depth
+            };
             let mut in_front = 0.0f32;
+            let mut deep = false;
             while in_front < 50.0 + ship.mass_box_size_x {
                 let mut check = spawn_pos;
                 add_distance_to_front(&mut check, in_front);
-                // the sea floor: terrain elevation (GetTerrainElevation) with the service
-                let floor = crate::systems::ai::collision::terrain_height_or(
-                    server,
-                    world.id,
-                    check.x,
-                    check.y,
-                    || {
-                        crate::systems::npcs::heightmap::world_height(
-                            server, world, check.x, check.y,
-                        )
-                        .unwrap_or(0.0)
-                    },
-                );
-                if floor > 0.0 {
-                    let surface = super::ship_physics::water_surface(
-                        server,
-                        world,
-                        [check.x, check.y, check.z],
+                let mut fore = check;
+                add_distance_to_front(&mut fore, half_len);
+                let mut aft = check;
+                add_distance_to_front(&mut aft, -half_len);
+                if depth_ok(check.x, check.y) && depth_ok(fore.x, fore.y) && depth_ok(aft.x, aft.y)
+                {
+                    spawn_pos.set_position(
+                        check.x,
+                        check.y,
+                        check.z,
+                        check.rot_x,
+                        check.rot_y,
+                        check.rot_z,
                     );
-                    if surface - floor > min_depth {
-                        spawn_pos.set_position(
-                            check.x,
-                            check.y,
-                            check.z,
-                            check.rot_x,
-                            check.rot_y,
-                            check.rot_z,
-                        );
-                        break;
-                    }
+                    deep = true;
+                    break;
                 }
                 in_front += 1.0;
+            }
+            if !deep {
+                if let Some(o) = owner {
+                    let w = world.world_pos_rot(&WorldObject::from(o));
+                    let mut fallback = spawn_pos;
+                    fallback.set_position(
+                        w.x,
+                        w.y,
+                        w.z,
+                        spawn_pos.rot_x,
+                        spawn_pos.rot_y,
+                        spawn_pos.rot_z,
+                    );
+                    add_distance_to_front(&mut fallback, 5.0);
+                    if depth_ok(fallback.x, fallback.y) {
+                        spawn_pos = fallback;
+                    }
+                }
             }
             spawn_pos.z += offset_z;
         } else {
@@ -4277,4 +4318,19 @@ pub fn delete_slave_by_id<'a>(
         server.ids.character.release_id(db_id);
         true
     })
+}
+
+#[cfg(test)]
+mod spawn_floor_tests {
+    use super::summon_floor;
+
+    #[test]
+    fn a_ground_probe_miss_uses_the_terrain_fallback() {
+        assert_eq!(summon_floor(Some(Some(7.0)), || 3.0), 7.0);
+        // Some(None): no static/terrain collider on the ray, fall back to the terrain height
+        // (the heightmap) instead of treating the spot as bottomless water.
+        assert_eq!(summon_floor(Some(None), || 3.0), 3.0);
+        // None: the collision service is off, use the fallback as well.
+        assert_eq!(summon_floor(None, || 3.0), 3.0);
+    }
 }
