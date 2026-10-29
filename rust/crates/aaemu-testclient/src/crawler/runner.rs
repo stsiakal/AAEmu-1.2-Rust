@@ -238,6 +238,9 @@ pub async fn run(cfg: &CrawlConfig, catalog: &Catalog) -> Result<()> {
                 println!("[crawl] dashboard: {e:#}");
             }
         }
+        if !attempt {
+            continue;
+        }
         // Questing kills the bot now and then; GM revive is setup for the next quest.
         if !session.game.state.disconnected {
             let _ = session.pump().await;
