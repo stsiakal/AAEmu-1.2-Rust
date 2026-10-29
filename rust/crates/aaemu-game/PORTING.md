@@ -166,7 +166,7 @@ Each subsystem records its status here, in its own section only (see `CONTRIBUTI
 | `Skills/Effects/SpecialEffects/*` (141 named `SpecialType` actions), `BubbleEffect`, `ImpulseEffect`, `PhysicalExplosionEffect` | `systems/skills/effects/{special/*,unit_fx}.rs`, `packets_special.rs` | partial | Ported actions and subsystem hooks are present, but historical logging placeholders do not establish gameplay completeness. Buff stealing, component-selective aggro copy/reset, target loss, NPC despawn, ongoing-buff cancellation and pet recovery now execute. ExplodeBuff, MoveToGround and RedeemBuff now execute (see below). Client visuals use the existing skill/plot notifications. 13 extra S->C packets, byte-exact tests. |
 | `Skills/SkillControllers/{Floating,Wandering,Leap,Dash,Rotate}` | `systems/skills/controllers.rs` | partial | Rotate uses native constructor/tick timing (`0x3924E1D0` / `0x392315C0`) with 1.2 controller7678 regression coverage. Generic Anchor and Flowgraph remain unverified; native 10.x Anchor parameter kinds1001..1039 differ from the 1.2 data kinds1..3. Harpoon ropes have a separate vehicles implementation. |
 | Movement hooks (`CSMoveUnit.RemoveEffects`, `Character.SetPosition` Move removal, fall damage) | `systems/skills/mod.rs` (`on_move_request`, `on_moved`) | done | Called from `world::session::move_unit`. |
-| `Skill.EndChanneling` target buff (`ChannelingTargetBuffId`) | `systems/skills/{skill,buffs}.rs` (`end_channeling`, `finish_effect_by_skill`) | deviation | **Deviation:** the C# `Buffs.RemoveEffect(templateId, skillId)` raised the buff's `OnTimeout` triggers on every removal; the Rust removal skips them for explicit removals (dispels, a stopped channel; see the FISH escape in `buff_removal_tests.rs`). Quest item grants hang on that trigger (GainItem on buff 3896 of skill 18449 'Extract Earth Crystal', 4 s channel under a 6 s buff, and the other channeling-target-buff quest skills of the item triage), so a channel that **runs to its end** now fires the target buff's Timeout triggers before removing it. A stopped / cancelled channel fires nothing (the C# granted the item then too). The caster-side `ChannelingBuffId` and buffs applied by skill effects (buff 1963 of 'Capture Crayfish') are unchanged: the latter expire on their own timer and fire Timeout already. |
+| `Skill.EndChanneling` target buff (`ChannelingTargetBuffId`) | `systems/skills/{skill,buffs}.rs` (`end_channeling`, `finish_effect_by_skill`) | deviation | **Deviation:** the C# `Buffs.RemoveEffect(templateId, skillId)` raised the buff's `OnTimeout` triggers on every removal; the Rust removal skips them for explicit removals (dispels, a stopped channel; see the FISH escape in `buff_removal_tests.rs`). Quest item grants hang on that trigger (GainItem on buff 3896 of skill 18449 'Extract Earth Crystal', 4 s channel under a 6 s buff, and the other channeling-target-buff quest skills of the item triage), so a channel that **runs to its end** now ends the target buff the way its own timer would (ACTING -> FINISHED, Timeout triggers, removal). The data pairs a channel with a target buff of the very same length in 18 skills with a Timeout trigger (e.g. 14054 'Insert Anima Into Stopped Machine', buff 1728, 5 s each), so the buff's own timer and the end of the channel reach the Timeout together; taking the buff from ACTING is an atomic claim (`finish_effect_by_skill`, `schedule_effect`), the loser leaves the buff alone, and the Timeout runs once (before, a second `GainItem` or `NpcControlEffect` followed in about one channel in ten: `integration_tests::channel_and_target_buff_ending_together_fire_the_timeout_trigger_once`). A stopped / cancelled channel fires nothing (the C# granted the item then too). The caster-side `ChannelingBuffId` and buffs applied by skill effects (buff 1963 of 'Capture Crayfish') are unchanged: the latter expire on their own timer and fire Timeout already. |
 
 #### Raw attribute bounds and permanent pStats (2026-10-25)
 
@@ -624,6 +624,34 @@ the x2game / cry3dengine decompiles (addresses below). Config `Physics` (`Config
   NPC spawner points snap to it within 1 m (`npc_spawn_on_terrain`). Real data: 1 487 of the 1 524
   NPC spawns of the 4 busiest main_world cells are within 1 m of the physics ground (1 407 of the
   terrain elevation alone; 178 stand on brushes).
+* **Deviation:** `npc_spawn_on_terrain` (`systems/npcs/npc/spawner.rs`, `spawn_ground_z`) snapped a
+  spawn to the ground only within 1 m. When the ground probe (2 m above the spawn, downwards) hits
+  a floor (terrain, a building, a cave floor) the spawn now snaps onto it when it is less than
+  `SPAWN_GROUND_SNAP` (5 m) above it (or sunk up to the probe's 2 m); spawns authored 1-5 m
+  above the ground (about 5 % of main_world) no longer float. Larger gaps (structures, sea-surface
+  swimmers, instance data) and probe misses (caves with no floor, no collision service) keep the
+  C# 1 m rule, with three additions: a spawn 1 m or more above a floor under the water surface
+  (a surface swimmer) stays; a probe miss under solid, non-hole terrain less than
+  `SPAWN_SINK_SNAP` (6 m) deep is lifted onto the terrain (the client drew it buried), and
+  anything under a hole stays; a floor at the heightmap ceiling (`max_height / 4` = 1024 m in
+  main_world, the u16 height storage saturates) is not trusted; a spawn 1 m or more above a floor
+  and inside the bounding box of a loaded brush at least 6 m tall (a building / castle shell,
+  `inside_brush_bounds`) keeps its Z: the Two Crowns throne hall (about 100 crowd NPCs at
+  Z 242.8 around 13575-13636, 10427-10475) has no floor in our collision (the stairs brush's slab
+  covers only a diagonal band, `castle_nuia_001` has no floor geometry), so the probe falls through
+  to the terrain 4 m below and a snap would sink them under the hall floor. Flying and `underwater_creature`
+  NPCs are not snapped.
+* **Terrain holes:** the 1.2 `heightmap.dat` marks cave / basement entrances with surface id 31
+  (`raw & 0x1F` of a node-v5 sample; `cry3dengine` `IsHole` 0x300CAB30: the containing sector's
+  lower sample, a node with fewer than 33 samples is read at `floor(i * (size - 1) / 32)`, shared
+  sector edges belong to the positive-side sector). `NodeCell.surface` keeps the ids (taken
+  before `RescaleToInt` drops the fifth bit), `WorldHeightmap` a per-cell hole bitmap
+  (`grid_is_hole`), and the physics heightfield's `getSurfType` returns the default `typemask`
+  bit for a hole, so rays pass through (`TerrainSource::is_hole`, `terrain_is_hole`). The
+  C# ignored the holes (and `GetTerrainElevation` still answers over a hole, as native does).
+  Real data: cells 20,8 / 21,8 / 8,13 have 7 / 3 / 2 leaves with `hasHoles` and SID 31
+  (`real_terrain_holes`). Unchanged and unfixed: the C# height decode `data >> 4` (12 bit) differs
+  from the native `raw & 0xFFE0` (mean 0.05 m, max 0.25 m on the measured cells).
   **Visibility deviation (systems::npcs / world::unit_state, 2026-10-11):** NPC unit-state packets
   preserve the spawn/movement transform instead of the C# serializer's `GetReferenceHeight`
   mutation. That mutation could replace a collision floor with a coarse navmesh plane or reset
@@ -2895,6 +2923,16 @@ running in place). Four mirrored C# bugs and one missing safeguard:
   146, never got past x 10494.7 of a 10497.3 route, and the 5 s stall skip fired). Rust only
   starts the simulation for an NPC without an AI; the AI runs the FollowPath / UseSkill / Timeout
   commands itself. Test: `flow_tests::run_command_set_effect_does_not_start_the_simulation_mover_for_an_ai_npc`.
+
+* `NpcControlEffect` `FollowPath` (and the no-AI `RunCommandSet` route) checked and set `IsInPatrol`
+  in two steps. The effect can reach an NPC twice at once (Timeout trigger of a channeling
+  target buff: the buff's timer and the end of the channel), and a second caller that passed the
+  check ran `Simulation.GoToPath` again, which toggles `MoveToPathEnabled` back off: the walk
+  stopped at once (6-9 of 400 simultaneous deliveries). The check-and-set is one step now
+  (`hooks::begin_patrol`). Test: `flow_tests::follow_path_effect_arriving_twice_at_once_starts_the_walk_once`;
+  the whole quest 2423 'The Windwhips' Chest' chain (Anima Injector -> buff 1728 -> route
+  `q2423_fm_tige` -> Suspicious Chest 2906 -> Metal Cylinder) is pinned on the real tables by
+  `skills::quest_machine_flow_tests` (`AAEMU_COMPACT_DB`).
 
 `flow_tests::follow_path_command_set_walks_every_route_point` runs the real command-set shape
 over three routes with an elevated point and checks every point is targeted in order, the set
