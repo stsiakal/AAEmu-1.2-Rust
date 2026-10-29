@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use aaemu_commons::PacketStream;
 use aaemu_game::opcodes::{cs, pp, sc};
+use aaemu_game::systems::skills::types::{SkillCastTarget, SkillCaster, SkillObject};
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -1448,13 +1449,39 @@ async fn wait_skill(session: &mut Session, skill_id: u32, wait: Duration) -> boo
     session.game.timeout = saved;
     match answered {
         Ok(p) => {
-            let mut s = p.stream();
             session.tracker.observe(std::slice::from_ref(&p));
-            let _ = s.read_u32();
-            true
+            if p.is_sc(sc::SCErrorMsgPacket) {
+                false
+            } else {
+                skill_response_result(&p).is_ok_and(|r| r == 0)
+            }
         }
         Err(_) => false,
     }
+}
+
+fn skill_response_result(packet: &Packet) -> anyhow::Result<u8> {
+    if packet.is_sc(sc::SCSkillFiredPacket) {
+        return Ok(0);
+    }
+    ensure!(
+        packet.is_sc(sc::SCSkillStartedPacket),
+        "server reported an error instead of a skill response"
+    );
+    let mut stream = packet.stream();
+    stream.read_u32()?;
+    stream.read_u16()?;
+    let caster_kind = stream.read_u8()?;
+    SkillCaster::read(caster_kind, &mut stream)?;
+    let target_kind = stream.read_u8()?;
+    SkillCastTarget::read(target_kind, &mut stream)?;
+    let object_kind = stream.read_u8()?;
+    SkillObject::read(object_kind, &mut stream)?;
+    stream.read_u16()?;
+    stream.read_u16()?;
+    stream.read_u8()?;
+    let flags = stream.read_u8()?;
+    Ok(if flags & 1 != 0 { stream.read_u8()? } else { 0 })
 }
 
 fn own_skill_response(packet: &Packet, skill_id: u32, caster: u32) -> bool {
@@ -1587,6 +1614,7 @@ impl LogWindow {
         let mut out: Vec<String> = text
             .lines()
             .filter(|l| l.contains(" WARN ") || l.contains(" ERROR "))
+            .filter(|l| !noise_line(l))
             .map(|l| l.chars().take(300).collect())
             .take(10)
             .collect();
@@ -1617,6 +1645,7 @@ impl ReportWindow {
             .into_iter()
             .filter(|p| !self.before.contains(p))
             .filter(|p| p.file_name().is_some_and(|n| n != "summary.json"))
+            .filter(|p| !report_is_noise(p))
             .map(|p| {
                 p.strip_prefix(dir)
                     .unwrap_or(&p)
@@ -1626,6 +1655,26 @@ impl ReportWindow {
             .take(10)
             .collect()
     }
+}
+
+fn noise_line(line: &str) -> bool {
+    line.contains("TeleportEnded,") || line.contains("entered closed zone")
+}
+
+/// The crawler teleports constantly; those WARNs are not quest evidence.
+fn report_is_noise(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    let message = v
+        .get("trigger")
+        .and_then(|t| t.get("message"))
+        .and_then(|m| m.as_str())
+        .unwrap_or("");
+    message.starts_with("TeleportEnded,") || message.contains("entered closed zone")
 }
 
 fn list_reports(dir: &Path) -> HashSet<PathBuf> {

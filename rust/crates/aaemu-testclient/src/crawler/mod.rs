@@ -149,16 +149,14 @@ pub async fn run(cfg: CrawlConfig) -> anyhow::Result<()> {
         .with_context(|| format!("creating output directory {}", cfg.out.display()))?;
     let catalog = catalog::Catalog::load(&cfg.compact, &cfg.data_dir)?;
     let path = cfg.catalog_path();
-    if !path.exists() {
-        catalog.write(&path)?;
-        println!(
-            "[crawl] catalog: {} quests, {} npcs, {} doodads -> {}",
-            catalog.quests.len(),
-            catalog.npc_spawns.len(),
-            catalog.doodad_spawns.len(),
-            path.display()
-        );
-    }
+    catalog.write(&path)?;
+    println!(
+        "[crawl] catalog: {} quests, {} npcs, {} doodads -> {}",
+        catalog.quests.len(),
+        catalog.npc_spawns.len(),
+        catalog.doodad_spawns.len(),
+        path.display()
+    );
     let summary = catalog.summary(&cfg);
     println!(
         "[crawl] {}: {} quests in levels {}-{} ({} with objectives unsupported)",

@@ -192,6 +192,8 @@ pub struct DoodadSkills {
     pub group_skill: HashMap<u32, u32>,
     /// Template -> the skill of its default func group.
     pub template_skill: HashMap<u32, u32>,
+    /// Templates with at least one func group that offers a player skill.
+    pub templates_with_skill: HashSet<u32>,
 }
 
 type TemplateRow = (u32, String, u8, u32, u32, u32, bool, bool, i32);
@@ -326,7 +328,7 @@ fn load_groups(
 fn load_spawns(path: &Path) -> Result<HashMap<u32, Vec<[f32; 3]>>> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading spawn file {}", path.display()))?;
-    let value: serde_json::Value = serde_json::from_str(&text)
+    let value: serde_json::Value = aaemu_game::data::world_data::parse_lenient_json(&text)
         .with_context(|| format!("parsing spawn file {}", path.display()))?;
     let mut out: HashMap<u32, Vec<[f32; 3]>> = HashMap::new();
     let Some(list) = value.as_array() else {
@@ -885,8 +887,15 @@ impl Catalog {
             if starter.kind == "sphere" && unsupported.is_none() {
                 unsupported = Some("starter is a quest sphere".into());
             }
-            if turnin.kind == "none" && unsupported.is_none() {
-                unsupported = Some("no completion act".into());
+            if turnin.kind == "none" {
+                // No report act anywhere: the engine walks Ready -> Reward -> Completed by
+                // itself once the objectives are done.
+                turnin = Turnin {
+                    kind: "auto".into(),
+                    npc: 0,
+                    doodad: 0,
+                    act: String::new(),
+                };
             }
 
             cat.quests.push(Quest {
@@ -952,6 +961,28 @@ impl Catalog {
             "item_id",
         )?;
         cat.load_doodad_skills(&conn)?;
+        // Doodad objectives whose template offers no skill in any func group cannot be played
+        // through a real packet; report them as unsupported instead of failing at runtime.
+        for q in &mut cat.quests {
+            if q.unsupported.is_some() {
+                continue;
+            }
+            for o in &q.objectives {
+                let doodad = if o.class == "QuestActObjInteraction" {
+                    o.doodad
+                } else if o.class.contains("ItemGather") || o.class.contains("ItemUse") {
+                    o.highlight_doodad
+                } else {
+                    0
+                };
+                if doodad != 0 && !cat.doodad_skills.templates_with_skill.contains(&doodad) {
+                    q.unsupported = Some(format!(
+                        "doodad {doodad} has no interaction skill in the data"
+                    ));
+                    break;
+                }
+            }
+        }
         Ok(cat)
     }
 
@@ -1178,7 +1209,14 @@ fn required_count(score: i32, let_it_done: bool, d: &Detail) -> i32 {
 
 fn gate_text(kind: u32, v1: u32, v2: u32) -> (bool, String) {
     match kind {
-        1 => (true, format!("level {v1}-{v2}")),
+        1 => (
+            true,
+            if v2 == 0 {
+                format!("level >= {v1}")
+            } else {
+                format!("level {v1}-{v2}")
+            },
+        ),
         2 => (false, format!("ability {v1} level {v2}")),
         3 => (true, format!("race {v1}")),
         4 => (true, format!("gender {v1}")),
