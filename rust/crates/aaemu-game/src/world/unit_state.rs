@@ -286,7 +286,7 @@ impl NetUnitHeader {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EquipMode {
     /// Character / Housing / Mate: `stream.Write(item)` or `0`, except the body parts
-    /// (19..=25) and Cosplay (27), which are template-only.
+    /// (19..=25), which are template-only.
     Full,
     /// Slave: full items in every slot; the client reads 19..=25 as full items only for
     /// `BaseUnitType.Slave`.
