@@ -119,13 +119,15 @@ deriving further layout offsets. Rays are ported: `SRWIParams` (64 B) and `ray_h
 (callbacks at +100/+104) and the five terrain entity slots at world+0x52C+4*i.
 `pe_params_particle` is ported (pointer at +140, size 156), `player dynamics` (id 4) and
 `pe_status_living` (id 2) have their 1.2 layouts, and `var off=` translates the physics-vars
-block shift. `gather`/`abuoy`/`estate`/`poke` use the 1.2 addresses and 76-byte
-`global_buoyancy` records, so the p4a global-area buoyancy scenarios run. Wheeled entities
-are ported: car params (pointer at +84, no x64 +12 field, size 124), identical wheel
-params, and the type-1 geomparams wheel block shifted from +112..+183 to +88..+159 by the
-same whole-struct conversion. The three
-process-specific status-5 words (+100/+104/+120 in the 1.2 output) are zeroed so the trace
-is deterministic. See `tests/golden-12/README.md` for the evidence.
+block shift. Every `pe_status` id the suite uses is marshalled like the params (pos
+time_back +120 -> +100, living, wheel status 5): the scenario's x64 overrides are applied
+first and the whole struct is translated at the vtable call. Wheel status 5 has no wheel
+pos/q block; its contact-entity pointer at x86 +100 is zeroed before the reverse conversion
+because it is process-specific. `gather`/`abuoy`/`estate`/`poke` use the 1.2 addresses and
+76-byte `global_buoyancy` records, so the p4a global-area buoyancy scenarios run. Wheeled
+entities are ported: car params (pointer at +84, no x64 +12 field, size 124), identical
+wheel params, and the type-1 geomparams wheel block shifted from +112..+183 to +88..+159 by
+the same whole-struct conversion. See `tests/golden-12/README.md` for the evidence.
 
 **Rare startup crash.** About 1 in 20-100 runs aborts before the first step with
 `EXCEPTION c0000005 at cryphysics VA 6a071250 addr 6a071250` (exit code 3), independent of

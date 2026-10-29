@@ -127,7 +127,17 @@ GetParams-buffer fixes: `p5_particle_bounce`, `p5_particle_flags`, `p5_particle_
 `p7_body_add`, `p5_wheeled_gears`, `p5_wheeled_settle` and `p5_wheeled_settle_ray` changed
 (the corrected fields now match x64, e.g. the `getparams` part flags and the gear-ratio
 dumps), but their first divergences are unchanged 1-ulp float differences and the wheeled
-denormal/car-tail differences remain, so no status or count changes. The 21
+denormal/car-tail differences remain, so no status or count changes. The traces were
+regenerated again when statuses were marshalled like params (`pe_status_pos` time_back +120
+-> +100, `pe_status_living`, `pe_status_wheel`); the eleven wheeled scenarios with status-5
+dumps changed (`p5_wheeled_brake`, `drive`, `params`, `platform`, `settle`, `settle_ray`, `slope`,
+`tank`, `terrain_bumps`, `terrain_slope`, `turn`) — their status-5 lines now compare the
+same fields (except the x64-only wheel pos/q block) instead of a 28-byte-shifted dump, but
+their first divergences are unchanged (the earlier physics ulp/denormal difference), so the
+counts still do not change. The
+`p7_params_rigid` `f120=1` status now reaches the 1.2 engine, but that scenario's current and
+previous poses happen to be bit-identical in 1.2, so its trace is unchanged. All scenarios
+were run twice; the traces are deterministic. The 21
 not-applicable scenarios are the `p1a_*` internal-function
 probes (`--gprobe`, `--gphysblob`, protocol/pair-function addresses): they call x64
 internal functions directly and have no 1.2 equivalent in this harness.
@@ -175,8 +185,8 @@ control word should not matter. That holds for most scenarios, but **not all**:
 `p1c_drop_terrain_slope`, `p5_particle_spawn`, `p5_living_pair`, `p4a_buoy_basic` and
 `p4a_buoy_variants` differ between `--fpu 24` and `--fpu 53` (e.g. `capsule_drop` step 35
 `cap` `v[1]`: `3968136f` vs `396813ed`). Those have both traces committed. The wheeled
-family is **not** x87-dependent: its earlier apparent fpu24 differences were the
-run-varying status-5 words below. The decompile has 144 `float10` functions, so 1.2 is "SSE in the hot
+family is **not** x87-dependent: its `--fpu 24` and `--fpu 53` traces are byte-identical.
+The decompile has 144 `float10` functions, so 1.2 is "SSE in the hot
 rigid path, x87 in some helpers", not SSE-only; the docs have been corrected. For the
 bit-identical scenarios the 24-bit and 53-bit runs are byte-identical, which is expected
 from SSE code and is not by itself evidence of a divergence.
@@ -262,10 +272,15 @@ reading the wrong field. Sources are in `cryphysics.c` (x86 1.2, base `0x34FF000
   fields are absent, which is the first difference in the settle scenarios. Wheeled
   `part` records are geomparams type 1: the x64 wheel block at +112..+183 moves to the
   1.2 +88..+159 in the geomparams conversion (AddGeometry `0x35119FC0` reads bDriving at
-  `param_3[0x16]`). Status 4/5 are read in the raw x64-compatible layout up to +124.
-  Status 5 words +100/+104/+120 in the 1.2 output are process-specific (they change by
-  millions between runs, like an rdtsc delta); the oracle zeroes them so the trace is
-  deterministic. They are internal values, not physics results.
+  `param_3[0x16]`). Vehicle status 4 keeps the x64 layout. Wheel status 5 is marshalled
+  (`0x351184D0`): 1.2 drops the x64 wheel pos/q block at +16..43, so x64 +44..127 map to
+  x86 +16..99, the x64 contact-entity pointer +128 becomes x86 +100 (zeroed before the
+  reverse conversion because it is process-specific) and mass share x64 +136 becomes x86
+  +104. The rest of the x64 tail is present shifted: brake torque/steer/rotation
+  (+116..+124) are x86 +88..96. Only the x64 wheel pos/q block at +16..43 has no 1.2
+  counterpart, so those words are zero in the 1.2 traces: a genuine layout difference,
+  not an ulp one. The status-5 dumps now compare the same fields in both traces except
+  that x64-only block; the old raw dump was shifted by 28 bytes.
 
 ## Regenerate (runtime preparation: `oracle/README.md`)
 

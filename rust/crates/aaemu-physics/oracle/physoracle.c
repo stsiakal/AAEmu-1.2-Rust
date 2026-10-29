@@ -766,6 +766,86 @@ static const OffMap map_particle[] = {
   {80, 80, 12}, {92, 92, 12}, {104, 104, 12}, {116, 116, 16}, {132, 132, 4}, {136, 136, 4},
   {144, 140, 4}, {152, 144, 4}, {156, 148, 4}, {160, 152, 4}
 };
+/* pe_status_* (GetStatus): the scenario image is x64; these maps marshal every status type the
+   suite uses into/out of the 1.2 layout at the vtable call.  Evidence (x86 cryphysics.c):
+   - pos (1): base GetStatus FUN_3507f330 writes mtx3x4 +84, mtx3x3 +88, pGeom +92, pGeomProxy
+     +96 (param_2[0x15..0x18]); CRigidEntity::GetStatus 0x350bdd20 reads time_back at +100
+     (param_2[0x19]).  Everything through iSimClass +80 is unchanged.
+   - living (2): FUN_35030500, see the field map below.
+   - vehicle (4): identical through +52 (0x351184d0); 1.2 adds an extra +56 count, not in x64.
+   - wheel (5): 0x351184d0 drops the x64 pos/q block +16..43, so x64 +44..127 shift to +16..99;
+     the x64 8-byte pCollider +128 becomes x86 +100 (wheel record +0x4F0) and mass share
+     x64 +136 -> x86 +104 (param_2[0x19]/[0x1a]).
+   - dynamics (8): rigid GetStatus 0x350bdd20 writes the x64 offsets through mass +112.
+   - collisions (9): 1.2 has the buffer pointer at +4 and the count at +8 (soft GetStatus
+     0x350f8880 reads param_2[1] as the buffer and param_2[2] as the count).
+   The remaining ids used by the suite are pointer-free and keep the x64 offsets. */
+static const OffMap map_status_pos[] = {
+  {0, 0, 4}, {4, 4, 16}, {20, 20, 4}, {24, 24, 36}, {60, 60, 16}, {76, 76, 4}, {80, 80, 4},
+  {88, 84, 4}, {96, 88, 4}, {104, 92, 4}, {112, 96, 4}, {120, 100, 4}
+};
+static const OffMap map_status_living[] = {
+  /* FUN_35030500 writes +4..+148: x86 +4..83 -> x64 +4..83, +84 -> +88, +88..119 -> +92..123,
+     x64 +124 is absent, +120..135 -> +128..143, +136 -> +144, +140 (ptr) -> +152,
+     +144 -> +164. */
+  {0, 0, 4}, {4, 4, 80}, {88, 84, 4}, {92, 88, 32}, {128, 120, 16}, {144, 136, 4},
+  {152, 140, 4}, {164, 144, 4}
+};
+static const OffMap map_status_vehicle[] = {{0, 0, 56}};
+static const OffMap map_status_wheel[] = {
+  {0, 0, 16}, {44, 16, 84}, {128, 100, 4}, {136, 104, 4}
+};
+static const OffMap map_status_awake[] = {{0, 0, 8}};
+static const OffMap map_status_dynamics[] = {{0, 0, 116}};
+static const OffMap map_status_collisions[] = {{0, 0, 4}, {8, 4, 4}, {16, 8, 4}};
+static const OffMap map_status_id[] = {{0, 0, 28}};
+static const OffMap map_status_nparts[] = {{0, 0, 8}};
+static const OffMap map_status_point[] = {{0, 0, 16}};
+static const OffMap map_status_abilities[] = {{0, 0, 24}};
+static const OffMap map_status_patch[] = {{0, 0, 28}};
+static const OffMap map_status_artic[] = {{0, 0, 8}};
+static const OffMap map_status_stance[] = {{0, 0, 72}};
+static const OffMap map_status_constraint[] = {{0, 0, 52}};
+static const OffMap *x86_status_offmap(int type, int *n) {
+  switch (type) {
+  case 1: *n = (int)(sizeof map_status_pos / sizeof map_status_pos[0]); return map_status_pos;
+  case 2: *n = (int)(sizeof map_status_living / sizeof map_status_living[0]); return map_status_living;
+  case 4: *n = (int)(sizeof map_status_vehicle / sizeof map_status_vehicle[0]); return map_status_vehicle;
+  case 5: *n = (int)(sizeof map_status_wheel / sizeof map_status_wheel[0]); return map_status_wheel;
+  case 7: *n = (int)(sizeof map_status_awake / sizeof map_status_awake[0]); return map_status_awake;
+  case 8: *n = (int)(sizeof map_status_dynamics / sizeof map_status_dynamics[0]); return map_status_dynamics;
+  case 9: *n = (int)(sizeof map_status_collisions / sizeof map_status_collisions[0]); return map_status_collisions;
+  case 10: *n = (int)(sizeof map_status_id / sizeof map_status_id[0]); return map_status_id;
+  case 12: *n = (int)(sizeof map_status_nparts / sizeof map_status_nparts[0]); return map_status_nparts;
+  case 13: *n = (int)(sizeof map_status_point / sizeof map_status_point[0]); return map_status_point;
+  case 15: *n = (int)(sizeof map_status_abilities / sizeof map_status_abilities[0]); return map_status_abilities;
+  case 19: *n = (int)(sizeof map_status_patch / sizeof map_status_patch[0]); return map_status_patch;
+  case 20: *n = (int)(sizeof map_status_artic / sizeof map_status_artic[0]); return map_status_artic;
+  case 21: *n = (int)(sizeof map_status_stance / sizeof map_status_stance[0]); return map_status_stance;
+  case 26: *n = (int)(sizeof map_status_constraint / sizeof map_status_constraint[0]); return map_status_constraint;
+  }
+  *n = 0;
+  return 0;
+}
+static int x86_status_convert(int type, const unsigned char *src, unsigned char *dst, int to86) {
+  int n;
+  const OffMap *m = x86_status_offmap(type, &n);
+  if (!m) return 0;
+  if (to86) {
+    memset(dst, 0, 512);
+  } else {
+    int end = 0;
+    for (int i = 0; i < n; i++)
+      if (m[i].x64 + m[i].size > end) end = m[i].x64 + m[i].size;
+    memset(dst, 0, (size_t)end);
+  }
+  for (int i = 0; i < n; i++) {
+    int so = to86 ? m[i].x64 : m[i].x86;
+    int doff = to86 ? m[i].x86 : m[i].x64;
+    memcpy(dst + doff, src + so, m[i].size);
+  }
+  return 1;
+}
 /* pe_geomparams (AddGeometry param 2): the 1.2 struct is 88 B plain, 160 B car and 92 B
    articulated.  x64 mtx3x4 +48, mtx3x3 +56, surface +64, flags +68, collider +72,
    minContactDist +76, idmatBreakable +80, lattice +88, matMapping +96, nMats +104,
@@ -897,21 +977,6 @@ static int x86_entity_off_rev(void *e, int off) {
     if (off == 100) return 132;
   }
   return -1;
-}
-
-/* pe_status_living (id 2) has extra/reordered words after +80 in 1.2 (GetStatus
-   FUN_35030500 writes +84..+148): x86 +4..83 -> x64 +4..83, +84 -> +88, +88..119 -> +92..123,
-   x64 +124 is absent in x86, +120..135 -> +128..143, +136 -> +144, +140 (ptr) -> +152,
-   +144 -> +164. */
-static void x86_status_living_to64(const unsigned char *s, unsigned char *d) {
-  memset(d, 0, 512);
-  memcpy(d + 4, s + 4, 80);
-  memcpy(d + 88, s + 84, 4);
-  memcpy(d + 92, s + 88, 32);
-  memcpy(d + 128, s + 120, 16);
-  memcpy(d + 144, s + 136, 4);
-  memcpy(d + 152, s + 140, 4);
-  memcpy(d + 164, s + 144, 4);
 }
 
 /* ---- 1.2 buoyancy probes (p4a_*): CRigidEntity::GatherBuoyancy 0x350CE9B0 and
@@ -1350,31 +1415,24 @@ static void run_line(char *line) {
     unsigned char *callb = b;
 #ifdef ORACLE_X86
     unsigned char b86[1024];
-    int st_living = 0;
-    /* pointer-bearing params get the x86 layout; status/action structs used by the suite are
-       pointer-free up to the fields the scenarios read, except CLivingEntity status 2. */
+    /* params and statuses get the x86 layout at the vtable call; dumps keep using x64 offsets. */
     if ((c[0] == 'p' || c[0] == 'g') && x86_convert(type, b, b86, 1)) callb = b86;
-    else if (c[0] == 's' && type == 2 && (int)(intptr_t)m_call0(e, 1) == 4) {
-      memset(b86, 0, sizeof b86);
-      SETI(b86, 0, type);
-      callb = b86;
-      st_living = 1;
-    }
+    else if (c[0] == 's' && x86_status_convert(type, b, b86, 1)) callb = b86;
 #endif
     if (c[0] == 'p') r = m_setp(e, E_SetParams, callb, ts);
     else if (c[0] == 'a') r = m_setp(e, E_Action, callb, ts);
     else if (c[0] == 'g') r = m_status(e, E_GetParams, callb);
     else r = m_status(e, E_GetStatus, callb);
 #ifdef ORACLE_X86
-    if (st_living) x86_status_living_to64(b86, b);
-    else if (callb != b) x86_convert(type, b86, b, 0);
-    /* Wheel status (5) word +104 returns a process-specific counter/pointer in 1.2 (it
-       changes between runs by a few million, like a rdtsc delta).  Mask it so the trace is
-       deterministic; it is an internal value, not a physics result. */
-    if (c[0] == 's' && type == 5 && (int)(intptr_t)m_call0(e, 1) == 3) {
-      *(uint32_t *)(b + 100) = 0;
-      *(uint32_t *)(b + 104) = 0;
-      *(uint32_t *)(b + 120) = 0;
+    if (callb != b) {
+      if (c[0] == 's') {
+        /* Wheel status (5) x86 +100 is the contact entity pointer (process-specific); it maps
+           to x64 +128, which no dump prints.  Zero it so a pointer never reaches the trace. */
+        if (type == 5 && (int)(intptr_t)m_call0(e, 1) == 3) *(uint32_t *)(b86 + 100) = 0;
+        x86_status_convert(type, b86, b, 0);
+      } else {
+        x86_convert(type, b86, b, 0);
+      }
     }
 #endif
     printf("ret %s %s %d %d", c, need(&t, "target"), type, r);

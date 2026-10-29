@@ -475,9 +475,14 @@ destroy (`0x3509E7D0`), 30 `SetSurfaceParameters` (`0x35081080`), 33 `TimeStep` 
 sim_class 44, recalc_bounds 48, byte 52. `pe_geomparams` is 88 B: density 4, mass 8, pos 12, q 24,
 scale 40, mtx3x4 44, mtx3x3 48, surface_idx 52, flags 56, collider 60, min_contact_dist 64,
 idmat_breakable 68, lattice 72, matMapping 76, nMats 80, recalcBBox 84. `pe_status_pos` is
-unchanged through `iSimClass` (+80; `time_back` moves to +100). Pointer-free params/actions
-(simulation, buoyancy, bbox, flags, timeout, impulse, awake, set_velocity, reset, drive) keep
-their x64 offsets.
+unchanged through `iSimClass` (+80), but the pointer fields move to 84 (`Matrix34*`), 88
+(`Matrix33*`), 92 (`pGeom`) and 96 (`pGeomProxy`) and `time_back` moves to +100
+(`FUN_3507f330` writes `param_2[0x15..0x18]`; CRigidEntity::GetStatus `0x350bdd20` reads
+`param_2[0x19]`). `pe_status_living` follows `FUN_35030500`; wheel status 5 (`0x351184d0`) drops
+the x64 wheel pos/q block at +16..43, so x64 +44..127 map to x86 +16..99, the x64 contact-entity
+pointer +128 is x86 +100 and mass share +136 is +104. Vehicle status 4 and dynamics 8 keep their
+x64 offsets. Pointer-free params/actions (simulation, buoyancy, bbox, flags, timeout, impulse,
+awake, set_velocity, reset, drive) keep their x64 offsets.
 
 **Physics-vars block.** `GetPhysVars` returns `world+0x48` (x64: `+0x68`); the block is 540 B.
 The first 29 words equal x64. After block `+116` two extra zero words follow (x86 world
@@ -551,7 +556,9 @@ and keep the x64 layout. Player dynamics (4) keeps the x64 layout through collTy
 pColliderToIgnore is +76 (x64 +80) and bActive +84 (x64 +92) (`0x3502F5D0`). `pe_status_living`
 (2) is ordered differently (`FUN_35030500`): x86 +4..83 -> x64 +4..83, +84 -> +88, +88..119
 -> +92..123, x64 +124 absent, +120..135 -> +128..143, +136 -> +144, +140 (ptr) -> +152, +144
--> +164. `pe_status_check_stance` (21) is pointer-free and matches. Six living scenarios are
+-> +164. Statuses are marshalled like params (one map per `pe_status` id the suite uses), so
+scenario `status` overrides keep their x64 offsets in 1.2 too. `pe_status_check_stance` (21) is
+pointer-free and matches. Six living scenarios are
 bit-identical (walk, dims, jump, slope, stairs, swim); `p5_living_bumps`/`net`/`terrain`
 differ by 1–2 ulp. The remaining four are timing/transient differences, not proof of a
 different rule: `p5_living_pair` is the same push of `c` one step earlier on x86 (step 19
@@ -584,13 +591,15 @@ which is the first divergence in `p5_wheeled_settle`/`settle_ray`. Wheeled parts
 geomparams type 1: the x64 wheel fields +112..+183 move to 1.2 +88..+159 in the
 whole-struct geomparams conversion (`AddGeometry 0x35119FC0` reads bDriving at
 `param_3[0x16]`). GetParams output buffers reached through a scenario `buf:` pointer (the
-gear ratios) survive the reverse conversion. Twelve wheeled scenarios run
-(car position matches; q denormals/velocity differ by 1 ulp), `p5_wheeled_mesh` needs
-trimesh. The wheeled family is not x87-dependent: the earlier apparent 24/53 differences
-were status-5 words +100/+104/+120, which are process-specific counters in 1.2 (they change
-by millions between runs). The oracle zeroes those three words so the trace is
-deterministic. A rare startup crash at heap VA `0x6A071250` occurred a few times and did not
-reproduce in retries.
+gear ratios) survive the reverse conversion. Vehicle status 4 keeps the x64 offsets.
+Wheel status 5 is marshalled (`0x351184D0`): 1.2 has no wheel pos/q block, so x64
++44..+127 map to x86 +16..+99, the contact-entity pointer x64 +128 becomes x86 +100
+(process-specific, zeroed before the reverse conversion) and mass share x64 +136 becomes
+x86 +104; the x64 +116..+124 tail is at x86 +88..96. Twelve wheeled scenarios
+run (car position matches; q denormals/velocity differ by 1 ulp), `p5_wheeled_mesh` needs
+trimesh. The wheeled family is not x87-dependent: its `--fpu 24` and `--fpu 53` traces are
+byte-identical. A rare startup crash at heap VA `0x6A071250` occurred a few times and did
+not reproduce in retries.
 
 **SSE vs x87.** The earlier note "both builds are SSE scalar, so the x87 precision control
 does not matter" is only true for the hot rigid path: 22 of the 25 scenarios are byte-identical
