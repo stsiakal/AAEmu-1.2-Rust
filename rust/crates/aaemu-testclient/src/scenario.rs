@@ -17,13 +17,18 @@ use crate::record::Recorder;
 use crate::stream::StreamClient;
 
 mod cometsboon;
+mod coreloop;
 mod craft;
 mod doodad;
 mod fixes;
+mod gather;
+mod housing;
 mod lunafrost;
+mod mount;
 mod music;
 mod plant;
 mod portal;
+mod questchain;
 mod questitem;
 mod script;
 
@@ -90,6 +95,22 @@ pub enum Kind {
     /// `scenario/craft.rs`). GM account.
     #[serde(rename = "craft")]
     Craft,
+    /// Build a small house with `CSCreateHouse` and its build steps, then demolish it (see
+    /// `scenario/housing.rs`). GM account.
+    #[serde(rename = "housing")]
+    Housing,
+    /// Summon a mount, ride it, move, dismount and dismiss it (see `scenario/mount.rs`).
+    /// GM account.
+    #[serde(rename = "mount")]
+    Mount,
+    /// Accept quest 251, kill and loot three boars and turn it in (see `scenario/questchain.rs`).
+    /// GM account.
+    #[serde(rename = "questchain")]
+    QuestChain,
+    /// Mine an iron vein, check the labor cost and the ore (see `scenario/gather.rs`).
+    /// GM account.
+    #[serde(rename = "gather")]
+    Gather,
     /// Ad-hoc live checks driven by the command file `$AAEMU_SCRIPT` (see `scenario/script.rs`).
     /// GM account.
     #[serde(rename = "script")]
@@ -116,9 +137,13 @@ impl std::str::FromStr for Kind {
             "lunafrost" => Self::Lunafrost,
             "portal" => Self::Portal,
             "craft" => Self::Craft,
+            "housing" => Self::Housing,
+            "mount" => Self::Mount,
+            "questchain" => Self::QuestChain,
+            "gather" => Self::Gather,
             "script" => Self::Script,
             _ => bail!(
-                "unknown scenario '{s}' (login, lobby, full, combat, npc-return, mate-revive, questitem, doodad, \n                 plant, cometsboon, stonethrow, ghost, lunafrost, portal, craft, script, load)"
+                "unknown scenario '{s}' (login, lobby, full, combat, npc-return, mate-revive, questitem, doodad, \n                 plant, cometsboon, stonethrow, ghost, lunafrost, portal, craft, housing, mount, \n                 questchain, gather, script, load)"
             ),
         })
     }
@@ -912,6 +937,26 @@ async fn run_inner(
     }
     if kind == Kind::Craft {
         craft::run(&mut game, r).await?;
+        drop(stream);
+        return Ok(());
+    }
+    if kind == Kind::Housing {
+        housing::run(&mut game, r).await?;
+        drop(stream);
+        return Ok(());
+    }
+    if kind == Kind::Mount {
+        mount::run(&mut game, cfg, r).await?;
+        drop(stream);
+        return Ok(());
+    }
+    if kind == Kind::QuestChain {
+        questchain::run(&mut game, r).await?;
+        drop(stream);
+        return Ok(());
+    }
+    if kind == Kind::Gather {
+        gather::run(&mut game, r).await?;
         drop(stream);
         return Ok(());
     }
