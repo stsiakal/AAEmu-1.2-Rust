@@ -2322,6 +2322,9 @@ pub fn create_from_skill(
         return;
     };
     let owner = owner.clone();
+    // Capture synchronously, before the detached future can be delayed: a later refusal must
+    // only roll back the cooldowns this cast started.
+    let cooldown = summon_cooldown_token(&server, &owner, item_template_id);
     // Construct the lease before the detached future exists, so even a never-polled task
     // remains pending evidence. The captured lease drops on no runtime, abort and unwind.
     let lease = server
@@ -2341,6 +2344,7 @@ pub fn create_from_skill(
             placement,
             max_range,
             lease,
+            cooldown,
         )
         .await;
     };
@@ -2447,6 +2451,9 @@ pub fn create_for_owner<'a>(
     placement: Option<crate::systems::skills::ext::SummonPlacement>,
     max_range: f32,
 ) -> impl std::future::Future<Output = Option<SlaveRef>> + Send + 'a {
+    // Capture synchronously (the returned future may be polled much later): a refusal must
+    // only roll back the cooldowns this cast started.
+    let cooldown = summon_cooldown_token(server, owner, item_template_id);
     let lease = server
         .systems
         .vehicles
@@ -2463,6 +2470,7 @@ pub fn create_for_owner<'a>(
         placement,
         max_range,
         lease,
+        cooldown,
     )
 }
 
@@ -2477,6 +2485,7 @@ async fn create_for_owner_job(
     placement: Option<crate::systems::skills::ext::SummonPlacement>,
     max_range: f32,
     lease: super::audit::Lease,
+    cooldown: Option<SummonCooldownToken>,
 ) -> Option<SlaveRef> {
     lease.phase("validating");
     let world = player_world(server, owner)?;
@@ -2509,12 +2518,12 @@ async fn create_for_owner_job(
         else {
             // The placement was refused (error 583): the summon never happens, so do not leave
             // the skill cooldown/GCD that the skill system started.
-            refund_summon_cooldown(server, owner, item.template_id);
+            refund_summon_cooldown(owner, cooldown);
             return None;
         };
         if collision && !summon_placement_clear_1_2(server, &world, owner, &template, &transform) {
             error(owner, error::SLAVE_SPAWN_SHIP_NEED_MORE_SPACE);
-            refund_summon_cooldown(server, owner, item.template_id);
+            refund_summon_cooldown(owner, cooldown);
             return None;
         }
         (Some(transform), false)
@@ -2525,7 +2534,7 @@ async fn create_for_owner_job(
             Some(transform) => (Some(transform), true),
             None => {
                 error(owner, error::SLAVE_SPAWN_SHIP_NEED_MORE_SPACE);
-                refund_summon_cooldown(server, owner, item.template_id);
+                refund_summon_cooldown(owner, cooldown);
                 return None;
             }
         }
@@ -2541,6 +2550,7 @@ async fn create_for_owner_job(
         placement,
         max_range,
         searched,
+        cooldown,
         &lease,
     )
     .await
@@ -2573,6 +2583,7 @@ pub fn create<'a>(
             None,
             0.0,
             false,
+            None,
             &lease,
         )
         .await
@@ -2591,6 +2602,7 @@ async fn create_with_placement(
     placement: Option<crate::systems::skills::ext::SummonPlacement>,
     max_range: f32,
     searched: bool,
+    cooldown: Option<SummonCooldownToken>,
     lease: &super::audit::Lease,
 ) -> Option<SlaveRef> {
     server
@@ -2761,9 +2773,7 @@ async fn create_with_placement(
                     let Some(transform) = validated_summon_placement(
                         server, world, owner, template, placement, max_range,
                     ) else {
-                        if let Some(item) = &item {
-                            refund_summon_cooldown(server, owner, item.template_id);
-                        }
+                        refund_summon_cooldown(owner, cooldown);
                         return None;
                     };
                     position_override = Some(transform);
@@ -2774,9 +2784,7 @@ async fn create_with_placement(
                         Some(transform) => position_override = Some(transform),
                         None => {
                             error(owner, error::SLAVE_SPAWN_SHIP_NEED_MORE_SPACE);
-                            if let Some(item) = &item {
-                                refund_summon_cooldown(server, owner, item.template_id);
-                            }
+                            refund_summon_cooldown(owner, cooldown);
                             return None;
                         }
                     }
@@ -5687,6 +5695,144 @@ mod summon_hull_overlap_tests {
         assert_eq!(p.data().unit.global_cooldown_ms, 0);
     }
 
+    /// The summon job waits (reservations, DB, hull load) while the player can cast again. Its
+    /// delayed error-100 refund must not clear the newer GCD or a newer cooldown of the same
+    /// skill: only the entries captured when the job started are rolled back.
+    #[tokio::test]
+    async fn a_newer_skill_cooldown_survives_a_delayed_summon_refusal() {
+        let mut data = with_ship_data(crate::data::GameData::empty());
+        data.items.templates.insert(
+            RULE_ITEM,
+            ItemTemplate {
+                kind: TemplateKind::SummonSlave {
+                    slave_id: RULE_SLAVE,
+                },
+                use_skill_id: RULE_SKILL,
+                ..ItemTemplate::plain(RULE_ITEM, 1)
+            },
+        );
+        data.systems.skills.add_skill(SkillTemplate {
+            id: RULE_SKILL,
+            ..Default::default()
+        });
+        let s = world_at_with(data, 101.0, &[]);
+        let (mut client, p) = search_player(&s);
+        client.conn.active_char = Some(p.clone());
+        let bag = p
+            .data()
+            .inventory
+            .get(slot_type::INVENTORY)
+            .unwrap()
+            .clone();
+        let template = s.game_data.items.template(RULE_ITEM).unwrap().clone();
+        let mut item = Item::create(0x9003, &template, 1, 0, 1, &s.game_data.items, 0);
+        item.owner_id = u64::from(p.character_id);
+        item.slot_type = slot_type::INVENTORY;
+        item.slot = 0;
+        bag.lock().unwrap().items.push(item);
+        s.items.add_container(bag);
+        p.data().unit.cooldowns.add_cooldown(RULE_SKILL, 10_000, 0);
+        p.data().unit.global_cooldown_ms = 10_000;
+        // The job captures the cooldowns when it is created; the next skill replaces them
+        // before the detached task is polled.
+        let job = create_for_owner(&s, &p, 0x9003, RULE_ITEM, false, None, None, 0.0);
+        p.data().unit.global_cooldown_ms = 20_000;
+        p.data().unit.cooldowns.cooldowns.insert(RULE_SKILL, 20_000);
+        let result = tokio::time::timeout(Duration::from_secs(2), job)
+            .await
+            .expect("summon job");
+        assert!(result.is_none());
+        let codes: Vec<i16> = client
+            .drain()
+            .iter()
+            .filter(|f| f.0 == crate::opcodes::sc::SCErrorMsgPacket)
+            .map(|f| i16::from_le_bytes([f.1[0], f.1[1]]))
+            .collect();
+        assert!(codes.contains(&100), "{codes:?}");
+        assert_eq!(
+            p.data().unit.global_cooldown_ms,
+            20_000,
+            "the newer GCD belongs to the later skill"
+        );
+        assert_eq!(
+            p.data().unit.cooldowns.cooldowns.get(&RULE_SKILL),
+            Some(&20_000),
+            "the newer cooldown of the same skill is kept"
+        );
+    }
+
+    /// The invalid-placement refusal path uses the same guarded refund: a newer GCD survives,
+    /// while the summon skill's cooldown (still the captured entry) is cleared.
+    #[tokio::test]
+    async fn an_invalid_placement_keeps_a_newer_gcd() {
+        let mut data = with_ship_data(crate::data::GameData::empty());
+        data.items.templates.insert(
+            RULE_ITEM,
+            ItemTemplate {
+                kind: TemplateKind::SummonSlave {
+                    slave_id: RULE_SLAVE,
+                },
+                use_skill_id: RULE_SKILL,
+                ..ItemTemplate::plain(RULE_ITEM, 1)
+            },
+        );
+        data.systems.skills.add_skill(SkillTemplate {
+            id: RULE_SKILL,
+            ..Default::default()
+        });
+        data.systems
+            .vehicles
+            .slave_templates
+            .get_mut(&RULE_SLAVE)
+            .unwrap()
+            .spawn_valid_area_range = 10;
+        let s = world_at_with(data, GROUND, &[]);
+        let (mut client, p) = search_player(&s);
+        let bag = p
+            .data()
+            .inventory
+            .get(slot_type::INVENTORY)
+            .unwrap()
+            .clone();
+        let template = s.game_data.items.template(RULE_ITEM).unwrap().clone();
+        let mut item = Item::create(0x9004, &template, 1, 0, 1, &s.game_data.items, 0);
+        item.owner_id = u64::from(p.character_id);
+        item.slot_type = slot_type::INVENTORY;
+        item.slot = 0;
+        bag.lock().unwrap().items.push(item);
+        s.items.add_container(bag);
+        p.data().unit.cooldowns.add_cooldown(RULE_SKILL, 10_000, 0);
+        p.data().unit.global_cooldown_ms = 10_000;
+        let placement = crate::systems::skills::ext::SummonPlacement {
+            x: 530.0,
+            y: 500.0,
+            z: WATER,
+            yaw: 0.0,
+        };
+        let job = create_for_owner(&s, &p, 0x9004, RULE_ITEM, false, None, Some(placement), 0.0);
+        p.data().unit.global_cooldown_ms = 20_000;
+        let result = tokio::time::timeout(Duration::from_secs(2), job)
+            .await
+            .expect("summon job");
+        assert!(result.is_none());
+        let codes: Vec<i16> = client
+            .drain()
+            .iter()
+            .filter(|f| f.0 == crate::opcodes::sc::SCErrorMsgPacket)
+            .map(|f| i16::from_le_bytes([f.1[0], f.1[1]]))
+            .collect();
+        assert!(codes.contains(&583), "{codes:?}");
+        assert_eq!(
+            p.data().unit.global_cooldown_ms,
+            20_000,
+            "the newer GCD belongs to the later skill"
+        );
+        assert!(
+            !p.data().unit.cooldowns.cooldowns.contains_key(&RULE_SKILL),
+            "the summon skill's captured cooldown is still refunded"
+        );
+    }
+
     /// GM `/slave spawn` bypasses the client-side rule: it keeps the C# in-front placement and
     /// still spawns when the 1.2 search would refuse.
     #[tokio::test]
@@ -6209,28 +6355,66 @@ fn revalidated_searched_placement(
     summon_candidate_1_2(server, world, owner, template)
 }
 
-/// The 1.2 client refuses before sending, so a server-side refusal must not leave the skill's
-/// cooldown or the GCD that the skill system started before the effect ran.
-fn refund_summon_cooldown(server: &GameServer, owner: &PlayerRef, item_template_id: u32) {
-    let Some(skill_id) = server
+/// The cooldown entries a summon cast started, captured when its job is created. The job can
+/// refuse long after the cast (reservations, DB, hull load), so the refund must only clear the
+/// GCD/skill cooldown of this cast and leave a newer skill's entries alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+struct SummonCooldownToken {
+    gcd_end_ms: i64,
+    skill_id: u32,
+    skill_end_ms: Option<i64>,
+    tag_id: u32,
+    tag_end_ms: Option<i64>,
+}
+
+/// Snapshot of the owner's GCD and the summon skill's cooldowns (`None` without a use skill).
+fn summon_cooldown_token(
+    server: &GameServer,
+    owner: &PlayerRef,
+    item_template_id: u32,
+) -> Option<SummonCooldownToken> {
+    let skill_id = server
         .game_data
         .items
         .template(item_template_id)
         .map(|t| t.use_skill_id)
-        .filter(|id| *id != 0)
-    else {
-        return;
-    };
-    let tag = server
+        .filter(|id| *id != 0)?;
+    let tag_id = server
         .game_data
         .systems
         .skills
         .skill(skill_id)
         .map_or(0, |s| s.cooldown_tag_id.max(0) as u32);
+    let c = owner.data();
+    Some(SummonCooldownToken {
+        gcd_end_ms: c.unit.global_cooldown_ms,
+        skill_id,
+        skill_end_ms: c.unit.cooldowns.cooldowns.get(&skill_id).copied(),
+        tag_id,
+        tag_end_ms: c.unit.cooldowns.tag_cooldowns.get(&tag_id).copied(),
+    })
+}
+
+/// The 1.2 client refuses before sending, so a server-side refusal must not leave the skill's
+/// cooldown or the GCD that the skill system started before the effect ran. Each entry is
+/// cleared only while it is still the one captured in `cooldown`: a skill used since then owns
+/// its newer GCD/cooldown and must keep it.
+fn refund_summon_cooldown(owner: &PlayerRef, cooldown: Option<SummonCooldownToken>) {
+    let Some(token) = cooldown else {
+        return;
+    };
     let mut c = owner.data();
-    c.unit.cooldowns.remove_cooldown(skill_id);
-    if tag != 0 {
-        c.unit.cooldowns.tag_cooldowns.remove(&tag);
+    if c.unit.global_cooldown_ms == token.gcd_end_ms {
+        c.unit.global_cooldown_ms = 0;
     }
-    c.unit.global_cooldown_ms = 0;
+    if token.skill_end_ms.is_some()
+        && c.unit.cooldowns.cooldowns.get(&token.skill_id).copied() == token.skill_end_ms
+    {
+        c.unit.cooldowns.remove_cooldown(token.skill_id);
+    }
+    if token.tag_id != 0
+        && c.unit.cooldowns.tag_cooldowns.get(&token.tag_id).copied() == token.tag_end_ms
+    {
+        c.unit.cooldowns.tag_cooldowns.remove(&token.tag_id);
+    }
 }
