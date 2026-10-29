@@ -17,6 +17,11 @@
 //! aaemu-testclient control --describe
 //! aaemu-testclient control --config private.json --login H:P --capture game.jsonl
 //!                          [--deadline-ms 570000]
+//! aaemu-testclient crawl --race nuian|elf|firran|harani --out DIR [--levels a-b]
+//!                        [--from-quest N] [--limit N] [--min-level N]
+//!                        [--game-config F] [--server-log F] [--bugreports DIR]
+//!                        Play every quest of one race (see CRAWLER.md).
+//! aaemu-testclient crawl --dashboard --out DIR
 //! ```
 //!
 //! Settings come from `--config` (JSON, see `testclient.example.json`), then the flags. Keep
