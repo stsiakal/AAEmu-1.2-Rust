@@ -357,6 +357,18 @@ impl Catalog {
             zones: load_zones(&conn)?,
             ..Catalog::default()
         };
+        cat.npc_groups = load_groups(
+            &conn,
+            "quest_monster_npcs",
+            "quest_monster_group_id",
+            "npc_id",
+        )?;
+        cat.item_groups = load_groups(
+            &conn,
+            "quest_item_group_items",
+            "quest_item_group_id",
+            "item_id",
+        )?;
 
         // ---- quest templates / components / acts --------------------------------
         let mut templates: Vec<TemplateRow> = Vec::new();

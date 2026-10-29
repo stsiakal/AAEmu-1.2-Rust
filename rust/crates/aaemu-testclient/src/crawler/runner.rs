@@ -21,7 +21,7 @@ use crate::login::LoginClient;
 use crate::record::Recorder;
 use crate::stream::StreamClient;
 
-const QUIET: Duration = Duration::from_millis(600);
+const QUIET: Duration = Duration::from_millis(400);
 const CAST_ANSWER: Duration = Duration::from_secs(8);
 const KILL_CAST_SPACING: Duration = Duration::from_millis(1200);
 
@@ -152,7 +152,7 @@ struct Session {
 
 impl Session {
     async fn pump(&mut self) -> Result<Vec<Packet>> {
-        let packets = self.game.drain(QUIET, Duration::from_secs(4)).await?;
+        let packets = self.game.drain(QUIET, Duration::from_millis(1500)).await?;
         self.tracker.observe(&packets);
         for p in &packets {
             if p.is_sc(sc::SCLevelChangedPacket) {
@@ -171,6 +171,16 @@ impl Session {
     async fn sleep_pump(&mut self, ms: u64) -> Result<Vec<Packet>> {
         tokio::time::sleep(Duration::from_millis(ms)).await;
         self.pump().await
+    }
+
+    async fn pump_fast(&mut self, max_ms: u64) -> Result<Vec<Packet>> {
+        let packets = self
+            .game
+            .drain(Duration::from_millis(120), Duration::from_millis(max_ms))
+            .await?;
+        self.tracker.observe(&packets);
+        ensure!(!self.game.state.disconnected, "disconnected");
+        Ok(packets)
     }
 }
 
@@ -1021,7 +1031,7 @@ async fn hunt_once(
             let _ = session.sleep_pump(500).await;
         }
         tokio::time::sleep(KILL_CAST_SPACING).await;
-        let _ = session.pump().await;
+        let _ = session.pump_fast(900).await;
     }
     if session.game.state.dead_units.contains(&target.obj_id) {
         return Ok(());
