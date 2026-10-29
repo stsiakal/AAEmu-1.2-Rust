@@ -24,13 +24,13 @@ const DESIGN: u32 = 172;
 const DESIGN_ITEM: u32 = 21166;
 /// Placement tax is paid with bound tax certificates (Feature `taxItem` is on by default).
 const TAX_CERTIFICATE: u32 = 31892;
-const TAX_CERTIFICATES: u32 = 100;
+const TAX_CERTIFICATES: u32 = 500;
 /// `housing_build_steps` of design 172: (skill, material item, actions).
 const BUILD_STEPS: [(u32, u32, i32); 3] = [(14575, 17684, 1), (14575, 17684, 1), (14574, 17683, 1)];
 /// Original client housing polygon in zone 142 (see `npcs::subzone` tests).
 const PLOT: (f32, f32) = (13944.868, 14216.393);
 /// Offsets tried when an earlier run's house still occupies the plot.
-const OFFSETS: [(f32, f32); 8] = [
+const OFFSETS: [(f32, f32); 16] = [
     (0.0, 0.0),
     (30.0, 0.0),
     (-30.0, 0.0),
@@ -39,6 +39,14 @@ const OFFSETS: [(f32, f32); 8] = [
     (45.0, 45.0),
     (-45.0, -45.0),
     (60.0, -60.0),
+    (-60.0, 60.0),
+    (60.0, 0.0),
+    (-60.0, 0.0),
+    (0.0, 60.0),
+    (0.0, -60.0),
+    (90.0, 0.0),
+    (-90.0, 0.0),
+    (0.0, 90.0),
 ];
 /// `ErrorMessageType` of the placement rejections worth retrying on another spot.
 const INVALID_AREA: i16 = 112;
@@ -100,18 +108,18 @@ pub(super) async fn run(game: &mut GameClient, r: &mut Runner<'_>) -> anyhow::Re
                 .collect::<Vec<_>>()
         )
     })?;
-    for (_, material, count) in BUILD_STEPS {
-        gm_command(game, &format!("item add self {material} {count}")).await?;
-    }
     gm_command(
         game,
         &format!("item add self {TAX_CERTIFICATE} {TAX_CERTIFICATES}"),
     )
     .await?;
+    // Three build actions cost 25 labor each. The build materials are tradepacks that occupy the
+    // single backpack slot, so each one is added right before the step that consumes it.
+    gm_command(game, "labor 200").await?;
     r.var("design_item_id", design_item);
     r.end(
         s,
-        format!("design item {design_item} ({DESIGN_ITEM}), build materials, {TAX_CERTIFICATES} tax certificates"),
+        format!("design item {design_item} ({DESIGN_ITEM}), {TAX_CERTIFICATES} tax certificates"),
     );
 
     // ---- a free spot on the housing plot ----
@@ -241,6 +249,15 @@ pub(super) async fn run(game: &mut GameClient, r: &mut Runner<'_>) -> anyhow::Re
         game.change_target(house_obj).await?;
         let mut sent = 0;
         for _ in 0..actions {
+            let reply = gm_command(game, &format!("item add self {material} 1")).await?;
+            ensure!(
+                stack_id(&reply, material).is_some(),
+                "build material {material} could not be added: {:?}",
+                reply
+                    .iter()
+                    .filter_map(super::questitem::chat_text)
+                    .collect::<Vec<_>>()
+            );
             game.start_skill(skill, house_obj).await?;
             let answer = game
                 .wait_for("building skill response", |p| {
@@ -258,11 +275,16 @@ pub(super) async fn run(game: &mut GameClient, r: &mut Runner<'_>) -> anyhow::Re
                 result == 0,
                 "building skill {skill} answered with SkillResult {result}"
             );
+            // The building skills have a 30 s cast time.
+            let saved = game.timeout;
+            game.timeout = Duration::from_secs(50);
             let progress = game
                 .wait_for("SCHouseBuildProgressPacket", |p| {
                     p.is_sc(sc::SCHouseBuildProgressPacket)
                 })
-                .await
+                .await;
+            game.timeout = saved;
+            let progress = progress
                 .with_context(|| format!("building skill {skill} made no house progress"))?;
             let (tl, _model, all, cur) = build_progress(&progress.body)?;
             ensure!(
@@ -332,18 +354,16 @@ pub(super) async fn run(game: &mut GameClient, r: &mut Runner<'_>) -> anyhow::Re
         .filter_map(super::questitem::chat_text)
         .collect();
     let deadline = Instant::now() + Duration::from_secs(10);
-    let mut demolished = false;
-    while Instant::now() < deadline {
+    let is_demolished = |p: &Packet| {
+        (p.is_sc(sc::SCHouseDemolishedPacket) || p.is_sc(sc::SCMyHouseRemovedPacket))
+            && p.stream().read_u16().ok() == Some(house_tl)
+    };
+    let mut demolished = reply.iter().any(is_demolished);
+    while !demolished && Instant::now() < deadline {
         let batch = game
             .drain(Duration::from_millis(300), Duration::from_secs(1))
             .await?;
-        if batch.iter().any(|p| {
-            (p.is_sc(sc::SCHouseDemolishedPacket) || p.is_sc(sc::SCMyHouseRemovedPacket))
-                && p.stream().read_u16().ok() == Some(house_tl)
-        }) {
-            demolished = true;
-            break;
-        }
+        demolished = batch.iter().any(is_demolished);
     }
     ensure!(
         demolished,

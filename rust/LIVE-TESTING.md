@@ -273,6 +273,33 @@ least two completed crafts (`SCSkillStarted` + `SCSkillEnded`), then `SCErrorMsg
 on, besides a failed `SCSkillStarted`), and no cast after it. Run it on an account whose labor is not hugely negative
 or positive (a character with 30 labor runs about 15 crafts, 1 s each). Server log:
 `craft 8000001 refused by skill 8000016: skill result 39`.
+
+`housing` (GM account) builds design 172 "cozy Nuian house" on the original client's housing polygon in zone 142
+(13944.868, 14216.393, area 52 / group 1). It adds the design item 21166 and 500 bound tax certificates (31892),
+sends `CSConstructHouseTax` (300000 copper quote) and `CSCreateHouse`, then runs the three build steps with
+skills 14575 / 14575 / 14574 and their tradepack materials (17684 / 17684 / 17683, added one at a time because
+the single backpack slot must be free for the next one). It requires `SCMyHouse` + `SCHouseState` with the bot as
+owner, the `SCHouseBuildProgress` steps up to 3/3, `SCHouseTaxInfo`, and finally demolishes the house with the GM
+`/house forcedemo` command and requires `SCHouseDemolished`. Tries nearby offsets if an earlier run's house still
+occupies the plot.
+
+`mount` (GM account) adds the brown Lilliot horse whistle (item 8159), summons it with use skill 10602, records a
+walking step for a speed baseline, sends `CSMountMate` (driver point 1) and requires `SCUnitAttached`, moves the
+mate with `CSMoveUnit` (20 m at 20 m/s, echoed by `SCOneUnitMovement`), then `CSUnMountMate` (`SCUnitDetached`)
+and `CSRemoveMate`.
+
+`questchain` (GM account) spawns the quest giver 3512 and quest 251 "Angry Boars" in front of the bot, accepts with
+`CSStartQuestContext`, spawns a boar 3475 per objective, weakens it with the GM `/damage 99%` setup command, kills it
+with the player's melee `CSStartSkill` 2 and loots the corpse with `CSLootOpenBag(lootAll)`; the quest must count
+3 x boar meat (item 4058). It then reports with `CSCompleteQuestContext` and requires `SCQuestContextCompleted` and
+the reward item 18791. The completion flag and the spawned NPC are reset with GM commands so the next run can
+accept the quest again.
+
+`gather` (GM account) tops labor up, spawns iron vein 1671 with `/spawn doodad` and mines it with the vein's
+`DoodadFuncUse` skill 13986 (doodad target, 10 labor, range 4). It requires `SkillResult` 0, a
+`SCCharacterLaborPowerChanged` of -10, the vein's phase change and an item task creating iron ore (item 8022, loot
+pack 6359). The GM-placed vein is removed afterwards.
+
 `m*` script commands (`aaemu-testclient/src/scenario/music.rs`, used by `rust/verify/musicrun1.vtest` /
 `musicrun2.vtest`) replay the 1.2 client's music wire sequence and fail on a missing callback:
 `mcompose` (item cast 22215, CS122 only after the received own `SCSkillFired`), `mrequest` (CS123 cold /

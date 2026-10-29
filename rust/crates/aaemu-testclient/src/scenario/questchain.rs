@@ -33,6 +33,10 @@ const ATTACK: u32 = 2;
 
 pub(super) async fn run(game: &mut GameClient, r: &mut Runner<'_>) -> anyhow::Result<()> {
     gm_access(game, r).await?;
+    // A previous run (or another scenario) may have completed the quest: reset it first.
+    let _ = gm_command(game, &format!("quest uncomplete {QUEST}")).await?;
+    game.drain(Duration::from_millis(300), Duration::from_secs(2))
+        .await?;
 
     // ---- the giver in front of the bot ----
     let s = r.begin("game.questchain.giver");
@@ -96,33 +100,46 @@ pub(super) async fn run(game: &mut GameClient, r: &mut Runner<'_>) -> anyhow::Re
         let boar_obj = boar.obj_id;
         move_near(game, boar.pos).await?;
         game.change_target(boar_obj).await?;
-        // Setup: leave the boar at 1 % so the player's next hit is the killing blow.
-        let reply = gm_command(game, "damage 99%").await?;
-        let damage_text: Vec<String> = reply.iter().filter_map(chat_text).collect();
-        ensure!(
-            !damage_text
-                .iter()
-                .any(|t| t.contains("Cannot") || t.contains("no target")),
-            "/damage did not hit boar {boar_obj}: {damage_text:?}"
-        );
-        game.start_skill(ATTACK, boar_obj).await?;
-        let caster = game.state.self_obj;
-        let answer = game
-            .wait_for("melee skill response", |p| {
-                own_skill_response(p, ATTACK, caster) || p.is_sc(sc::SCErrorMsgPacket)
-            })
-            .await
-            .with_context(|| format!("attack on boar {boar_obj} got no answer"))?;
-        if answer.is_sc(sc::SCErrorMsgPacket) {
-            bail!(
-                "attack on boar {boar_obj} rejected with SCErrorMsg {:?}",
-                answer.stream().read_i16().ok()
+        // Setup: leave the boar at 1 % so the player's next hit is the killing blow. Send it
+        // without the long GM reply drain: a damaged boar keeps moving while the reply is read.
+        game.chat(0, "/damage 99%").await?;
+        game.drain(Duration::from_millis(300), Duration::from_secs(1))
+            .await?;
+        let mut result = -1;
+        for attempt in 0..3 {
+            // The boar may have wandered: walk to its current position and aim again.
+            if let Some(at) = game.state.units.get(&boar_obj).map(|u| u.pos) {
+                move_near(game, at).await?;
+            }
+            game.change_target(boar_obj).await?;
+            game.start_skill(ATTACK, boar_obj).await?;
+            let caster = game.state.self_obj;
+            let answer = game
+                .wait_for("melee skill response", |p| {
+                    own_skill_response(p, ATTACK, caster) || p.is_sc(sc::SCErrorMsgPacket)
+                })
+                .await
+                .with_context(|| format!("attack on boar {boar_obj} got no answer"))?;
+            if answer.is_sc(sc::SCErrorMsgPacket) {
+                bail!(
+                    "attack on boar {boar_obj} rejected with SCErrorMsg {:?}",
+                    answer.stream().read_i16().ok()
+                );
+            }
+            result = i32::from(skill_response_result(&answer)?);
+            if result == 0 {
+                break;
+            }
+            ensure!(
+                result
+                    == i32::from(aaemu_game::systems::skills::types::skill_result::TOO_FAR_RANGE),
+                "attack on boar {boar_obj} (attempt {}) answered with SkillResult {result}",
+                attempt + 1
             );
         }
-        let result = skill_response_result(&answer)?;
         ensure!(
             result == 0,
-            "attack on boar {boar_obj} answered with SkillResult {result}"
+            "attack on boar {boar_obj} kept failing with SkillResult {result}"
         );
         game.wait_for("SCUnitDeathPacket for the boar", |p| {
             p.is_sc(sc::SCUnitDeathPacket) && packet_obj_id(p).ok() == Some(boar_obj)
@@ -186,11 +203,25 @@ pub(super) async fn run(game: &mut GameClient, r: &mut Runner<'_>) -> anyhow::Re
         .iter()
         .find(|p| p.is_sc(sc::SCQuestContextCompletedPacket))
         .and_then(|p| p.stream().read_u32().ok());
-    let reward = answers
+    let reward = super::questitem::stack_location(&answers, REWARD).is_some();
+    let tasks: Vec<String> = answers
         .iter()
-        .any(|p| p.is_sc(sc::SCItemTaskSuccessPacket) && added_template(p, REWARD));
+        .filter(|p| p.is_sc(sc::SCItemTaskSuccessPacket))
+        .map(|p| {
+            let t = crate::game::parse_item_task(&p.body);
+            format!(
+                "{}:{:?}",
+                t.action,
+                t.items
+                    .iter()
+                    .map(|i| (i.task, i.template, i.id))
+                    .collect::<Vec<_>>()
+            )
+        })
+        .collect();
     let note = format!(
-        "SCQuestContextCompleted {:?}; reward item {REWARD} received {reward}; answers {}",
+        "SCQuestContextCompleted {:?}; reward item {REWARD} received {reward}; item tasks \
+         {tasks:?}; answers {}",
         completed,
         packet_summary(&answers)
     );
@@ -204,12 +235,13 @@ pub(super) async fn run(game: &mut GameClient, r: &mut Runner<'_>) -> anyhow::Re
     );
     r.end(s, note);
 
-    // ---- tidy up: the GM-spawned NPC ----
+    // ---- tidy up: the GM-spawned NPC and the completion flag ----
     let s = r.begin("game.questchain.cleanup");
+    let _ = gm_command(game, &format!("quest uncomplete {QUEST}")).await?;
     let _ = gm_command(game, &format!("despawn npc {giver_obj}")).await?;
     game.drain(Duration::from_millis(300), Duration::from_secs(2))
         .await?;
-    r.end(s, "spawned NPC removed");
+    r.end(s, "spawned NPC removed, quest completion reset");
 
     let s = r.begin("game.leave");
     game.leave_world(0).await?;
