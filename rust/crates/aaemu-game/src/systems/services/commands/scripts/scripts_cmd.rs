@@ -236,7 +236,7 @@ mod tests {
         assert_eq!(out, ["[scripts] [Scripts] Reload - Success"]);
         assert_eq!(
             server.systems.services.commands.get_command_keys().len(),
-            96
+            crate::systems::services::commands::scripts::EXPECTED_COMMAND_KEYS
         );
         let (_, out) = harness::run(&server, &gm.p, "scripts what").await;
         assert_eq!(out, [harness::error("scripts", "Undefined action...")]);

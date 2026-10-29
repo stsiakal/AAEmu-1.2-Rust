@@ -99,6 +99,9 @@ pub struct AppConfig {
     /// `Events` (Rust only: seasonal event windows).
     #[serde(rename = "events")]
     pub events: EventsConfig,
+    /// `BugReports` (Rust only: automated bug reports, `systems::services::bugreport`).
+    #[serde(rename = "bugreports")]
+    pub bug_reports: crate::systems::services::bugreport::config::BugReportsConfig,
     /// `CharacterNameRegex` (`None` = NameManager's default pattern).
     #[serde(rename = "characternameregex")]
     pub character_name_regex: Option<String>,
@@ -152,6 +155,7 @@ impl Default for AppConfig {
             specialty: SpecialtyConfig::default(),
             scripts: ScriptsConfig::default(),
             events: EventsConfig::default(),
+            bug_reports: Default::default(),
             character_name_regex: None,
             default_language: "en_us".into(),
             debug_info: true,

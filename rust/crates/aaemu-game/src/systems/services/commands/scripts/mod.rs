@@ -508,8 +508,16 @@ pub fn load(manager: &CommandManager, env: &ScriptEnv) -> bool {
     for (names, command) in all_commands(env) {
         manager.register_names(names, command);
     }
+    // Rust-only command: `/scripts reload force` clears the manager, so it is registered
+    // with the scripts on every load.
+    crate::systems::services::bugreport::command::register(manager);
     true
 }
+
+/// Number of primary keys [`load`] registers: the 96 commands of the C# script set plus the
+/// Rust-only `/bug` command. A fixed number on purpose, so a dropped command fails the tests.
+#[cfg(test)]
+pub(crate) const EXPECTED_COMMAND_KEYS: usize = 96 + 1;
 
 /// Installs [`load`] as the command manager's script loader (`GameService` scripts stage).
 pub fn install(manager: &CommandManager, env: ScriptEnv) {

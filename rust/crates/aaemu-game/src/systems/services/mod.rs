@@ -31,6 +31,7 @@
 
 pub mod accounts;
 pub mod beauty_salon;
+pub mod bugreport;
 pub mod character;
 pub mod character_packets;
 pub mod commands;
@@ -132,6 +133,12 @@ impl System {
             },
         );
         s.commands.reload();
+        // Automated bug reports (writer, panic hook, invariant timer) and `/bug` (always
+        // registered so players get a "disabled" answer when the reporter is off).
+        if let Err(e) = bugreport::ensure_started(server) {
+            tracing::error!("bug reports disabled: {e:#}");
+        }
+        bugreport::command::register(&s.commands);
         s.tasks.start(&s.tick.on_tick);
         // Stage 4: `IInitializable.Initialize()`.
         s.tick.initialize();
