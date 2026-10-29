@@ -2429,9 +2429,25 @@ Additional world-side fixes from the same audit:
 * Ship replication preserves the physical quaternion instead of rebuilding it through the
   legacy Euler conversion, including mixed yaw/tilt and positive-W packet reconstruction.
   Solid hull and bottom boxes use transformed authored collision-proxy bounds independently
-  of the inertia-only mass box. Native entity bounds can include render and non-brush objects
-  unavailable to this loader, so this is a documented proxy adaptation. Explicit buoyancy
-  settings remain authoritative; missing model assets retain the prior geometry fallback.
+  of the inertia-only mass box, keeping the authored length/beam (the Longliner's 14 m half
+  length). The bounds' z-range is clipped to the hull envelope at `add_ship`: the top is at
+  most the mass-box top + 1 m freeboard (`cry::HULL_FREEBOARD_METERS`) and the authored
+  bottom/draft is kept, so mast and rigging proxies of the "DEFAULT" union never become part
+  of the solid hull. Without the clip the union put the entity bounding box above the
+  waterline; the engine's water-area check then let the summoned Cutter sink until buoyancy
+  launched it. Native entity bounds can include render and non-brush objects unavailable to
+  this loader, so this is a documented proxy adaptation. Explicit buoyancy settings remain
+  authoritative; missing model assets retain the prior geometry fallback.
+* Doodads attached to a slave (masts, sails, cannons) get no world collider: they move with
+  the hull and would otherwise overlap its collision box (CryPhysics then ejects a freshly
+  summoned hull). The exclusion is keyed on `doodad_owner_type::SLAVE` and therefore also
+  covers cart equipment.
+* Summon placement probes the collision-world ground (`ground_height_probe`, mask
+  static+terrain) at the candidate centre and at the hull fore/aft points instead of trusting
+  the heightmap alone; a probe miss (`Some(None)`) falls back to the terrain elevation (then
+  the heightmap) rather than "bottomless water". If no forward candidate is deep enough, the
+  spot 5 m in front of the owner is used when it clears the same depth test (its centre only;
+  no further placement search).
 
 Remaining packet stubs and table candidates are still subject to behavior review. Missing SQL
 mentions do not establish disuse (some names are selected dynamically); empty tables, client
