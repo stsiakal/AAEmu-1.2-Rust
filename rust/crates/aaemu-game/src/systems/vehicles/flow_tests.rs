@@ -3476,6 +3476,57 @@ async fn summon_pos_outside_the_valid_area_errors_without_spawning() {
     assert!(slaves::get_active_slave_by_owner_obj_id(&world, PA).is_none());
 }
 
+/// The client picks boat summon points on its wave-displaced sea, a little above the nominal
+/// surface: `z = 100.3` over ocean level 100.0 was refused as "not on water".
+#[tokio::test]
+async fn boat_summon_point_slightly_above_the_sea_surface_is_accepted() {
+    use crate::systems::skills::ext::SummonPlacement;
+    let mut data = summon_pos_data(50);
+    data.systems
+        .vehicles
+        .slave_templates
+        .get_mut(&SLAVE_TEMPLATE)
+        .unwrap()
+        .slave_kind = super::data::slave_kind::BOAT;
+    let server = server_with(data);
+    let (mut a, pa, _item_id, world) = summon_pos_client(&server);
+    let template = server
+        .game_data
+        .systems
+        .vehicles
+        .slave_template(SLAVE_TEMPLATE)
+        .unwrap()
+        .clone();
+    assert!(template.is_a_boat());
+    assert_eq!(world.template.ocean_level, 100.0);
+    let place = |z: f32| {
+        slaves::validated_summon_placement(
+            &server,
+            &world,
+            &pa,
+            &template,
+            Some(SummonPlacement {
+                x: 103.0,
+                y: 104.0,
+                z,
+                yaw: 1.25,
+            }),
+            0.0,
+        )
+    };
+    for z in [99.0, 100.0, 100.058, 100.3, 100.6] {
+        let t = place(z).unwrap_or_else(|| panic!("z {z} over the sea must be accepted"));
+        assert_eq!((t.x, t.y, t.z), (103.0, 104.0, 100.0), "z {z}");
+    }
+    assert!(
+        !error_codes(&a.drain()).contains(&super::error::SLAVE_SPAWN_ERROR_INVALID_AREA),
+        "accepted placements must not send the invalid-area error"
+    );
+    // Beyond the tolerance the point is in the air, not on the water.
+    assert!(place(101.5).is_none());
+    assert!(error_codes(&a.drain()).contains(&super::error::SLAVE_SPAWN_ERROR_INVALID_AREA));
+}
+
 #[tokio::test]
 async fn slave_equipment_equips_unequips_and_survives_a_resummon() {
     use crate::models::item::ItemClass;
@@ -4044,6 +4095,105 @@ async fn slave_equipment_cannon_visuals_and_pack_validation() {
     assert!(error_codes(&frames).contains(&super::error::ITEM_NOT_FOR_PET));
     assert!(bag.lock().unwrap().get_item_by_slot(7).is_some());
     assert!(other.data().equipment[3].is_none());
+}
+
+const FARM_WAGON: u32 = 69;
+const WAGON_CRATE: u32 = 9001;
+
+/// The shipped Farm Wagon (model 1008) attach points and four trade-pack crate bindings.
+fn farm_wagon_data() -> GameData {
+    use super::data::SlaveDoodadBinding;
+    use crate::systems::npcs::doodad::templates::DoodadTemplate;
+    let mut d = slave_data();
+    d.systems.npcs.doodad.templates.insert(
+        WAGON_CRATE,
+        DoodadTemplate {
+            id: WAGON_CRATE,
+            ..DoodadTemplate::default()
+        },
+    );
+    d.systems.vehicles.slave_templates.insert(
+        FARM_WAGON,
+        SlaveTemplate {
+            id: FARM_WAGON,
+            name: "Farm Wagon".into(),
+            model_id: 1008,
+            level: 1,
+            slave_kind: super::data::slave_kind::MACHINE,
+            doodad_bindings: [9u8, 10, 11, 12]
+                .into_iter()
+                .enumerate()
+                .map(|(i, attach_point_id)| SlaveDoodadBinding {
+                    id: i as u32 + 1,
+                    owner_id: FARM_WAGON,
+                    owner_type: "Slave".into(),
+                    attach_point_id,
+                    doodad_id: WAGON_CRATE,
+                    persist: false,
+                    scale: 1.0,
+                })
+                .collect(),
+            ..SlaveTemplate::default()
+        },
+    );
+    let wagon = super::data::parse_attach_points(include_str!(
+        "../../../app/Data/slave_attach_points.json"
+    ))
+    .expect("shipped attach points")
+    .into_iter()
+    .find(|(model, _)| *model == 1008)
+    .expect("Farm Wagon (model 1008)");
+    d.systems.vehicles.attach_points.insert(wagon.0, wagon.1);
+    d
+}
+
+#[tokio::test]
+async fn farm_wagon_crate_doodads_bind_at_the_prefab_cannon_offsets() {
+    let server = server_with(farm_wagon_data());
+    crate::systems::npcs::install_hooks(&server);
+    let a = TestClient::new(&server, 1, 1);
+    let pa = spawn_player(&server, &a, test_character(1, "Wagon", 100.0, 100.0), PA);
+    let world = server.world.world(0).unwrap();
+    server.systems.npcs.spawns.get_or_create(&world);
+    let wagon = slaves::create_core(
+        &server,
+        &world,
+        Some(&pa),
+        None,
+        FARM_WAGON,
+        None,
+        false,
+        None,
+        None,
+    )
+    .expect("wagon");
+    let crates = wagon.data().attached_doodads.clone();
+    assert_eq!(crates.len(), 4, "one crate per cannon marker");
+    // game/prefabs/vehicle_tractor.xml, vehicle_tractor.tractor_body, metres.
+    for (point, expected) in [
+        (9u8, [-0.629_516_6, -1.942_382_8, 1.141_372_7]),
+        (10, [-0.627_685_55, -3.170_410_2, 1.141_372_7]),
+        (11, [0.632_934_6, -3.174_682_6, 1.141_372_7]),
+        (12, [0.633_850_1, -1.942_016_6, 1.141_418_5]),
+    ] {
+        let crate_ = crates
+            .iter()
+            .filter_map(|id| world.doodad(*id))
+            .find(|d| d.data().attach_point == point)
+            .unwrap_or_else(|| panic!("no crate at point {point}"));
+        assert_eq!(
+            crate_.data().transform.parent_obj_id,
+            wagon.obj_id,
+            "crate {point} follows the wagon"
+        );
+        let t = crate_.data().transform;
+        for (got, want) in [(t.x, expected[0]), (t.y, expected[1]), (t.z, expected[2])] {
+            assert!(
+                (got - want).abs() < 0.000_01,
+                "crate at point {point}: {got} != {want}"
+            );
+        }
+    }
 }
 
 const FIRE_CANNON: u32 = 10473;

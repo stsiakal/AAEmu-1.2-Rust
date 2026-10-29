@@ -31,6 +31,9 @@ use crate::systems::npcs::doodad::spawner::SimpleSpawnerDef;
 use crate::systems::npcs::spawn_manager;
 use crate::systems::skills::effects::EffectArgs;
 use crate::systems::skills::packets::SCUnitDeathPacket;
+use crate::systems::skills::packets_special::{
+    SCTeleportUnitPacket, TELEPORT_REASON_MOVE_TO_LOCATION,
+};
 use crate::systems::skills::types::{
     BuffEventTriggerKind, BuffRemoveOn, KillReason, SkillCastTarget, SkillCaster,
 };
@@ -1704,8 +1707,12 @@ fn try_delete(
     // its world position as its new local one, so the owner's world pose survives the hull.
     let slave_obj = WorldObject::from(&slave);
     world.detach_child(&slave_obj);
+    let mut deck_standers = Vec::new();
     for child in slave_obj.core().take_children() {
         world.detach_child(&child);
+        if let Some(player) = child.as_player() {
+            deck_standers.push((player.clone(), child.transform()));
+        }
     }
     let spawns = spawn_manager_of(server, world.id);
     for id in &doodad_ids {
@@ -1739,6 +1746,20 @@ fn try_delete(
         );
     }
     world.remove_object(obj_id);
+    // A deck stander is only a transform child of the hull, so no SCUnitDetached/attached
+    // state reaches its client. It kept its world pose above; tell its own client where that
+    // is, as every other server-forced move does (portal, recall, GM teleport).
+    for (player, t) in deck_standers {
+        player.data().set_disabled_set_position(true);
+        player.send(SCTeleportUnitPacket {
+            reason: TELEPORT_REASON_MOVE_TO_LOCATION,
+            error_message: 0,
+            x: t.x,
+            y: t.y,
+            z: t.z,
+            z2: t.rot_z,
+        });
+    }
     if let Some(s) = &spawns {
         s.add_despawn(
             server,
@@ -2010,7 +2031,7 @@ pub fn create_from_skill(
 /// The client-chosen `SummonPos` turned into a spawn transform, or `None` (with
 /// `SlaveSpawnErrorInvalidArea`) when the spot is too far, on the wrong surface or inside
 /// collision. `None` also means "no placement": the C# in-front placement is used.
-fn validated_summon_placement(
+pub(super) fn validated_summon_placement(
     server: &GameServer,
     world: &WorldInstance,
     owner: &PlayerRef,
@@ -2053,7 +2074,7 @@ fn validated_summon_placement(
     };
     transform.set_position(p.x, p.y, p.z, 0.0, 0.0, p.yaw);
     if template.is_a_boat() {
-        if !super::ship_physics::is_water(server, world, [p.x, p.y, p.z]) {
+        if !super::ship_physics::is_summon_water(server, world, [p.x, p.y, p.z]) {
             return invalid("a ship must be summoned on water");
         }
         transform.set_height(super::ship_physics::water_surface(
@@ -2303,7 +2324,7 @@ async fn create_with_placement(
     } else {
         Vec::new()
     };
-    let loaded = if let Some(item) = item.as_ref().filter(|_| owner_id != 0) {
+    let mut loaded = if let Some(item) = item.as_ref().filter(|_| owner_id != 0) {
         let mut flush_items: Vec<_> = prior
             .iter()
             .map(|(_, s)| s.data().summoning_item_id)

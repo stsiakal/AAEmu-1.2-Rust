@@ -329,6 +329,28 @@ warning- or error-free. Independent cargo/SQL and control reviews support this
 bounded observation with that replacement-refusal qualification; wider audit items
 remain open.
 
+#### Stale saved cargo racks and client summon points (2026-10-28)
+
+Deviation from the C# `SlaveManager.Create`, which restored a rack's saved item reference
+unchecked: the saved-cargo preflight (`PersistentDoodads::validate_slave_cargo`) no longer
+refuses the summon forever when a rack's escrow pack is gone (no container holds the id) or is
+not the escrowed pack any more (moved out of System escrow, or the id was reused by an
+unrelated item). Such a rack is restored empty in its authored empty phase, the cleared row is
+persisted, and a warning names the rack and item ids; no item is granted, moved or deleted.
+Several holders of the id, an intact pack referenced by two racks or by a live rack of another
+hull, and a live-receipt mismatch still refuse. Such rows most likely date from before
+`a0a62dbf3`, when deleting a live rack ran `remove_expired_doodad_item` and removed the escrowed
+pack while the persistent rack row kept its reference; the surviving logs cannot prove it. Today
+cargo, rack and Slave references are retained by `cleanup_doodad_escrow_item`.
+
+Boat summon points are checked with `ship_physics::is_summon_water`: the client picks them on
+its wave-displaced sea 0.05-0.6 m above the nominal level (`z = 100.3` over ocean level
+100.0), which the strict `IsWater` (`z <= level`; the open ocean has no water volume) refused
+as "a ship must be summoned on water". A point up to `SUMMON_WATER_TOLERANCE` (1 m) above the
+water is accepted when the terrain under it is below the surface (so beaches stay land).
+Land-vehicle placement keeps the strict check. Real-data check (needs `AAEMU_GAME_PAK`):
+`cargo test -p aaemu-game real_water_boat_summon_points -- --ignored --nocapture`.
+
 ### systems::social
 
 | Area (C#) | Rust | Status | Notes |
@@ -1261,6 +1283,13 @@ is no longer mirrored (see "Known deviations", dead NPC returned and healed).
   `cast_validation_tests.rs` cover the height/mask/class rule, the radius gate, the 0.5 m
   position radius and the terrain gate. Not modelled: the multi-part target variant
   `FUN_3989DAE0` (loops the target's sub-shapes and passes if any part passes).
+  **Doodad targets are exempt** (2026-10-28): the client's cast target check for wire type 4
+  (`FUN_3939E030`, IDA `sub_3939E030`) only looks the doodad up, and `FUN_390B5540` (skill
+  result 0xC) is reached only for unit (`FUN_390B5C60`) and position (`FUN_390B5A30`) targets,
+  so a doodad's origin inside static map geometry (production: craft 6231 / skill 16766 at the
+  Two Crowns specialty bench, doodad 4235 at 13824.67 10604.76 120.54, whose ray always hit map
+  brush cell (13, 10)) must not refuse the interaction. This supersedes the earlier skip of
+  the owning house's collider for its fixtures.
 * systems::skills: the labor margin requirement uses `GetMaxLabor(Payment.PremiumState)`; every
   connection has the default C# `AccountPayment` (premium until 2030), so the cap is 5000.
 * systems::skills (in-place resurrection, 2026-10-20): `CSResurrectCharacterPacket(in_place =
