@@ -11,7 +11,7 @@ use aaemu_game::managers::character::{self, CreateCharacterRequest};
 use aaemu_game::models::char_data::{ability, VisualOptions};
 use aaemu_game::models::character::Character;
 use aaemu_game::net::socketless::SocketlessConnection;
-use aaemu_game::world::session::{self, SelectDbData};
+use aaemu_game::world::session::{self, leave_target, SelectDbData};
 use aaemu_game::GameServer;
 
 use crate::host::BotSession;
@@ -49,6 +49,27 @@ pub async fn login(
     // Ensures the dedicated account row exists (`AccountManager.GetAccountDetailsInternal`).
     let _ = aaemu_game::db::get_account_details(&server.db, &server.config, account).await;
     let mut conn = SocketlessConnection::new(server, account);
+    // A failed add must not leave a phantom connection in `server.connections`.
+    match login_with(server, account, name, &mut conn).await {
+        Ok((character_id, name, obj_id)) => {
+            tracing::info!(
+                "Bots: '{name}' (character {character_id}, obj {obj_id}) entered the world on account {account}"
+            );
+            Ok(Arc::new(BotSession::new(conn, character_id, name)))
+        }
+        Err(e) => {
+            server.connections.remove(conn.id());
+            Err(e)
+        }
+    }
+}
+
+async fn login_with(
+    server: &GameServer,
+    account: u32,
+    name: &str,
+    conn: &mut SocketlessConnection,
+) -> anyhow::Result<(u32, String, u32)> {
     let (characters, packets) =
         aaemu_game::db_character::load_account_characters(server, account).await?;
     // Deletion bookkeeping packets for a client connection; nobody reads this connection's lobby.
@@ -102,16 +123,11 @@ pub async fn login(
     };
     session::enter_world(server, &mut conn.conn, visual_options());
     if server.world.character_by_id(character_id).is_none() {
-        // enter_world refused (the server is shutting down) or the connection was closed.
-        server
-            .enter_world
-            .release_character(character_id, conn.id());
+        // enter_world refused (the server is shutting down): undo the select (save + release).
+        session::leave_world_now(server, &mut conn.conn, leave_target::CHARACTER_SELECT).await;
         anyhow::bail!("character {character_id} ('{name}') did not enter the world");
     }
-    tracing::info!(
-        "Bots: '{name}' (character {character_id}, obj {obj_id}) entered the world on account {account}"
-    );
-    Ok(Arc::new(BotSession::new(conn, character_id, name)))
+    Ok((character_id, name, obj_id))
 }
 
 /// The world-entry half of [`login`] for an already loaded character (tests, and a future roster
@@ -121,6 +137,21 @@ pub fn enter_loaded(
     mut conn: SocketlessConnection,
     character: Character,
 ) -> anyhow::Result<Arc<BotSession>> {
+    let conn_id = conn.id();
+    match enter_loaded_with(server, &mut conn, character) {
+        Ok((character_id, name)) => Ok(Arc::new(BotSession::new(conn, character_id, name))),
+        Err(e) => {
+            server.connections.remove(conn_id);
+            Err(e)
+        }
+    }
+}
+
+fn enter_loaded_with(
+    server: &GameServer,
+    conn: &mut SocketlessConnection,
+    character: Character,
+) -> anyhow::Result<(u32, String)> {
     let character_id = character.id;
     let name = character.unit.name.clone();
     conn.conn.characters = vec![character.clone()];
@@ -143,10 +174,11 @@ pub fn enter_loaded(
     }
     session::enter_world(server, &mut conn.conn, visual_options());
     if server.world.character_by_id(character_id).is_none() {
+        server.world.try_remove_character(character_id);
         server
             .enter_world
             .release_character(character_id, conn.id());
         anyhow::bail!("character {character_id} ('{name}') did not enter the world");
     }
-    Ok(Arc::new(BotSession::new(conn, character_id, name)))
+    Ok((character_id, name))
 }

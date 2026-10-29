@@ -101,15 +101,31 @@ impl BotHost {
         }
         let bot = crate::life::login(server, &self.config, name).await?;
         let character_id = bot.character_id;
-        let mut roster = self.bots.lock().await;
-        if let Some(existing) = roster.get(&character_id) {
-            // A concurrent add of the same character won the world entry; keep one session.
-            anyhow::bail!(
-                "'{}' is already a live bot (character {character_id})",
-                existing.name
-            );
+        let refusal = {
+            let mut roster = self.bots.lock().await;
+            if roster.len() >= self.config.max_bots {
+                // A concurrent add filled the last slot while this login was running.
+                Some(format!(
+                    "bot limit reached (MaxBots={}); remove one first",
+                    self.config.max_bots
+                ))
+            } else if let Some(existing) = roster.get(&character_id) {
+                // A concurrent add of the same character won the world entry; keep one session.
+                Some(format!(
+                    "'{}' is already a live bot (character {character_id})",
+                    existing.name
+                ))
+            } else {
+                roster.insert(character_id, bot.clone());
+                None
+            }
+        };
+        if let Some(reason) = refusal {
+            // Do not leave the loser of the race in the world.
+            bot.logout(server).await;
+            bot.disconnect(server).await;
+            anyhow::bail!(reason);
         }
-        roster.insert(character_id, bot);
         Ok(character_id)
     }
 
