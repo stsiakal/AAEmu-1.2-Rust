@@ -81,8 +81,7 @@ pub async fn serve(server: Arc<GameServer>, socket: TcpStream, peer: SocketAddr)
             cmd = cmd_rx.recv() => match cmd {
                 Some(ConnCommand::Send(packet)) => conn.send(packet.as_ref()),
                 Some(ConnCommand::LeaveWorld(target)) => {
-                    let active = conn.active_char.clone();
-                    crate::world::session::leave_world_task(&server, Some(&mut conn), target, active).await;
+                    crate::world::session::leave_world_now(&server, &mut conn, target).await;
                 }
                 Some(ConnCommand::ReturnToWorldList) => {
                     crate::world::session::return_to_world_list(&server, &mut conn).await;

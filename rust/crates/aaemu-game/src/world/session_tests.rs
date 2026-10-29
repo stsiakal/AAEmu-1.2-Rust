@@ -594,3 +594,92 @@ async fn private_mysql_reentry_loads_the_state_the_departure_save_committed() {
     assert_eq!(server.enter_world.character_owner(1), Some(2));
     pool.close().await;
 }
+
+/// The real-client world-entry S->C sequence, captured from the individual
+/// `spawn_character` / `notify_in_game` / `notify_in_game_completed` calls before
+/// `session::enter_world` existed. The wrapper must not change a single frame (opcode and body
+/// size) the client receives; the chosen bodies are deterministic (the GUID / buff elapsed time
+/// are the only volatile fields and are not compared).
+#[tokio::test]
+async fn enter_world_keeps_the_client_login_packet_sequence() {
+    use crate::models::char_data::VisualOptions;
+    use crate::opcodes::sc;
+
+    let server = test_server();
+    let mut client = TestClient::new(&server, 1, 1007);
+    let character = test_character(7, "Sequence", 100.0, 100.0);
+    client.conn.characters = vec![character.clone()];
+    session::select_loaded(
+        &server,
+        &mut client.conn,
+        character,
+        SelectDbData::default(),
+    )
+    .unwrap();
+    let select = client.drain();
+    let shape = |frames: &[(u16, Vec<u8>)]| -> Vec<(u16, usize)> {
+        frames.iter().map(|(op, body)| (*op, body.len())).collect()
+    };
+    let mut want = vec![
+        (sc::SCCharacterStatePacket, 520),
+        (sc::SCCharacterGamePointsPacket, 40),
+        (sc::SCCharacterInvenInitPacket, 8),
+    ];
+    want.extend([(sc::SCCharacterInvenContentsPacket, 43); 10]);
+    want.extend([
+        (sc::SCActionSlotsPacket, 85),
+        (sc::SCQuestsPacket, 4),
+        (sc::SCCompletedQuestsPacket, 4),
+        (sc::SCActabilityPacket, 2),
+        (sc::SCCountUnreadMailPacket, 16),
+        (sc::SCFactionListPacket, 1),
+        (sc::SCFactionRelationListPacket, 2),
+        (sc::SCExpeditionRolePolicyListPacket, 1),
+    ]);
+    want.extend([(sc::SCResponseUIDataPacket, 12); 3]);
+    assert_eq!(shape(&select), want, "select burst changed");
+    assert_eq!(select[0].1[..6], [0, 0, 0, 0, 16, 0]);
+    assert_eq!(select[2].1, [50, 0, 0, 0, 50, 0, 0, 0]);
+    assert_eq!(select[3].1[..3], [2, 1, 0]);
+
+    session::enter_world(
+        &server,
+        &mut client.conn,
+        VisualOptions {
+            flag: 0x1F,
+            stp: Some([0; 6]),
+            ..Default::default()
+        },
+    );
+    let entered = client.drain();
+    assert_eq!(
+        shape(&entered),
+        vec![
+            (sc::SCUnitStatePacket, 391),
+            (sc::SCDetailedTimeOfDayPacket, 16),
+            (sc::SCJoinedChatChannelPacket, 10),
+            (sc::SCJoinedChatChannelPacket, 10),
+            (sc::SCJoinedChatChannelPacket, 10),
+            (sc::SCOnOffSnowPacket, 1),
+        ],
+        "spawn / notify-in-game / notify-in-game-completed burst changed"
+    );
+    // NetUnit: bc objId 0x100, BaseUnitType.Character, name length + "Sequence".
+    assert_eq!(
+        entered[0].1[..13],
+        [0, 1, 0, 8, 0, b'S', b'e', b'q', b'u', b'e', b'n', b'c', b'e']
+    );
+    let joined = |kind: i16, faction: u32| {
+        let mut body = Vec::new();
+        body.extend_from_slice(&kind.to_le_bytes());
+        body.extend_from_slice(&0i16.to_le_bytes());
+        body.extend_from_slice(&faction.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body
+    };
+    assert_eq!(entered[2].1, joined(1, 0));
+    assert_eq!(entered[3].1, joined(6, 148));
+    assert_eq!(entered[4].1, joined(0, 0));
+    assert_eq!(entered[5].1, [0]);
+    assert_eq!(client.conn.state, GameState::World);
+}
