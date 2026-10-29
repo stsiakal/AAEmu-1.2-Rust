@@ -36,7 +36,7 @@ impl BotSession {
     }
 
     /// Dispatches one client packet through the real handler on this bot's connection.
-    pub async fn dispatch<P: ClientPacket>(
+    pub async fn dispatch<P: ClientPacket + std::fmt::Debug>(
         &self,
         server: &GameServer,
         packet: P,

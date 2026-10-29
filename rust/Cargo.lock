@@ -6,9 +6,13 @@ version = 4
 name = "aaemu-bots"
 version = "0.1.0"
 dependencies = [
+ "aaemu-commons",
  "aaemu-game",
  "anyhow",
+ "chrono",
  "futures",
+ "rusqlite",
+ "sqlx",
  "tokio",
  "tracing",
 ]

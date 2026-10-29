@@ -181,11 +181,13 @@ pub struct BotsConfig {
     /// Start the bots host and register the operator `/bot` commands.
     #[serde(rename = "enabled", deserialize_with = "lenient")]
     pub enabled: bool,
-    /// Numeric id of the dedicated bot account. The game auto-creates its `accounts` row; the
-    /// login database does not need one because bots never authenticate through the login server.
-    #[serde(rename = "account", deserialize_with = "lenient")]
-    pub account: u32,
-    /// Upper bound for `/bot add` (the bots host refuses more).
+    /// First of the dedicated bot account ids: bot `n` uses `AccountBase + n`, one character
+    /// each, so no two bots share account state (labor, account attributes) or log in on one
+    /// account. The game auto-creates the `accounts` rows (`get_account_details`); the login
+    /// database does not need them because bots never authenticate through the login server.
+    #[serde(rename = "accountbase", deserialize_with = "lenient")]
+    pub account_base: u32,
+    /// Number of bot accounts (and the upper bound for `/bot add`).
     #[serde(rename = "maxbots", deserialize_with = "lenient")]
     pub max_bots: usize,
 }
@@ -194,7 +196,7 @@ impl Default for BotsConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            account: 1_000_000,
+            account_base: 1_000_000,
             max_bots: 10,
         }
     }
@@ -1390,14 +1392,14 @@ mod tests {
     fn bots_section_defaults_off_and_binds_leniently() {
         let cfg = AppConfig::from_value(json!({})).unwrap();
         assert!(!cfg.bots.enabled);
-        assert_eq!(cfg.bots.account, 1_000_000);
+        assert_eq!(cfg.bots.account_base, 1_000_000);
         assert_eq!(cfg.bots.max_bots, 10);
         let cfg = AppConfig::from_value(json!({
-            "Bots": { "Enabled": "True", "Account": "1000042", "MaxBots": "3" }
+            "Bots": { "Enabled": "True", "AccountBase": "1000042", "MaxBots": "3" }
         }))
         .unwrap();
         assert!(cfg.bots.enabled);
-        assert_eq!(cfg.bots.account, 1_000_042);
+        assert_eq!(cfg.bots.account_base, 1_000_042);
         assert_eq!(cfg.bots.max_bots, 3);
     }
 

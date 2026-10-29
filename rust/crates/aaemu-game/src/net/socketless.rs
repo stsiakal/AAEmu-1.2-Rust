@@ -67,14 +67,28 @@ impl SocketlessConnection {
         self.drain().into_iter().map(|f| f.0).collect()
     }
 
-    /// Queues an encoded/decoded packet like a client handler would: the packet's
+    /// Queues an encoded/decoded packet like a client handler would: the packet is recorded in
+    /// the connection's bug-report ring (as `handle_frame` does for a wire frame), then
     /// [`ClientPacket::handle`] runs, then the per-frame achievement work
     /// `GameServer::handle_frame` does after a handler.
-    pub async fn dispatch<P: ClientPacket>(
+    pub async fn dispatch<P: ClientPacket + std::fmt::Debug>(
         &mut self,
         server: &GameServer,
         packet: P,
     ) -> crate::Result<()> {
+        if let Some(ring) = self.conn.packet_ring().cloned() {
+            let (level, opcode) = server
+                .registry
+                .find_by_name(P::NAME)
+                .unwrap_or((crate::net::packet::LEVEL_PLAIN, 0));
+            crate::systems::services::bugreport::packet_ring::record_incoming_packet(
+                Some(&ring),
+                level,
+                opcode,
+                P::NAME,
+                &packet,
+            );
+        }
         let result = packet.handle(server, &mut self.conn).await;
         crate::systems::economy::flush_deferred_glider_reequips(server);
         crate::systems::flush_achievements(server);

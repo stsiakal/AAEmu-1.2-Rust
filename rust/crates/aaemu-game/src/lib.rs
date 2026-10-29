@@ -15,7 +15,6 @@ pub mod net;
 pub mod opcodes;
 pub mod packets;
 pub mod server;
-pub mod server_main;
 pub mod stream;
 pub mod stream_world;
 pub mod systems;

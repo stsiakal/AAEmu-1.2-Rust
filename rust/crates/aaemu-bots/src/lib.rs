@@ -35,8 +35,9 @@ pub fn install(server: &Arc<GameServer>) -> anyhow::Result<()> {
     commands::register(server, &host);
     host.start();
     tracing::info!(
-        "Bots: enabled on account {} (max {} bots; /bot add <name>)",
-        config.account,
+        "Bots: enabled on accounts {}..{} ({} accounts; /bot add <name>)",
+        config.account_base,
+        config.account_base.saturating_add(config.max_bots as u32),
         config.max_bots
     );
     Ok(())

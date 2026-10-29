@@ -13,9 +13,13 @@ name = "aaemu-game-bots"
 path = "src/bin/aaemu-game-bots.rs"
 
 [dependencies]
+aaemu-commons.workspace = true
 aaemu-game = { path = "../aaemu-game" }
 anyhow.workspace = true
+chrono.workspace = true
 futures.workspace = true
+rusqlite.workspace = true
+sqlx.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
