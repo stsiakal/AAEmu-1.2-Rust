@@ -1137,13 +1137,24 @@ impl GameClient {
 
     /// `CSCreateCharacterPacket`: Nuian (1) male (1) Fighter (ability 1), default appearance.
     pub async fn create_character(&mut self, name: &str) -> anyhow::Result<()> {
+        self.create_character_as(name, 1, 1, 1).await
+    }
+
+    /// `CSCreateCharacterPacket` for a race / gender / first ability, default appearance.
+    pub async fn create_character_as(
+        &mut self,
+        name: &str,
+        race: u8,
+        gender: u8,
+        ability1: u8,
+    ) -> anyhow::Result<()> {
         let mut s = PacketStream::new();
-        s.write_str(name).write_u8(1).write_u8(1);
+        s.write_str(name).write_u8(race).write_u8(gender);
         for _ in 0..7 {
             s.write_u32(0); // body items: template defaults
         }
         write_custom_model(&mut s);
-        s.write_u8(1) // ability1: Fight
+        s.write_u8(ability1)
             .write_u8(11) // ability2: None
             .write_u8(11) // ability3: None
             .write_u8(1); // level
@@ -1365,6 +1376,28 @@ impl GameClient {
             .write_u32(0) // type2
             .write_u8(0) // SkillCastUnitTarget
             .write_bc(target_obj)
+            .write_u8(0); // flag: no skill object
+        self.send_cs(cs::CSStartSkillPacket, s.as_bytes()).await
+    }
+
+    /// `CSStartSkillPacket` cast from an inventory item on a doodad (`SkillCastDoodadTarget`).
+    pub async fn start_item_skill_on_doodad(
+        &mut self,
+        skill_id: u32,
+        item_id: u64,
+        item_template_id: u32,
+        doodad_obj: u32,
+    ) -> anyhow::Result<()> {
+        let mut s = PacketStream::new();
+        s.write_u32(skill_id)
+            .write_u8(2) // SkillCasterType.Item
+            .write_bc(self.state.self_obj)
+            .write_u64(item_id)
+            .write_u32(item_template_id)
+            .write_u8(0) // type1
+            .write_u32(0) // type2
+            .write_u8(4) // SkillCastTargetType.Doodad
+            .write_bc(doodad_obj)
             .write_u8(0); // flag: no skill object
         self.send_cs(cs::CSStartSkillPacket, s.as_bytes()).await
     }
