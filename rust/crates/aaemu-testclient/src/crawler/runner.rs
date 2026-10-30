@@ -768,11 +768,15 @@ async fn accept_quest(
             .pump()
             .await
             .map_err(|e| format!("accept pump: {e:#}"))?;
-        if packets.iter().any(|p| p.is_sc(sc::SCErrorMsgPacket)) {
-            return Err(format!(
-                "server refused the accept: {}",
-                error_codes(&packets)
-            ));
+        let codes: Vec<i16> = packets
+            .iter()
+            .filter(|p| p.is_sc(sc::SCErrorMsgPacket))
+            .filter_map(|p| p.stream().read_i16().ok())
+            .collect();
+        // 621 = QuestDailyLimit: the character already completed a non-repeatable quest.
+        // 287 = CLOSED_ZONE, often a stale answer to the GM teleport that preceded the accept.
+        if codes.contains(&621) {
+            return Err("already completed".into());
         }
         if session.tracker.state(quest.id).is_some() {
             return Ok(());
