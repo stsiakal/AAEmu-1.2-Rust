@@ -1855,8 +1855,19 @@ is no longer mirrored (see "Known deviations", dead NPC returned and healed).
   `NextPhase`, a function group of the other template. NPC 10119 near Arach Hollow summons doodad
   5007, whose clout moved the Amber Boulder (4252) into 5007's `DoodadFuncFinal` phase. That
   deleted the boulder, so quest 3447 "Fellow Searchers" could not be completed. 991 clouts use
-  the origin source and 602 of them have a next phase. The borrowed doodad is still the trigger
-  origin, but the task now changes the phase of the doodad that owns the clout.
+  the origin source and 602 of them have a next phase. The task now changes the phase of the
+  doodad that owns the clout.
+
+* systems::npcs (2026-10-30): a `DoodadFuncClout` whose doodad is initialised before its `Spawn`
+  (the `SummonDoodad` path runs `InitDoodad` first, then `Spawn`) keeps that doodad as the area
+  trigger origin even with `UseOriginSource`. The C# anchor moved the area to the first doodad
+  within 4 m of the caster; when a planted crop stood next to the caster of Comet's Boon (skill
+  18222, summoned doodad 5017), the caster sat 2.002 m off the clout's 2.0 m half-length and
+  buff 3771 was never applied, leaving the doodad's speed trail without its buff. Already
+  spawned doodads keep the C# anchor. `Unit.DecrementTriggerCount` now clamps at 0 as the C#
+  `Unit.DecrementTriggerCount` does: a clout with `NextPhase == -1` is removed by the doodad
+  delete and again by its task, and the former -1 suppressed the buff of the next clout on the
+  same unit.
 
 * systems::vehicles / managers::item (2026-10-15): the shared death hook ignores self-deaths
   of objects other than characters and mates instead of reporting a missing mate owner. A mate
