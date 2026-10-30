@@ -24,8 +24,9 @@ pub struct BotSession {
     conn: Mutex<SocketlessConnection>,
     next_think: Mutex<Instant>,
     disconnected: AtomicBool,
-    /// The long-range road graph of this bot's world (built on the first route that needs it).
-    pub(crate) roads: RoadGraphCache,
+    /// The road graphs of this bot's server (the host's shared cache, or a private one for a bot
+    /// built on its own); built on the first route that needs one.
+    roads: OnceLock<RoadGraphCache>,
     /// Generation of the running navigation task: a `goto` bumps it and earlier walkers stop.
     nav_generation: Arc<AtomicU64>,
     /// The generation [`BotSession::cancel_navigation`] produced: a walk that stops at exactly
@@ -79,7 +80,7 @@ impl BotSession {
             conn: Mutex::new(conn),
             next_think: Mutex::new(Instant::now() + jitter),
             disconnected: AtomicBool::new(false),
-            roads: RoadGraphCache,
+            roads: OnceLock::new(),
             nav_generation: Arc::new(AtomicU64::new(0)),
             cancelled_generation: AtomicU64::new(u64::MAX),
             plan_gate: OnceLock::new(),
@@ -152,6 +153,17 @@ impl BotSession {
     /// Installs the host's configured gate (first call wins).
     pub fn install_plan_gate(&self, gate: Arc<PlanGate>) {
         let _ = self.plan_gate.set(gate);
+    }
+
+    /// The road graphs of this bot's server (a private cache when the host did not install its
+    /// shared one).
+    pub(crate) fn road_cache(&self) -> RoadGraphCache {
+        self.roads.get_or_init(RoadGraphCache::default).clone()
+    }
+
+    /// Installs the host's road graph cache (first call wins).
+    pub fn install_road_cache(&self, cache: RoadGraphCache) {
+        let _ = self.roads.set(cache);
     }
 
     /// The next movement-packet time: a monotonic per-session clock at wall-clock rate, not the

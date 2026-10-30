@@ -15,7 +15,7 @@
 //!   walk them either way).
 
 use std::collections::{BinaryHeap, HashMap};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use aaemu_game::server::GameServer;
 use aaemu_game::systems::skills::controllers::Vec3;
@@ -341,35 +341,27 @@ impl RoadGraph {
     }
 }
 
-/// The server-wide road graphs, one per world template and shared by every bot (an `Arc`
-/// handle, built the first time any bot needs that template). Keyed by the template id of the
-/// bot's own instance, not locked to the first template a bot happened to use.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RoadGraphCache;
-
-#[derive(Debug, Default)]
-struct RoadGraphEntry {
-    graph: OnceLock<Option<Arc<RoadGraph>>>,
+/// The road graphs of one server, one per world template, shared by that server's bots: a
+/// clone is another handle on the same graphs, and a server (the bots host, or a bot built on
+/// its own) makes its own cache, so a graph is never taken from another server's game data
+/// (the cache is not a process global). A graph is built the first time a bot needs its
+/// template; a template without road data is not cached, so it is asked again.
+#[derive(Debug, Clone, Default)]
+pub struct RoadGraphCache {
+    graphs: Arc<Mutex<HashMap<u32, Arc<RoadGraph>>>>,
 }
 
 impl RoadGraphCache {
-    /// The graph of `template_id`, built once with the server's loaded road data.
+    /// The graph of `template_id`, built once from the server's loaded road data (`None`
+    /// without road data for the template).
     pub fn get(&self, server: &GameServer, template_id: u32) -> Option<Arc<RoadGraph>> {
-        static CACHE: OnceLock<Mutex<HashMap<u32, Arc<RoadGraphEntry>>>> = OnceLock::new();
-        let entry = {
-            let mut cache = CACHE
-                .get_or_init(|| Mutex::new(HashMap::new()))
-                .lock()
-                .expect("road graph cache poisoned");
-            cache
-                .entry(template_id)
-                .or_insert_with(|| Arc::new(RoadGraphEntry::default()))
-                .clone()
-        };
-        entry
-            .graph
-            .get_or_init(|| RoadGraph::from_server(server, template_id).map(Arc::new))
-            .clone()
+        let mut graphs = self.graphs.lock().expect("road graph cache poisoned");
+        if let Some(graph) = graphs.get(&template_id) {
+            return Some(graph.clone());
+        }
+        let graph = Arc::new(RoadGraph::from_server(server, template_id)?);
+        graphs.insert(template_id, graph.clone());
+        Some(graph)
     }
 }
 
@@ -502,6 +494,81 @@ mod tests {
             .route(at(0.0, 0.0, 100.0), at(100.0, 0.0, 100.0))
             .expect("route");
         assert_eq!(route, vec![at(0.0, 0.0, 100.0), at(100.0, 0.0, 100.0)]);
+    }
+
+    /// The world template of the test road.
+    const ROAD_TEMPLATE: u32 = 5;
+
+    /// A server whose game data holds one ground transfer road in [`ROAD_TEMPLATE`] (or none).
+    fn server_with_roads(with_road: bool) -> GameServer {
+        use aaemu_game::data::world_templates::WorldSpawnPosition;
+        use aaemu_game::data::GameData;
+        use aaemu_game::systems::vehicles::data::{TransferRoad, TransferTemplate, VehicleModel};
+
+        let mut data = GameData::empty();
+        if with_road {
+            let vehicles = &mut data.systems.vehicles;
+            vehicles.model_types.insert(7, (7, "VehicleModel".into()));
+            vehicles.vehicle_models.insert(
+                7,
+                VehicleModel {
+                    id: 7,
+                    ground: true,
+                    ..VehicleModel::default()
+                },
+            );
+            let point = |x: f32| WorldSpawnPosition {
+                world_id: ROAD_TEMPLATE,
+                x,
+                y: 10.0,
+                z: 100.0,
+                ..WorldSpawnPosition::default()
+            };
+            vehicles.transfer_templates.insert(
+                1,
+                TransferTemplate {
+                    id: 1,
+                    model_id: 7,
+                    transfer_roads: vec![TransferRoad {
+                        pos: vec![point(0.0), point(50.0), point(100.0)],
+                        ..TransferRoad::default()
+                    }],
+                    ..TransferTemplate::default()
+                },
+            );
+        }
+        aaemu_game::test_support::test_server_with(data)
+    }
+
+    /// The cache is per server, not a process global: a template without road data is not
+    /// cached (a server that has the data gets its graph from the same cache), and a cache
+    /// never hands out the graph another cache built from another server's data.
+    #[tokio::test]
+    async fn the_road_cache_belongs_to_its_server_and_does_not_keep_a_missing_graph() {
+        let without = server_with_roads(false);
+        let with = server_with_roads(true);
+
+        let shared = RoadGraphCache::default();
+        assert!(
+            shared.get(&without, ROAD_TEMPLATE).is_none(),
+            "no road data"
+        );
+        let graph = shared
+            .get(&with, ROAD_TEMPLATE)
+            .expect("the earlier miss was not cached");
+        assert_eq!(graph.len(), 3);
+        // A clone is another handle on the same graphs ...
+        let again = shared.clone().get(&with, ROAD_TEMPLATE).expect("cached");
+        assert!(Arc::ptr_eq(&graph, &again));
+        // ... a new cache (another server / host / bot) builds its own.
+        let other = RoadGraphCache::default();
+        assert!(other.get(&without, ROAD_TEMPLATE).is_none());
+        let other_graph = other
+            .get(&with, ROAD_TEMPLATE)
+            .expect("built from its own server");
+        assert!(!Arc::ptr_eq(&graph, &other_graph));
+        // Another template of the same server has no roads.
+        assert!(shared.get(&with, 0).is_none());
     }
 
     #[test]

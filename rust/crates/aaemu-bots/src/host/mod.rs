@@ -22,7 +22,7 @@ pub(crate) use session::StepPause;
 pub(crate) use session::WalkSend;
 
 use crate::nav::movement::Goto;
-use crate::nav::PlanGate;
+use crate::nav::{PlanGate, RoadGraphCache};
 
 /// The scheduler tick: connection commands are serviced this often.
 const HOST_TICK: Duration = Duration::from_millis(250);
@@ -42,6 +42,8 @@ pub struct BotHost {
     server: Weak<GameServer>,
     config: BotsConfig,
     plan_gate: Arc<PlanGate>,
+    /// The road graphs of this host's server, shared by all its bots.
+    roads: RoadGraphCache,
     bots: Mutex<HashMap<u32, Arc<BotSession>>>,
 }
 
@@ -50,6 +52,7 @@ impl BotHost {
         Self {
             server: Arc::downgrade(server),
             plan_gate: Arc::new(PlanGate::new(config.plan_concurrency)),
+            roads: RoadGraphCache::default(),
             config,
             bots: Mutex::new(HashMap::new()),
         }
@@ -111,6 +114,9 @@ impl BotHost {
         }
         let bot = crate::life::login(server, &self.config, name).await?;
         let character_id = bot.character_id;
+        // Before the bot is in the roster (nothing else can reach it yet): it uses this host's
+        // road graphs from its first route on.
+        bot.install_road_cache(self.roads.clone());
         let refusal = {
             let mut roster = self.bots.lock().await;
             if roster.len() >= self.config.max_bots {

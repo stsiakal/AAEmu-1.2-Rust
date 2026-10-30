@@ -150,7 +150,7 @@ async fn real_far_road_nodes_plan_within_the_budget() {
         .copied()
         .find(|p| (600.0..1500.0).contains(&planar(a, *p)) && graph.route(a, *p).is_some())
         .expect("a far node on the same road network");
-    let cache = crate::nav::RoadGraphCache;
+    let cache = crate::nav::RoadGraphCache::default();
     let nav = GameNav::of_instance(&server, 0, Some(&cache)).expect("main world instance");
     let (from, to) = (
         Vec3::new(a.x + 20.0, a.y, a.z),

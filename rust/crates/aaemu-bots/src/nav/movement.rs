@@ -560,7 +560,8 @@ async fn walk(
     };
     let start = position(&player);
     let instance_id = player.data().unit.transform.instance_id;
-    let Some(owned) = OwnedGameNav::of_player(server.clone(), player.clone(), bot.roads) else {
+    let Some(owned) = OwnedGameNav::of_player(server.clone(), player.clone(), bot.road_cache())
+    else {
         return NavOutcome::Failed(NavFailure::Unreachable(
             "the bot's world instance is unknown".into(),
         ));
@@ -1139,7 +1140,8 @@ async fn plan_blocking(
     spots: Vec<(f32, f32)>,
     cancel: PlanCancel,
 ) -> Result<Vec<Vec3>, String> {
-    let Some(nav) = OwnedGameNav::of_player(server.clone(), player.clone(), bot.roads) else {
+    let Some(nav) = OwnedGameNav::of_player(server.clone(), player.clone(), bot.road_cache())
+    else {
         return Err("the bot's world instance is unknown".to_string());
     };
     let base: Arc<dyn NavWorld + Send + Sync> = Arc::new(nav);
