@@ -93,8 +93,12 @@ struct Fingerprint {
 struct Dashboard {
     generated: String,
     results: u64,
+    /// Old per-race result lines without a character field; they are ignored.
+    legacy_ignored: u64,
     totals: Counts,
     races: BTreeMap<String, RaceTotals>,
+    /// One entry per `race/character`, so two characters of one race stay separate.
+    characters: BTreeMap<String, Counts>,
     act_kinds: BTreeMap<String, ActTotals>,
     top_failures: Vec<FailureGroup>,
     bug_fingerprints: Vec<Fingerprint>,
@@ -111,7 +115,10 @@ const COLUMNS: [&str; 6] = [
 
 pub fn write(out: &Path) -> Result<()> {
     std::fs::create_dir_all(out)?;
-    let mut latest: HashMap<(String, u32), QuestResult> = HashMap::new();
+    // Keyed by character as well as race: a later character must not hide an earlier one's
+    // result for the same quest. Old per-race files have no `character` and are ignored.
+    let mut latest: HashMap<(String, String, u32), QuestResult> = HashMap::new();
+    let mut legacy_ignored = 0u64;
     for entry in std::fs::read_dir(out).with_context(|| format!("reading {}", out.display()))? {
         let path = entry?.path();
         if path.extension().is_none_or(|e| e != "jsonl") {
@@ -124,12 +131,17 @@ pub fn write(out: &Path) -> Result<()> {
             let Ok(r) = serde_json::from_str::<QuestResult>(line) else {
                 continue;
             };
-            latest.insert((r.race.clone(), r.quest), r);
+            if r.character.is_empty() {
+                legacy_ignored += 1;
+                continue;
+            }
+            latest.insert((r.race.clone(), r.character.clone(), r.quest), r);
         }
     }
 
     let mut d = Dashboard {
         generated: chrono_like_now(),
+        legacy_ignored,
         ..Dashboard::default()
     };
     let mut failures: HashMap<u32, FailureGroup> = HashMap::new();
@@ -138,6 +150,10 @@ pub fn write(out: &Path) -> Result<()> {
     for r in latest.values() {
         d.results += 1;
         d.totals.add(r);
+        d.characters
+            .entry(format!("{}/{}", r.race, r.character))
+            .or_default()
+            .add(r);
         let race = d.races.entry(r.race.clone()).or_default();
         race.counts.add(r);
         race.by_zone
@@ -236,6 +252,12 @@ fn render(d: &Dashboard) -> String {
         "Generated {}; {} quest results.\n\n",
         d.generated, d.results
     ));
+    if d.legacy_ignored > 0 {
+        s.push_str(&format!(
+            "Ignored {} legacy result line(s) without a character (old per-race files).\n\n",
+            d.legacy_ignored
+        ));
+    }
     s.push_str(&format!(
         "**Totals:** {} passed, {} passed (GM-assisted), {} failed, {} unsupported, {} skipped, \
          {} daily limit.\n\n",
@@ -250,6 +272,13 @@ fn render(d: &Dashboard) -> String {
     s.push_str(&table_header("race"));
     for (race, t) in &d.races {
         s.push_str(&table_row(race, &t.counts));
+    }
+    s.push('\n');
+
+    s.push_str("## Per character\n\n");
+    s.push_str(&table_header("race/character"));
+    for (character, counts) in &d.characters {
+        s.push_str(&table_row(character, counts));
     }
     s.push('\n');
 
@@ -421,6 +450,7 @@ mod tests {
             level: 3,
             zone: "zone".into(),
             race: "nuian".into(),
+            character: "CrawlerA".into(),
             status: status.into(),
             step: "complete".into(),
             reason: String::new(),
@@ -437,6 +467,64 @@ mod tests {
             reports: Vec::new(),
             account_id: 1,
         }
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "aaemu-testclient-{tag}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    #[test]
+    fn characters_stay_separate_and_legacy_lines_are_ignored() {
+        let dir = temp_dir("dashboard-characters");
+        let mut a = result(16, "passed", false);
+        a.character = "CrawlerA".into();
+        let mut b = result(16, "failed", false);
+        b.character = "CrawlerB".into();
+        let mut legacy = result(16, "passed", false);
+        legacy.character = String::new();
+        for (file, r) in [
+            ("nuian-CrawlerA.jsonl", &a),
+            ("nuian-CrawlerB.jsonl", &b),
+            ("nuian.jsonl", &legacy),
+        ] {
+            std::fs::write(
+                dir.join(file),
+                format!(
+                    "{}
+",
+                    serde_json::to_string(r).unwrap()
+                ),
+            )
+            .unwrap();
+        }
+
+        write(&dir).unwrap();
+        let md = std::fs::read_to_string(dir.join("crawl.md")).unwrap();
+        // The same quest keeps one row per character: B does not replace A.
+        assert!(
+            md.contains("| nuian/CrawlerA | 1 | 0 | 0 | 0 | 0 | 0 |"),
+            "{md}"
+        );
+        assert!(
+            md.contains("| nuian/CrawlerB | 0 | 0 | 1 | 0 | 0 | 0 |"),
+            "{md}"
+        );
+        assert!(md.contains("Ignored 1 legacy result line(s)"), "{md}");
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("crawl.json")).unwrap())
+                .unwrap();
+        assert_eq!(json["results"], 2);
+        assert!(json["characters"]["nuian/CrawlerA"].is_object());
+        assert!(json["characters"]["nuian/CrawlerB"].is_object());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

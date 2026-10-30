@@ -143,15 +143,20 @@ impl CrawlConfig {
         }
     }
 
-    /// The per-character JSONL result file. Results are not shared between two characters of
-    /// the same race: each one has its own completed-quest state on the server.
-    pub fn result_path(&self) -> PathBuf {
-        let character = if self.character.is_empty() {
+    /// The selected character name (the race default when `--character` was not given).
+    pub fn character_name(&self) -> String {
+        if self.character.is_empty() {
             self.race.character_name().to_string()
         } else {
             self.character.clone()
-        };
-        let character: String = character
+        }
+    }
+
+    /// The per-character JSONL result file. Results are not shared between two characters of
+    /// the same race: each one has its own completed-quest state on the server.
+    pub fn result_path(&self) -> PathBuf {
+        let character: String = self
+            .character_name()
             .chars()
             .map(|c| {
                 if c.is_ascii_alphanumeric() || c == '-' || c == '_' {

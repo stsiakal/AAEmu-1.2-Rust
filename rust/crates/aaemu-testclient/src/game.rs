@@ -482,6 +482,15 @@ pub struct BagStack {
     pub count: i32,
 }
 
+/// The crawler's cleanup responsibility for one bag stack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AddedStack {
+    /// Units this client added that should still be in the bag (net of observed consumption).
+    pub owed: i32,
+    /// This client created or took the whole stack, so every unit in it is the crawler's.
+    pub whole: bool,
+}
+
 /// The readable part of an `SCItemTaskSuccessPacket`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ItemTaskInfo {
@@ -633,23 +642,35 @@ pub fn parse_item_task(body: &[u8]) -> ItemTaskInfo {
                     });
                 }
                 item_action::SWAP_SLOT => {
-                    s.read_u8()?; // from slot type
-                    s.read_u8()?; // from slot
-                                  // The item ends up in the destination slot: that is the one to remember.
-                    let slot_type = s.read_u8()?;
-                    let slot = s.read_u8()?;
-                    let id = s.read_u64()?;
-                    s.read_u64()?; // to item id
+                    let from_slot_type = s.read_u8()?;
+                    let from_slot = s.read_u8()?;
+                    let to_slot_type = s.read_u8()?;
+                    let to_slot = s.read_u8()?;
+                    let from_id = s.read_u64()?;
+                    let to_id = s.read_u64()?;
                     s.read_i32()?; // flags
+                                   // Both items change slots: the from item moves to the destination and the
+                                   // destination item (if any) moves to the old from slot.
                     info.items.push(TaskItem {
                         task,
                         template: 0,
-                        id,
-                        slot_type,
-                        slot,
+                        id: from_id,
+                        slot_type: to_slot_type,
+                        slot: to_slot,
                         count: 0,
                         mate: None,
                     });
+                    if to_id != 0 {
+                        info.items.push(TaskItem {
+                            task,
+                            template: 0,
+                            id: to_id,
+                            slot_type: from_slot_type,
+                            slot: from_slot,
+                            count: 0,
+                            mate: None,
+                        });
+                    }
                 }
                 item_action::UPDATE_DETAIL => {
                     let slot_type = s.read_u8()?;
@@ -706,7 +727,7 @@ pub struct GameState {
     /// Units this client added to the bag since it connected, by item id. The crawler destroys
     /// only these; it survives a reconnect while [`GameState::bag`] is rebuilt from the inventory
     /// snapshot of the new connection.
-    pub added_items: HashMap<u64, i32>,
+    pub added_items: HashMap<u64, AddedStack>,
     pub bag_slots: u8,
     /// Active quests from `SCQuestsPacket`: template id -> status.
     pub active_quests: HashMap<u32, u8>,
@@ -754,7 +775,13 @@ impl GameState {
                     },
                 );
                 if t.count > 0 {
-                    *self.added_items.entry(t.id).or_default() += t.count;
+                    self.added_items.insert(
+                        t.id,
+                        AddedStack {
+                            owed: t.count,
+                            whole: true,
+                        },
+                    );
                 }
             }
             item_action::ADD_STACK => {
@@ -773,7 +800,12 @@ impl GameState {
                         e.slot_type = t.slot_type;
                     }
                     e.slot = t.slot;
-                    *self.added_items.entry(t.id).or_default() += t.count;
+                    let added = self.added_items.entry(t.id).or_insert(AddedStack {
+                        owed: 0,
+                        // An untracked stack existed before this client added to it.
+                        whole: false,
+                    });
+                    added.owed += t.count;
                 } else if let Some(e) = self.bag.get_mut(&t.id) {
                     // A consumption; never create a stack (or a ledger entry) from it.
                     e.count = (e.count + t.count).max(0);
@@ -782,9 +814,9 @@ impl GameState {
                     }
                 }
                 if t.count < 0 {
-                    if let Some(owed) = self.added_items.get_mut(&t.id) {
-                        *owed = (*owed + t.count).max(0);
-                        if *owed == 0 {
+                    if let Some(added) = self.added_items.get_mut(&t.id) {
+                        added.owed = (added.owed + t.count).max(0);
+                        if added.owed == 0 {
                             self.added_items.remove(&t.id);
                         }
                     }
@@ -1032,10 +1064,15 @@ impl GameState {
         } else if p.is_sc(sc::SCCompletedQuestsPacket) {
             let count = s.read_i32()?;
             for _ in 0..count.max(0) {
-                // The wire carries the block id as 16 bits plus its 8-byte body.
-                let id = s.read_u16()?;
-                s.read_bytes(8)?;
-                st.completed_quests.insert(u32::from(id));
+                // Wire entry: 16-bit block id (= questId / 64) plus an 8-byte bitfield; bit i
+                // is byte i / 8, bit i % 8, and quest = block * 64 + i.
+                let block = u32::from(s.read_u16()?);
+                let bits = s.read_bytes(8)?;
+                for bit in 0..64u32 {
+                    if bits[(bit / 8) as usize] >> (bit % 8) & 1 == 1 {
+                        st.completed_quests.insert(block * 64 + bit);
+                    }
+                }
             }
         } else if p.is_sc(sc::SCQuestsPacket) {
             let count = s.read_i32()?;
@@ -2842,7 +2879,7 @@ mod bag_state_tests {
         s.into_bytes()
     }
 
-    fn swap(from: (u8, u8), to: (u8, u8), item_id: u64) -> Vec<u8> {
+    fn swap(from: (u8, u8), to: (u8, u8), item_id: u64, to_item_id: u64) -> Vec<u8> {
         let mut s = PacketStream::new();
         s.write_u8(8)
             .write_u8(from.0)
@@ -2850,7 +2887,7 @@ mod bag_state_tests {
             .write_u8(to.0)
             .write_u8(to.1)
             .write_u64(item_id)
-            .write_u64(0)
+            .write_u64(to_item_id)
             .write_i32(0);
         s.into_bytes()
     }
@@ -2897,16 +2934,39 @@ mod bag_state_tests {
                 count: 2
             })
         );
-        assert_eq!(st.added_items.get(&100), Some(&2));
+        assert_eq!(
+            st.added_items.get(&100),
+            Some(&AddedStack {
+                owed: 2,
+                whole: true
+            })
+        );
         st.observe(&item_task(&add_stack(100, 500, 5))).unwrap();
         assert_eq!(st.bag[&100].count, 7);
-        assert_eq!(st.added_items[&100], 7);
+        assert_eq!(st.added_items[&100].owed, 7);
+        assert!(st.added_items[&100].whole);
         st.observe(&item_task(&add_stack(100, 500, -3))).unwrap();
         assert_eq!(st.bag[&100].count, 4);
-        assert_eq!(st.added_items[&100], 4);
+        assert_eq!(st.added_items[&100].owed, 4);
         st.observe(&item_task(&remove(100, 500))).unwrap();
         assert!(!st.bag.contains_key(&100));
         assert!(!st.added_items.contains_key(&100));
+    }
+
+    #[test]
+    fn adding_to_an_untracked_stack_is_recorded_as_merged() {
+        let mut st = GameState::default();
+        // A pre-existing stack (not created by this client) grows by 2: only those 2 are ours,
+        // and the stack is marked merged so a reconnect can forget the doubt.
+        st.observe(&item_task(&add_stack(150, 417, 2))).unwrap();
+        assert_eq!(st.bag[&150].count, 2);
+        assert_eq!(
+            st.added_items.get(&150),
+            Some(&AddedStack {
+                owed: 2,
+                whole: false
+            })
+        );
     }
 
     #[test]
@@ -2919,11 +2979,19 @@ mod bag_state_tests {
     }
 
     #[test]
-    fn a_slot_swap_stores_the_destination_slot() {
+    fn a_slot_swap_updates_both_items_slots() {
         let mut st = GameState::default();
         st.observe(&item_task(&create(300, 500, 1))).unwrap();
-        st.observe(&item_task(&swap((2, 3), (2, 7), 300))).unwrap();
+        st.observe(&item_task(&create(301, 501, 1))).unwrap();
+        st.observe(&item_task(&swap((2, 3), (2, 7), 300, 301)))
+            .unwrap();
         assert_eq!(st.bag[&300].slot, 7);
+        assert_eq!(st.bag[&301].slot, 3);
+        // An empty destination only moves the source item.
+        st.observe(&item_task(&swap((2, 7), (2, 9), 300, 0)))
+            .unwrap();
+        assert_eq!(st.bag[&300].slot, 9);
+        assert_eq!(st.bag[&301].slot, 3);
     }
 
     #[test]
@@ -2944,17 +3012,25 @@ mod bag_state_tests {
     }
 
     #[test]
-    fn completed_quests_come_from_the_server_snapshot() {
+    fn completed_quests_decode_the_server_block_bitfield() {
+        use aaemu_commons::Marshal;
+        use aaemu_game::models::char_data::CompletedQuest;
+        use aaemu_game::packets::world::SCCompletedQuestsPacket;
+        use aaemu_game::systems::quests::engine::set_completed_quest_flag;
+
+        // Several quests in block 11 (704/707/750) and one in block 97 (6250), encoded by the
+        // server's own writer and flag setter.
+        let mut blocks: Vec<CompletedQuest> = Vec::new();
+        for quest in [704u32, 707, 750, 6250] {
+            set_completed_quest_flag(&mut blocks, quest, true);
+        }
+        let mut encoded = PacketStream::new();
+        SCCompletedQuestsPacket { quests: blocks }.write(&mut encoded);
+
         let mut st = GameState::default();
-        let mut body = PacketStream::new();
-        body.write_i32(2)
-            .write_u16(11)
-            .write_raw(&[0; 8])
-            .write_u16(6250)
-            .write_raw(&[0; 8]);
-        st.observe(&packet(sc::SCCompletedQuestsPacket, body.into_bytes()))
+        st.observe(&packet(sc::SCCompletedQuestsPacket, encoded.into_bytes()))
             .unwrap();
-        assert_eq!(st.completed_quests, HashSet::from([11, 6250]));
+        assert_eq!(st.completed_quests, HashSet::from([704, 707, 750, 6250]));
     }
 
     #[test]

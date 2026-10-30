@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 
 use super::catalog::{Catalog, GateVerdict, Objective, Quest};
 use super::CrawlConfig;
-use crate::game::{BagStack, DoodadInfo, GameClient, GameState, Packet, UnitInfo, LEVEL_PROXY};
+use crate::game::{
+    AddedStack, BagStack, DoodadInfo, GameClient, GameState, Packet, UnitInfo, LEVEL_PROXY,
+};
 use crate::login::LoginClient;
 use crate::record::Recorder;
 use crate::stream::StreamClient;
@@ -32,6 +34,10 @@ pub struct QuestResult {
     pub level: u8,
     pub zone: String,
     pub race: String,
+    /// The character that played it. Absent in old per-race result files, which the dashboard
+    /// ignores.
+    #[serde(default)]
+    pub character: String,
     /// `passed`, `daily-limit`, `failed`, `unsupported` or `skipped`.
     pub status: String,
     /// `accept`, `objective 2`, `turn-in`, ...
@@ -270,6 +276,17 @@ pub async fn run(cfg: &CrawlConfig, catalog: &Catalog) -> Result<()> {
     // Gates and skips come from the server's completed-quest list of THIS character, not from
     // the result file: two characters of the same race must never inherit each other's state.
     let mut passed: HashSet<u32> = session.game.state.completed_quests.clone();
+    let mut seeded: Vec<u32> = passed.iter().copied().collect();
+    seeded.sort_unstable();
+    println!(
+        "[crawl] {} completed quest(s) seeded from the character: {}",
+        seeded.len(),
+        seeded
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 
     let mut quests: Vec<&Quest> = catalog
         .quests
@@ -354,10 +371,19 @@ pub async fn run(cfg: &CrawlConfig, catalog: &Catalog) -> Result<()> {
                 Ok(mut fresh) => {
                     fresh.gm_bootstrap().await?;
                     fresh.tracker = session.tracker;
-                    // The new connection rebuilt the bag from its inventory snapshot; keep the
-                    // ledger of what this crawler added so cleanup still removes those items.
+                    // The new connection rebuilt the bag from its inventory snapshot. Stacks
+                    // this crawler created whole are still provably ours; merged stacks may
+                    // have lost the crawler's units while disconnected, so forget those.
                     fresh.game.state.added_items =
                         std::mem::take(&mut session.game.state.added_items);
+                    for (id, units) in
+                        forget_merged_after_reconnect(&mut fresh.game.state.added_items)
+                    {
+                        println!(
+                            "[crawl] cleanup: not destroying {units} merged unit(s) of stack {id} \
+                             after the reconnect"
+                        );
+                    }
                     session = fresh;
                 }
                 Err(e) => {
@@ -396,6 +422,7 @@ fn finish_result(
         level: quest.level,
         zone: quest.zone.clone(),
         race: cfg.race.name().to_string(),
+        character: cfg.character_name(),
         status: "failed".into(),
         step: String::new(),
         reason: String::new(),
@@ -707,16 +734,35 @@ async fn crawl_quest(
     evidence
 }
 
+/// Drops the responsibility for merged stacks after a reconnect: their crawler units may have
+/// been consumed while the client was away, and destroying `min(owed, current count)` could hit
+/// units that existed before the crawler added to the stack. Returns the skipped units to log.
+fn forget_merged_after_reconnect(added: &mut HashMap<u64, AddedStack>) -> Vec<(u64, i32)> {
+    let mut skipped = Vec::new();
+    added.retain(|id, stack| {
+        if stack.whole {
+            return true;
+        }
+        if stack.owed > 0 {
+            skipped.push((*id, stack.owed));
+        }
+        false
+    });
+    skipped.sort_unstable();
+    skipped
+}
+
 /// The destroys that remove exactly what the crawler's ledger says it added: `(item id, slot
 /// type, slot, count)`. Only units still in the bag and still owed are destroyed, so a stack the
 /// crawler never touched is never touched by cleanup.
 fn items_to_destroy(
-    added: &HashMap<u64, i32>,
+    added: &HashMap<u64, AddedStack>,
     bag: &HashMap<u64, BagStack>,
 ) -> Vec<(u64, u8, u8, i32)> {
     let mut out = Vec::new();
-    for (id, owed) in added {
-        if *owed <= 0 {
+    for (id, added) in added {
+        let owed = added.owed;
+        if owed <= 0 {
             continue;
         }
         let Some(stack) = bag.get(id) else {
@@ -725,7 +771,7 @@ fn items_to_destroy(
         if stack.slot_type != 2 {
             continue;
         }
-        let count = (*owed).min(stack.count);
+        let count = owed.min(stack.count);
         if count <= 0 {
             continue;
         }
@@ -755,9 +801,9 @@ async fn cleanup_added_items(session: &mut Session) {
         let _ = session.sleep_pump(600).await;
         for (id, _, _, count) in &doomed {
             let remove = match session.game.state.added_items.get_mut(id) {
-                Some(owed) => {
-                    *owed = (*owed - *count).max(0);
-                    *owed == 0
+                Some(added) => {
+                    added.owed = (added.owed - *count).max(0);
+                    added.owed == 0
                 }
                 None => false,
             };
@@ -836,17 +882,17 @@ async fn run_quest_body(
                     ),
                 ));
             }
+            // Call this on every completion path: an Updated that completes the objective may
+            // arrive after the post-accept pump, and status 3/5 can break below.
+            for step in setup_assisted_steps(Some(state), quest, setup_level, &setup_items) {
+                if !gm_assisted.contains(&step) {
+                    gm_assisted.push(step);
+                }
+            }
             if state.status == 3 || state.status == 5 {
                 break;
             }
             if session.tracker.progress(quest.id, obj.objective_index) >= obj.required {
-                // The Updated that completed it may have arrived after the post-accept pump;
-                // flag it here if the setup could have satisfied it.
-                for step in setup_assisted_steps(Some(state), quest, setup_level, &setup_items) {
-                    if !gm_assisted.contains(&step) {
-                        gm_assisted.push(step);
-                    }
-                }
                 break;
             }
             if Instant::now() >= deadline {
@@ -2295,12 +2341,16 @@ mod tests {
         }
     }
 
+    fn added(owed: i32, whole: bool) -> AddedStack {
+        AddedStack { owed, whole }
+    }
+
     #[test]
     fn two_quests_needing_the_same_item_each_get_a_fresh_stack() {
         let mut bag = HashMap::new();
         let mut ledger = HashMap::new();
         bag.insert(1, stack(500, 3, 2));
-        ledger.insert(1, 2);
+        ledger.insert(1, added(2, true));
         let doomed = items_to_destroy(&ledger, &bag);
         assert_eq!(doomed, [(1, 2, 3, 2)]);
         // Applying the cleanup empties the bag again, so the next quest's gain is a new stack.
@@ -2310,7 +2360,7 @@ mod tests {
         }
         assert!(bag.is_empty());
         bag.insert(2, stack(500, 4, 2));
-        ledger.insert(2, 2);
+        ledger.insert(2, added(2, true));
         assert_eq!(items_to_destroy(&ledger, &bag), [(2, 2, 4, 2)]);
     }
 
@@ -2320,13 +2370,13 @@ mod tests {
         let mut ledger = HashMap::new();
         // A pre-existing stack of 3 grew by 2 (GM add): only the 2 are the crawler's.
         bag.insert(9, stack(417, 3, 5));
-        ledger.insert(9, 2);
+        ledger.insert(9, added(2, false));
         // A quest reward stack is fully the crawler's.
         bag.insert(10, stack(500, 4, 1));
-        ledger.insert(10, 1);
+        ledger.insert(10, added(1, true));
         // A zero responsibility (a consumed unit) is never destroyed.
         bag.insert(11, stack(600, 5, 1));
-        ledger.insert(11, 0);
+        ledger.insert(11, added(0, true));
         // An equipment slot is never destroyed.
         bag.insert(
             12,
@@ -2335,7 +2385,7 @@ mod tests {
                 ..stack(700, 0, 1)
             },
         );
-        ledger.insert(12, 1);
+        ledger.insert(12, added(1, true));
         assert_eq!(
             items_to_destroy(&ledger, &bag),
             [(9, 2, 3, 2), (10, 2, 4, 1)]
@@ -2346,6 +2396,19 @@ mod tests {
     fn cleanup_never_destroys_an_untracked_stack() {
         let bag = HashMap::from([(1, stack(500, 2, 1))]);
         assert!(items_to_destroy(&HashMap::new(), &bag).is_empty());
+    }
+
+    #[test]
+    fn reconnect_forgets_merged_stacks_but_keeps_whole_ones() {
+        let mut ledger = HashMap::from([
+            (1, added(2, true)),
+            (2, added(3, false)),
+            (3, added(0, false)),
+        ]);
+        assert_eq!(forget_merged_after_reconnect(&mut ledger), [(2, 3)]);
+        assert_eq!(ledger.get(&1), Some(&added(2, true)));
+        assert!(!ledger.contains_key(&2));
+        assert!(!ledger.contains_key(&3));
     }
 
     fn objective(class: &str, index: u8, required: i32) -> Objective {

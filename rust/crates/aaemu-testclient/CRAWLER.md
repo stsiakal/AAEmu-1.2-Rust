@@ -50,7 +50,7 @@ $TC crawl --race nuian \
 - Results are appended to `<out>/<race>-<character>.jsonl`, one file per character: two
   characters of the same race never share results. Gates and passes are seeded from the
   server's completed-quest list for the character that just entered the world, not from the
-  file. Unsupported and skipped quests are re-recorded but do not consume the limit. A quest
+  file; the seeded ids are logged at start. Unsupported and skipped quests are re-recorded but do not consume the limit. A quest
   that passes unlocks the quests chained behind it later in the same run; a prerequisite that
   failed keeps its dependants skipped until it passes in a later run. `--skip-failed`
   additionally skips quests that already failed in that character's result file, so a
@@ -76,9 +76,12 @@ or level act the setup `/level`/gate/starter item made true at accept, or `/leve
 act. `daily-limit` is error 621 (`QuestDailyLimit`); it is not a pass and is retried in later
 runs.
 
-`crawl.json` / `crawl.md` aggregate the latest result per race and quest: totals per race,
-level band, zone and act kind (with GM-assisted passes in their own column, outside the plain
-passed total); failing quests ranked by how many races hit them; bug-report fingerprints.
+`crawl.json` / `crawl.md` aggregate the latest result per race, character and quest: totals per
+race, then one row per character, level band, zone and act kind (with GM-assisted passes in
+their own column, outside the plain passed total); failing quests ranked by how many races hit
+them; bug-report fingerprints. Old per-race result files without a `character` field (for
+example `nuian.jsonl` from before results were scoped per character) are ignored and counted in
+the header.
 A ledger records every bag unit the crawler adds, and cleanup destroys exactly those units
 (plus late quest rewards still in the ledger) after each quest and before the next one, so a
 long run does not fill the inventory. The ledger survives a reconnect while the bag is
