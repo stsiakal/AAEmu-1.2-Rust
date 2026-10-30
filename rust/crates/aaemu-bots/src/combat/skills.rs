@@ -61,8 +61,9 @@ pub struct SkillInfo {
     pub self_buffs: Vec<u32>,
     pub gcd_free: bool,
     pub aoe: bool,
-    /// The skill's `target_type` as the static data has it (`0` self, `4`/`5` hostile, else a
-    /// friendly / ground target).
+    /// The skill's `target_type` as the static data has it (1.2 `SkillTargetType`: `0..=3`
+    /// self / friendly, `4`/`5` hostile / any unit, everything else a placement, doodad or
+    /// item target). See [`Aim`] for what the bot does with it.
     pub target_type: i32,
     /// Who the bot can aim the skill at with a unit cast target.
     pub aim: Aim,

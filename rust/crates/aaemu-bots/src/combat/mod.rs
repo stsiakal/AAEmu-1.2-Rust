@@ -71,6 +71,25 @@ const WANDER_MS: i64 = 15_000;
 /// How far from the grind centre a bot may wander (half its radius).
 const WANDER_FRACTION: f32 = 0.5;
 
+/// Why a monster was left out of target selection. Only an unreachable monster is retreated
+/// from; a monster ignored for a skill problem is still fought when it attacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IgnoreReason {
+    /// The walk to it failed (unreachable / stuck / timed out).
+    Unreachable,
+    /// Nothing was castable at it for the whole wait window.
+    NothingCastable,
+    /// No line of sight to it for the whole give-up window.
+    NoSight,
+}
+
+/// An ignored monster and why, with the bounded window it stays ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ignored {
+    pub until: i64,
+    pub reason: IgnoreReason,
+}
+
 /// What the bot is doing between fights.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Mode {
@@ -115,8 +134,8 @@ pub struct CombatState {
     approach_walk: Option<(u64, u32)>,
     /// Since when the bot has had a live target it can cast nothing at (the Wait give-up).
     waiting_since: Option<(u32, i64)>,
-    /// Monsters that could not be reached, ignored until the given time.
-    pub ignored: HashMap<u32, i64>,
+    /// Monsters left out of target selection, with the reason and the ignore window.
+    pub ignored: HashMap<u32, Ignored>,
     /// When expired ignore entries were last pruned.
     ignore_pruned_ms: i64,
     /// The last monster seen attacking the bot (the likely killer when it dies).
@@ -257,14 +276,43 @@ impl CombatState {
 
     /// Is the monster still inside its ignore window?
     pub fn is_ignored(&self, obj_id: u32, now: i64) -> bool {
-        self.ignored.get(&obj_id).is_some_and(|until| *until > now)
+        self.ignored
+            .get(&obj_id)
+            .is_some_and(|entry| entry.until > now)
+    }
+
+    /// Is the monster ignored because the bot could not walk to it? Only that reason makes the
+    /// bot retreat from an attacker it cannot answer.
+    pub fn is_unreachable(&self, obj_id: u32, now: i64) -> bool {
+        self.ignored
+            .get(&obj_id)
+            .is_some_and(|entry| entry.reason == IgnoreReason::Unreachable && entry.until > now)
+    }
+
+    /// Ignores the monster for the bounded window, with the reason.
+    pub fn ignore(&mut self, obj_id: u32, now: i64, reason: IgnoreReason) {
+        self.ignored.insert(
+            obj_id,
+            Ignored {
+                until: now + IGNORE_MS,
+                reason,
+            },
+        );
+    }
+
+    /// Extends an existing ignore entry while the monster keeps attacking (an unreachable
+    /// monster stays ignored for as long as it keeps hitting the bot).
+    pub fn refresh_ignore(&mut self, obj_id: u32, now: i64) {
+        if let Some(entry) = self.ignored.get_mut(&obj_id) {
+            entry.until = now + IGNORE_MS;
+        }
     }
 
     /// Drops ignore entries whose window has passed (the map is bounded by the monsters the
-    /// bot actually failed to reach, and pruned so a long session does not sit on stale ids).
+    /// bot actually ignored, and pruned so a long session does not sit on stale ids).
     pub fn prune_ignored(&mut self, now: i64) -> usize {
         let before = self.ignored.len();
-        self.ignored.retain(|_, until| *until > now);
+        self.ignored.retain(|_, entry| entry.until > now);
         before - self.ignored.len()
     }
 
@@ -419,29 +467,36 @@ pub async fn think(bot: &Arc<BotSession>, server: &Arc<GameServer>) -> Duration 
         radius.clamp(SEARCH_RADIUS_M, MAX_SCAN_RADIUS_M),
     );
     let attackers = target::attackers(&scan, &player);
-    // An attacker the bot already failed to reach is not re-acquired: answer a live attacker
-    // if there is one, else retreat from the one that is still hitting it (never stand still).
+    // An attacker ignored because the walk to it failed is not re-acquired: answer a live
+    // attacker if there is one, else retreat from the one still hitting the bot. A monster
+    // ignored for a skill problem (nothing castable / no line of sight) is still fought when
+    // it attacks; only the pull list skips it.
     let live_attacker = attackers
         .iter()
         .copied()
-        .find(|view| !state.is_ignored(view.obj_id, now));
-    let ignored_attacker = attackers
+        .find(|view| !state.is_unreachable(view.obj_id, now));
+    let unreachable_attacker = attackers
         .iter()
         .copied()
-        .find(|view| state.is_ignored(view.obj_id, now));
+        .find(|view| state.is_unreachable(view.obj_id, now));
+    if let Some(view) = unreachable_attacker {
+        // It is still hitting the bot: keep it ignored for another window so the bot does
+        // not re-target it the moment the old window ends.
+        state.refresh_ignore(view.obj_id, now);
+    }
     // A resting bot that something attacks stops resting and fights back on this think.
     let resting = survival::update_rest(&player, &mut state, !attackers.is_empty());
 
     // What cannot be fought: run away (the danger index keeps the area). A monster the bot
     // cannot reach but that keeps attacking is retreated from like a losing fight.
-    let unreachable_attacker = live_attacker.is_none() && ignored_attacker.is_some();
+    let retreat = live_attacker.is_none() && unreachable_attacker.is_some();
     if let Some(threat) = survival::threat_to_flee(
         &scan,
         &player,
         &mut state,
         now,
-        live_attacker.or(ignored_attacker),
-        unreachable_attacker,
+        live_attacker.or(unreachable_attacker),
+        retreat,
     ) {
         flee(bot, server, &mut state, &player, &threat, now);
         return Duration::from_millis(300);
@@ -497,7 +552,7 @@ pub async fn think(bot: &Arc<BotSession>, server: &Arc<GameServer>) -> Duration 
                     target = obj_id,
                     "Bots: target unreachable, leaving it alone"
                 );
-                state.ignored.insert(obj_id, now + IGNORE_MS);
+                state.ignore(obj_id, now, IgnoreReason::Unreachable);
                 state.disengage();
             }
         }
@@ -595,7 +650,7 @@ pub async fn think(bot: &Arc<BotSession>, server: &Arc<GameServer>) -> Duration 
                         target = obj_id,
                         "Bots: target unreachable, leaving it alone"
                     );
-                    state.ignored.insert(obj_id, now + IGNORE_MS);
+                    state.ignore(obj_id, now, IgnoreReason::Unreachable);
                     state.disengage();
                 }
                 Approach::InRange | Approach::Walking => {}
@@ -623,7 +678,7 @@ pub async fn think(bot: &Arc<BotSession>, server: &Arc<GameServer>) -> Duration 
                     target = obj_id,
                     "Bots: nothing castable at the target, leaving it alone"
                 );
-                state.ignored.insert(obj_id, now + IGNORE_MS);
+                state.ignore(obj_id, now, IgnoreReason::NothingCastable);
                 state.disengage();
             }
             Duration::from_millis(300)
@@ -634,7 +689,7 @@ pub async fn think(bot: &Arc<BotSession>, server: &Arc<GameServer>) -> Duration 
                 target = obj_id,
                 "Bots: giving up a target without line of sight"
             );
-            state.ignored.insert(obj_id, now + IGNORE_MS);
+            state.ignore(obj_id, now, IgnoreReason::NoSight);
             state.disengage();
             Duration::from_millis(300)
         }
@@ -700,7 +755,7 @@ fn acquire_target(
     if let Some(attacker) = attacker {
         // A monster the bot already failed to reach is not re-targeted, also when the caller's
         // snapshot predates the ignore (the failed-walk check runs earlier in the think).
-        if !state.is_ignored(attacker.obj_id, now)
+        if !state.is_unreachable(attacker.obj_id, now)
             && attacker.level <= my_level.saturating_add(state.max_target_level_gap)
         {
             return Some(attacker);
@@ -1052,29 +1107,37 @@ async fn heal_if_hurt(
                 .await
             }
         };
-        return heal_attempt_outcome(state, player, id, now, outcome);
+        return heal_attempt_outcome(
+            state,
+            player,
+            id,
+            i64::from(template.cooldown_time.max(0)),
+            now,
+            outcome,
+        );
     }
     None
 }
 
-/// Reads one heal attempt's outcome. A server-side cooldown the bot's own state missed is
-/// backed off for that skill and does not end the think (the bot keeps fighting instead of
-/// standing still while the cooldown ticks); every other outcome ends it (a refusal already
-/// backed the skill off).
+/// Reads one heal attempt's outcome. The attempt already sent a `CSStartSkill`, so it always
+/// ends the think (no second cast follows it). A server-side cooldown the bot's own state
+/// missed backs that heal off until its real cooldown (the template's) expires, so the next
+/// thinks skip the heal and fight instead of re-trying it.
 fn heal_attempt_outcome(
     state: &mut CombatState,
     player: &PlayerRef,
     skill: u32,
+    cooldown_ms: i64,
     now: i64,
     outcome: CastOutcome,
 ) -> Option<CastOutcome> {
     if outcome == CastOutcome::Cooldown {
-        cast::back_off(state, player, skill, player.obj_id, now);
+        cast::back_off_until(state, player, skill, player.obj_id, now + cooldown_ms);
         tracing::debug!(
             skill,
-            "Bots: heal on the server's cooldown, backing the skill off and fighting on"
+            cooldown_ms,
+            "Bots: heal on the server's cooldown, backed off for its cooldown"
         );
-        return None;
     }
     if outcome == CastOutcome::Started {
         tracing::debug!(skill, "Bots: healed");
@@ -1117,9 +1180,23 @@ mod state_tests {
     #[test]
     fn expired_ignore_entries_are_pruned() {
         let mut state = CombatState::default();
-        state.ignored.insert(1, 100);
-        state.ignored.insert(2, 500);
+        state.ignored.insert(
+            1,
+            Ignored {
+                until: 100,
+                reason: IgnoreReason::Unreachable,
+            },
+        );
+        state.ignored.insert(
+            2,
+            Ignored {
+                until: 500,
+                reason: IgnoreReason::NoSight,
+            },
+        );
         assert!(state.is_ignored(1, 50));
+        assert!(state.is_unreachable(1, 50));
+        assert!(!state.is_unreachable(2, 50), "only the reachability reason");
         assert!(
             !state.is_ignored(1, 100),
             "the window is exclusive at its end"

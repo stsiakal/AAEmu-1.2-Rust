@@ -17,6 +17,10 @@ use crate::nav::movement::{NavFailure, NavOutcome};
 use crate::nav::{PlanCancel, PlanGate, RoadGraphCache};
 use crate::rotation::ClassData;
 
+/// A one-shot hook run between a cast's state read and its dispatch (tests only).
+#[cfg(test)]
+type BeforeCastHook = Box<dyn FnOnce(&PlayerRef) + Send>;
+
 /// Idle cadence of a bot between thinks (the cadence table / governor comes in P2/P3).
 /// A bot character in the world on a socketless connection.
 pub struct BotSession {
@@ -49,6 +53,10 @@ pub struct BotSession {
     /// Test hook: parks the next walk step between choosing it and sending it.
     #[cfg(test)]
     step_pause: std::sync::Mutex<Option<Arc<StepPause>>>,
+    /// Test hook: runs once between a cast's state read and its dispatch, to stage a
+    /// server-side answer (a cooldown / refusal) the bot's own snapshot did not see.
+    #[cfg(test)]
+    before_cast: std::sync::Mutex<Option<BeforeCastHook>>,
     /// The combat / survival brain (target, rotation, resting, death, counters).
     brain: Mutex<CombatState>,
     /// Generation of the navigation task that owns the walk (`0` = none). A walk replaced or
@@ -103,6 +111,8 @@ impl BotSession {
             walk_deadline_cap_ms: AtomicU64::new(0),
             #[cfg(test)]
             step_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            before_cast: std::sync::Mutex::new(None),
             brain: Mutex::new(CombatState::default()),
             walk_generation: Arc::new(AtomicU64::new(0)),
             last_walk: Mutex::new(None),
@@ -358,6 +368,26 @@ impl BotSession {
         let pause = Arc::new(StepPause::default());
         *self.step_pause.lock().expect("step pause poisoned") = Some(pause.clone());
         pause
+    }
+
+    /// Test hook: runs `hook` once just before the next cast packet is dispatched (after the
+    /// bot read its own state, before the server handler answers).
+    #[cfg(test)]
+    pub(crate) fn before_next_cast(&self, hook: impl FnOnce(&PlayerRef) + Send + 'static) {
+        *self.before_cast.lock().expect("before-cast hook poisoned") = Some(Box::new(hook));
+    }
+
+    /// Runs the pending [`BotSession::before_next_cast`] hook (a no-op without one).
+    #[cfg(test)]
+    pub(crate) fn run_before_cast(&self, player: &PlayerRef) {
+        let hook = self
+            .before_cast
+            .lock()
+            .expect("before-cast hook poisoned")
+            .take();
+        if let Some(hook) = hook {
+            hook(player);
+        }
     }
 
     /// The park point of [`BotSession::pause_next_step`] (a no-op without a pending pause).

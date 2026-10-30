@@ -114,8 +114,8 @@ pub(crate) fn relation_checks() -> usize {
 /// What the bot has learned about whom to pull.
 #[derive(Debug, Default)]
 pub struct PullRules<'a> {
-    /// Monsters that could not be reached, ignored until the given time.
-    pub ignored: Option<&'a HashMap<u32, i64>>,
+    /// Monsters left out of target selection, with the reason and the ignore window.
+    pub ignored: Option<&'a HashMap<u32, super::Ignored>>,
     /// Death-review caution about packs (0 = normal).
     pub caution: u8,
     /// Templates the bot is too weak for until it reaches the level.
@@ -207,7 +207,7 @@ pub fn find_target(
         if rules
             .ignored
             .and_then(|i| i.get(&v.obj_id))
-            .is_some_and(|until| *until > now)
+            .is_some_and(|entry| entry.until > now)
         {
             continue;
         }
@@ -446,7 +446,13 @@ mod tests {
         let (server, player) = fixture();
         spawn_monster(&server, 0x201, 9, 2, 50, 105.0, 100.0);
         let mut ignored = HashMap::new();
-        ignored.insert(0x201u32, 1_000i64);
+        ignored.insert(
+            0x201u32,
+            crate::combat::Ignored {
+                until: 1_000,
+                reason: crate::combat::IgnoreReason::Unreachable,
+            },
+        );
         let mut deferred = HashMap::new();
         deferred.insert(9u32, 10u8);
         let scan = scan_npcs(&server, &player, SEARCH_RADIUS_M);

@@ -35,6 +35,7 @@ const INACTIVE_SKILL: u32 = 60_003;
 /// Denied by the [`REFUSAL_BUFF`] while it is active (the server's buff-skill requirement).
 const REFUSED_SKILL: u32 = 60_004;
 const REFUSED_HEAL: u32 = 60_005;
+const COOLDOWN_HEAL: u32 = 60_011;
 const REFUSAL_BUFF: u32 = 90_001;
 const MONSTER: u32 = 900;
 const MONSTER_B: u32 = 901;
@@ -81,7 +82,7 @@ fn add_damage_skill(data: &mut GameData, id: u32, damage: i32, cast_ms: i32, abi
     data.systems.skills.add_skill(template);
 }
 
-fn add_heal_skill(data: &mut GameData, id: u32, heal: i32) {
+fn add_heal_skill(data: &mut GameData, id: u32, heal: i32, cooldown_ms: i32) {
     use aaemu_game::systems::skills::data::effects::{EffectKind, EffectTemplate, HealEffect};
 
     let effect_id = 910_000 + id;
@@ -116,6 +117,7 @@ fn add_heal_skill(data: &mut GameData, id: u32, heal: i32) {
         target_type: 0,
         max_range: 0,
         casting_time: 0,
+        cooldown_time: cooldown_ms,
         ..Default::default()
     };
     use aaemu_game::systems::skills::data::templates::SkillEffect;
@@ -140,7 +142,8 @@ fn combat_server() -> Arc<GameServer> {
     add_damage_skill(&mut data, INACTIVE_SKILL, 5_000, 0, 5);
     add_damage_skill(&mut data, 3, 50, 0, 0);
     add_damage_skill(&mut data, REFUSED_SKILL, 5_000, 0, 0);
-    add_heal_skill(&mut data, REFUSED_HEAL, 5_000);
+    add_heal_skill(&mut data, REFUSED_HEAL, 5_000, 0);
+    add_heal_skill(&mut data, COOLDOWN_HEAL, 5_000, 10_000);
     data.systems.skills.add_buff(BuffTemplate {
         id: REFUSAL_BUFF,
         duration: 600_000,
@@ -569,7 +572,6 @@ async fn an_unreachable_target_is_ignored_and_the_next_one_attacked() {
     let server = combat_server();
     let bot = bot(&server, 2, "Blocker", 100.0, 100.0, &[KILL_SKILL]).await;
     bot.set_walk_deadline_cap(Duration::from_millis(1));
-    let now = aaemu_game::world::now_ms();
     spawn_monster(&server, 0x400, MONSTER, 2, 5_000, 140.0, 100.0);
     bot.set_mode(Mode::Fight {
         wanted: Vec::new(),
@@ -581,7 +583,7 @@ async fn an_unreachable_target_is_ignored_and_the_next_one_attacked() {
         bot.brain()
             .try_lock()
             .ok()
-            .is_some_and(|s| s.ignored.get(&0x400).is_some_and(|t| *t > now))
+            .is_some_and(|s| s.is_ignored(0x400, aaemu_game::world::now_ms()))
     })
     .await;
     assert!(ignored, "the unreachable target was left alone");
@@ -862,9 +864,25 @@ async fn an_unreachable_attacker_is_not_reacquired_and_the_bot_retreats() {
         retreated,
         "the bot re-acquired or stood under the unreachable attacker"
     );
+    let before = {
+        let state = bot.brain().lock().await;
+        assert_ne!(state.target, Some(0x400));
+        assert!(state.is_ignored(0x400, aaemu_game::world::now_ms()));
+        state
+            .ignored
+            .get(&0x400)
+            .map(|entry| entry.until)
+            .expect("ignored")
+    };
+    // Still hitting the bot: the ignore window is refreshed, not left to expire under it.
+    run_for(&server, &bot, Duration::from_millis(400)).await;
     let state = bot.brain().lock().await;
-    assert_ne!(state.target, Some(0x400));
-    assert!(state.is_ignored(0x400, aaemu_game::world::now_ms()));
+    let after = state
+        .ignored
+        .get(&0x400)
+        .map(|entry| entry.until)
+        .expect("still ignored");
+    assert!(after > before, "the ignore window was not refreshed");
 }
 
 /// With an ignored attacker that is nearer than a live one, the bot engages the live attacker
@@ -883,11 +901,11 @@ async fn an_ignored_attacker_does_not_shadow_a_live_one() {
         radius: 20.0,
     })
     .await;
-    bot.brain()
-        .lock()
-        .await
-        .ignored
-        .insert(0x400, aaemu_game::world::now_ms() + 60_000);
+    bot.brain().lock().await.ignore(
+        0x400,
+        aaemu_game::world::now_ms(),
+        crate::combat::IgnoreReason::Unreachable,
+    );
 
     let targeted = wait_until(&server, &bot, Duration::from_secs(5), || {
         bot.brain()
@@ -900,4 +918,130 @@ async fn an_ignored_attacker_does_not_shadow_a_live_one() {
         targeted,
         "the live attacker was shadowed by the ignored one"
     );
+}
+
+/// A monster ignored for a skill problem (nothing castable / no line of sight) is not
+/// unreachable: when it attacks, the bot fights it instead of retreating 70 m.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_skill_problem_ignored_attacker_is_still_fought() {
+    for reason in [
+        crate::combat::IgnoreReason::NothingCastable,
+        crate::combat::IgnoreReason::NoSight,
+    ] {
+        let server = combat_server();
+        let bot = bot(&server, 2, "Answering", 100.0, 100.0, &[KILL_SKILL]).await;
+        let player = player_of(&bot);
+        let mob = spawn_monster(&server, 0x400, MONSTER, 2, 50_000, 104.0, 100.0);
+        mob.data().current_aggro_target = player.obj_id;
+        bot.set_mode(Mode::Fight {
+            wanted: Vec::new(),
+            radius: 20.0,
+        })
+        .await;
+        bot.brain()
+            .lock()
+            .await
+            .ignore(0x400, aaemu_game::world::now_ms(), reason);
+
+        let targeted = wait_until(&server, &bot, Duration::from_secs(5), || {
+            bot.brain()
+                .try_lock()
+                .ok()
+                .is_some_and(|s| s.target == Some(0x400) && s.fleeing_to.is_none())
+        })
+        .await;
+        assert!(targeted, "{reason:?}: the attacker was not fought back");
+        let fought = wait_until(&server, &bot, Duration::from_secs(5), || {
+            monster_hp(&server, 0x400) < 50_000
+        })
+        .await;
+        assert!(fought, "{reason:?}: the bot never cast at the attacker");
+    }
+}
+
+/// A heal the server answers with a cooldown sent its `CSStartSkill` already: the think ends
+/// there (one cast per think), the heal is backed off for its template cooldown, and the next
+/// thinks fight.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_side_heal_cooldown_ends_the_think_with_one_cast() {
+    let server = combat_server();
+    let bot = bot(
+        &server,
+        2,
+        "Cooldown",
+        100.0,
+        100.0,
+        &[COOLDOWN_HEAL, KILL_SKILL],
+    )
+    .await;
+    spawn_monster(&server, 0x400, MONSTER, 2, 50_000, 101.0, 100.0);
+    bot.set_mode(Mode::Fight {
+        wanted: Vec::new(),
+        radius: 20.0,
+    })
+    .await;
+    // A fight is already running when the bot gets hurt, so the same think that tries the heal
+    // would otherwise fall through to the rotation on this target.
+    let engaged = wait_until(&server, &bot, Duration::from_secs(5), || {
+        bot.brain()
+            .try_lock()
+            .ok()
+            .is_some_and(|s| s.target == Some(0x400))
+    })
+    .await;
+    assert!(engaged, "the bot engaged the monster");
+    let player = bot.player().await.expect("a live bot");
+    {
+        let mut c = player.data();
+        c.unit.max_hp = 1_000;
+        c.unit.hp = 300; // below HEAL_BELOW: the heal is tried first
+    }
+
+    // The bot's own state says the heal is ready; the server state gains the cooldown in the
+    // window between the bot's read and the handler (the race the fix is for).
+    let cooldown_until = aaemu_game::world::now_ms() + 10_000;
+    bot.before_next_cast(move |p| {
+        p.data()
+            .unit
+            .cooldowns
+            .cooldowns
+            .insert(COOLDOWN_HEAL, cooldown_until);
+    });
+
+    let answered = wait_until(&server, &bot, Duration::from_secs(5), || {
+        bot.brain()
+            .try_lock()
+            .ok()
+            .is_some_and(|s| s.casts_on_cooldown == 1)
+    })
+    .await;
+    assert!(answered, "the server answered the heal with a cooldown");
+    {
+        let state = bot.brain().lock().await;
+        assert_eq!(
+            state.casts_started, 0,
+            "the fight cast followed the heal in the same think"
+        );
+        let key = state
+            .refused_on
+            .get(&COOLDOWN_HEAL)
+            .copied()
+            .expect("the heal is backed off");
+        assert!(
+            key.until >= cooldown_until,
+            "backed off for the template cooldown: {key:?}"
+        );
+    }
+
+    // The next thinks skip the backed-off heal and fight.
+    run_for(&server, &bot, Duration::from_millis(900)).await;
+    let state = bot.brain().lock().await;
+    assert!(
+        state.max_casts_per_think <= 1,
+        "one think sent {} casts",
+        state.max_casts_per_think
+    );
+    assert_eq!(state.casts_on_cooldown, 1, "the heal was retried");
+    assert!(state.casts_started >= 1, "the bot never fought");
+    assert!(monster_hp(&server, 0x400) < 50_000, "the fight stood still");
 }

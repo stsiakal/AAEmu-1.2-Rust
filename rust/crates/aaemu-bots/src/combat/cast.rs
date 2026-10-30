@@ -49,9 +49,15 @@ impl RefusalKey {
     }
 }
 
-/// Backs `skill` off for this target from the bot's 2 m cell with its loadout (a refusal, or a
-/// server-side cooldown the bot's own state did not see).
-pub fn back_off(state: &mut CombatState, player: &PlayerRef, skill: u32, target: u32, now: i64) {
+/// Backs `skill` off for this target from the bot's 2 m cell with its loadout until `until`
+/// (a refusal for [`REFUSAL_BACKOFF_MS`], or the skill's own cooldown after a server Cooldown).
+pub fn back_off_until(
+    state: &mut CombatState,
+    player: &PlayerRef,
+    skill: u32,
+    target: u32,
+    until: i64,
+) {
     let t = player.data().unit.transform;
     let cell = ((t.x / 2.0).floor() as i32, (t.y / 2.0).floor() as i32);
     let loadout = state.loadout_signature(player);
@@ -61,9 +67,14 @@ pub fn back_off(state: &mut CombatState, player: &PlayerRef, skill: u32, target:
             target,
             cell,
             loadout,
-            until: now + REFUSAL_BACKOFF_MS,
+            until,
         },
     );
+}
+
+/// Backs `skill` off for [`REFUSAL_BACKOFF_MS`] (a refusal).
+pub fn back_off(state: &mut CombatState, player: &PlayerRef, skill: u32, target: u32, now: i64) {
+    back_off_until(state, player, skill, target, now + REFUSAL_BACKOFF_MS);
 }
 
 /// Is `skill` still backed off for this target from the bot's 2 m cell with its loadout?
@@ -190,6 +201,10 @@ pub async fn cast(
         face_target(bot, server, &player, target_obj_id).await;
     }
     let before = cast_marks(&player, skill_id);
+    // Test hook: let a test change the server's state in the window between the bot's read and
+    // the handler (a cooldown race the bot-side gate cannot see yet).
+    #[cfg(test)]
+    bot.run_before_cast(&player);
     let packet = CSStartSkillPacket {
         skill_id,
         caster,

@@ -491,22 +491,44 @@ async fn the_rotation_skips_ground_and_doodad_skills() {
     }
 }
 
-/// A server-side heal cooldown (the bot's own state said the skill was ready) backs that skill
-/// off without ending the think: `None` lets the bot keep fighting in the same think.
+/// A server-side heal cooldown (the bot's own state said the skill was ready) sent a packet,
+/// so it ends the think, and the heal is backed off for its template cooldown, not the short
+/// refusal window.
 #[tokio::test]
-async fn a_server_side_heal_cooldown_is_backed_off_and_does_not_stop_the_fight() {
+async fn a_server_side_heal_cooldown_is_backed_off_for_its_cooldown() {
     let server = combat_server(None);
     let (player, _client) = learning_bot(&server, &[]);
     let mut state = CombatState::default();
     let now = aaemu_game::world::now_ms();
-    let outcome =
-        super::heal_attempt_outcome(&mut state, &player, KILL_SKILL, now, CastOutcome::Cooldown);
-    assert_eq!(outcome, None, "the fight continues in the same think");
-    assert!(
-        state.refused_on.contains_key(&KILL_SKILL),
-        "the heal is backed off"
+    let outcome = super::heal_attempt_outcome(
+        &mut state,
+        &player,
+        KILL_SKILL,
+        10_000,
+        now,
+        CastOutcome::Cooldown,
     );
-    let outcome =
-        super::heal_attempt_outcome(&mut state, &player, KILL_SKILL, now, CastOutcome::Started);
+    assert_eq!(
+        outcome,
+        Some(CastOutcome::Cooldown),
+        "the attempt sent a packet, so it ends the think"
+    );
+    let key = state
+        .refused_on
+        .get(&KILL_SKILL)
+        .copied()
+        .expect("the heal is backed off");
+    assert!(
+        key.until >= now + 9_000,
+        "backed off for the skill's cooldown, not the refusal window: {key:?}"
+    );
+    let outcome = super::heal_attempt_outcome(
+        &mut state,
+        &player,
+        KILL_SKILL,
+        10_000,
+        now,
+        CastOutcome::Started,
+    );
     assert_eq!(outcome, Some(CastOutcome::Started));
 }
