@@ -193,6 +193,23 @@ pub struct BotsConfig {
     /// Concurrent route plans (blocking workers doing terrain / collision queries).
     #[serde(rename = "planconcurrency", deserialize_with = "lenient")]
     pub plan_concurrency: usize,
+    /// How often a live bot thinks outside combat, in milliseconds (a moving or fighting bot
+    /// thinks at the same cadence; the P3 governor will vary it by activity).
+    #[serde(rename = "braintickms", deserialize_with = "lenient")]
+    pub brain_tick_ms: u64,
+    /// Monsters more than this many levels above the bot are not pulled (and make it flee).
+    #[serde(rename = "maxtargetlevelgap", deserialize_with = "lenient")]
+    pub max_target_level_gap: u8,
+    /// `archetypes.json` of the class research (`classes-12`): the class trios and learn order
+    /// the bots grow into. Empty = no archetype data (data-driven skill scoring only).
+    #[serde(rename = "archetypesfile")]
+    pub archetypes_file: String,
+    /// Directory of the rotation JSON files (`classes-12/rotations`). Empty = no rotations.
+    #[serde(rename = "rotationdir")]
+    pub rotation_dir: String,
+    /// Archetype a `/bot add` without a name argument creates (`darkrunner` by default).
+    #[serde(rename = "defaultarchetype")]
+    pub default_archetype: String,
 }
 
 impl Default for BotsConfig {
@@ -202,6 +219,11 @@ impl Default for BotsConfig {
             account_base: 1_000_000,
             max_bots: 10,
             plan_concurrency: 4,
+            brain_tick_ms: 250,
+            max_target_level_gap: 3,
+            archetypes_file: String::new(),
+            rotation_dir: String::new(),
+            default_archetype: "darkrunner".into(),
         }
     }
 }
@@ -1399,14 +1421,25 @@ mod tests {
         assert_eq!(cfg.bots.account_base, 1_000_000);
         assert_eq!(cfg.bots.max_bots, 10);
         assert_eq!(cfg.bots.plan_concurrency, 4);
+        assert_eq!(cfg.bots.brain_tick_ms, 250);
+        assert_eq!(cfg.bots.max_target_level_gap, 3);
+        assert!(cfg.bots.archetypes_file.is_empty());
+        assert_eq!(cfg.bots.default_archetype, "darkrunner");
         let cfg = AppConfig::from_value(json!({
-            "Bots": { "Enabled": "True", "AccountBase": "1000042", "MaxBots": "3", "PlanConcurrency": "2" }
+            "Bots": { "Enabled": "True", "AccountBase": "1000042", "MaxBots": "3", "PlanConcurrency": "2",
+                      "BrainTickMs": "500", "MaxTargetLevelGap": "2",
+                      "ArchetypesFile": "a.json", "RotationDir": "r", "DefaultArchetype": "cleric" }
         }))
         .unwrap();
         assert!(cfg.bots.enabled);
         assert_eq!(cfg.bots.account_base, 1_000_042);
         assert_eq!(cfg.bots.max_bots, 3);
         assert_eq!(cfg.bots.plan_concurrency, 2);
+        assert_eq!(cfg.bots.brain_tick_ms, 500);
+        assert_eq!(cfg.bots.max_target_level_gap, 2);
+        assert_eq!(cfg.bots.archetypes_file, "a.json");
+        assert_eq!(cfg.bots.rotation_dir, "r");
+        assert_eq!(cfg.bots.default_archetype, "cleric");
     }
 
     #[test]
