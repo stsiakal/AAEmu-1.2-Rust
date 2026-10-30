@@ -1635,15 +1635,6 @@ fn own_skill_response(packet: &Packet, skill_id: u32, caster: u32) -> bool {
         && stream.read_bc().ok() == Some(caster)
 }
 
-fn error_codes(packets: &[Packet]) -> String {
-    let codes: Vec<i16> = packets
-        .iter()
-        .filter(|p| p.is_sc(sc::SCErrorMsgPacket))
-        .filter_map(|p| p.stream().read_i16().ok())
-        .collect();
-    format!("{codes:?}")
-}
-
 fn last_events(game: &GameClient) -> String {
     let mut out: Vec<String> = game
         .state
