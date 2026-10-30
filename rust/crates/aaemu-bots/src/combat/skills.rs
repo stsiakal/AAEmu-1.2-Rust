@@ -416,22 +416,51 @@ pub fn skill_gate(
     }
 }
 
-/// The skills the bot may cast now: learned skills of its skillsets, then the default attacks.
+/// The default auto-attack that matches the equipped weapon: the ranged one for a weapon whose
+/// holdable reaches, the melee one otherwise (the client picks it the same way).
+pub fn default_attack(server: &GameServer, player: &PlayerRef) -> u32 {
+    let mainhand = {
+        let c = player.data();
+        c.inventory
+            .get(slot_type::EQUIPMENT)
+            .and_then(|e| {
+                e.lock()
+                    .expect("equipment poisoned")
+                    .items
+                    .iter()
+                    .find(|i| i.slot == aaemu_game::models::container::equip_slot::MAINHAND)
+                    .map(|i| i.template_id)
+            })
+    };
+    let reach = mainhand
+        .and_then(|id| server.game_data.items.template(id))
+        .and_then(|t| server.game_data.items.holdable_of(t))
+        .map_or(0, |h| h.max_range);
+    if reach >= 10 {
+        2
+    } else {
+        3
+    }
+}
+
+/// The skills the bot may cast now: learned skills of its skillsets, then the default attack of
+/// its weapon.
 pub fn candidate_ids(server: &GameServer, player: &PlayerRef) -> Vec<u32> {
-    let c = player.data();
-    let actives = [c.ability1, c.ability2, c.ability3];
     let data = &server.game_data.systems.skills;
-    let mut ids: Vec<u32> = c
-        .skills
-        .skills
-        .iter()
-        .map(|s| s.id)
-        .filter(|id| {
-            data.skill(*id)
-                .is_some_and(|t| t.ability_id == 0 || actives.contains(&t.ability_id))
-        })
-        .collect();
-    ids.extend(DEFAULT_ATTACKS);
+    let mut ids: Vec<u32> = {
+        let c = player.data();
+        let actives = [c.ability1, c.ability2, c.ability3];
+        c.skills
+            .skills
+            .iter()
+            .map(|s| s.id)
+            .filter(|id| {
+                data.skill(*id)
+                    .is_some_and(|t| t.ability_id == 0 || actives.contains(&t.ability_id))
+            })
+            .collect()
+    };
+    ids.push(default_attack(server, player));
     ids
 }
 

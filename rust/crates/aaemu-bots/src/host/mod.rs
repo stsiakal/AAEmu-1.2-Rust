@@ -78,6 +78,7 @@ impl BotHost {
     async fn run(self: Arc<Self>) {
         let mut ticker = tokio::time::interval(HOST_TICK);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last_report = tokio::time::Instant::now();
         loop {
             ticker.tick().await;
             let Some(server) = self.server.upgrade() else {
@@ -101,7 +102,31 @@ impl BotHost {
                     bot.disconnect(&server).await;
                 }
             }
+            if last_report.elapsed() >= Duration::from_secs(60) {
+                last_report = tokio::time::Instant::now();
+                self.report(&server).await;
+            }
         }
+    }
+
+    /// One INFO line per bot a minute: the counters an unattended run is judged by.
+    async fn report(&self, server: &GameServer) {
+        let bots: Vec<Arc<BotSession>> = self.bots.lock().await.values().cloned().collect();
+        for bot in bots {
+            let state = bot.brain().lock().await;
+            let (x, y, z) = bot.position().await.unwrap_or((0.0, 0.0, 0.0));
+            tracing::info!(
+                "Bots: '{}' {:?} at ({x:.0}, {y:.0}, {z:.0}) kills {} deaths {} casts {} refused {} looted {}",
+                bot.name,
+                state.mode,
+                state.kills,
+                state.deaths,
+                state.casts_started,
+                state.casts_refused,
+                state.looted_items
+            );
+        }
+        let _ = server;
     }
 
     /// `/bot add <name> [archetype]`: creates the character (on the archetype's creation tree
