@@ -3496,6 +3496,28 @@ fn create_spawn_committed(
         spawn_pos.rot_x = 0.0;
         spawn_pos.rot_y = 0.0;
         spawn_pos.rot_z = final_yaw;
+    } else if !template.is_a_boat() {
+        // A searched or client-chosen land spot carries its surface height already; re-ground
+        // it here so a static floor (bridge, plaza, quay) wins over the terrain below it.
+        let h = crate::systems::ai::collision::ground_height_or(
+            server,
+            world.id,
+            spawn_pos.x,
+            spawn_pos.y,
+            spawn_pos.z,
+            || {
+                crate::systems::npcs::heightmap::world_height(
+                    server,
+                    world,
+                    spawn_pos.x,
+                    spawn_pos.y,
+                )
+                .unwrap_or(0.0)
+            },
+        );
+        if h > 0.0 {
+            spawn_pos.set_height(h);
+        }
     }
 
     if let Some(committed) = &committed {
@@ -5023,6 +5045,7 @@ mod summon_hull_overlap_tests {
         HullFootprint, ShipModel,
     };
     use crate::systems::skills::ext::SummonPlacement;
+    use aaemu_commons::PacketStream;
 
     /// Waterline and seabed of the synthetic world; the seabed is deep enough for the Cutter
     /// (min depth 19.5 m), so only the hull-envelope overlap can reject these spots.
@@ -5074,6 +5097,23 @@ mod summon_hull_overlap_tests {
         ground: f32,
         statics: &[(Vec3, Vec3, bool)],
     ) -> Arc<crate::GameServer> {
+        world_on(
+            data,
+            Plane {
+                a: ground,
+                b: 0.0,
+                c: 0.0,
+                n: 1024,
+            },
+            statics,
+        )
+    }
+
+    fn world_on(
+        data: crate::data::GameData,
+        plane: Plane,
+        statics: &[(Vec3, Vec3, bool)],
+    ) -> Arc<crate::GameServer> {
         let s = Arc::new(crate::test_support::test_server_with(data));
         s.set_self();
         s.systems
@@ -5086,12 +5126,7 @@ mod summon_hull_overlap_tests {
             .ai
             .collision
             .test_terrain
-            .set(Arc::new(Plane {
-                a: ground,
-                b: 0.0,
-                c: 0.0,
-                n: 1024,
-            }))
+            .set(Arc::new(plane))
             .unwrap_or_else(|_| panic!("terrain"));
         let pw = crate::systems::ai::collision::phys_world(&s, 0).expect("physics world");
         let mut content = CellContent {
@@ -5461,22 +5496,159 @@ mod summon_hull_overlap_tests {
         assert!(summon_candidate_1_2(&s, &world, &p, &template).is_none());
     }
 
+    /// A cart-shaped land template (no ship model, so the 1.2 box check is skipped).
+    fn land_template() -> SlaveTemplate {
+        SlaveTemplate {
+            id: RULE_SLAVE,
+            name: "Farm Wagon".into(),
+            model_id: 0,
+            spawn_x_offset: 30.0,
+            spawn_y_offset: 0.0,
+            slave_kind: slave_kind::MACHINE,
+            ..Default::default()
+        }
+    }
+
+    fn land_data() -> crate::data::GameData {
+        let mut data = search_data();
+        data.systems
+            .vehicles
+            .slave_templates
+            .insert(RULE_SLAVE, land_template());
+        data
+    }
+
+    /// A test server on the plane `z = a + c·y` (rising along the yaw-0 facing).
+    fn slope_server(a: f32, c: f32, statics: &[(Vec3, Vec3)]) -> Arc<crate::GameServer> {
+        let statics: Vec<_> = statics
+            .iter()
+            .map(|(center, half)| (*center, *half, false))
+            .collect();
+        world_on(
+            crate::data::GameData::empty(),
+            Plane {
+                a,
+                b: 0.0,
+                c,
+                n: 1024,
+            },
+            &statics,
+        )
+    }
+
+    /// The player stands on the slope `z = 100 + 0.2·y` (200 at y = 500); the first candidate
+    /// is 1 m uphill, inside the 10 m step. The old ray ended at the player's foot height,
+    /// under that uphill ground, and refused it.
     #[tokio::test]
     async fn the_1_2_land_rule_limits_the_terrain_step_to_10_m() {
-        let mut template = ship_template();
-        template.slave_kind = slave_kind::MACHINE;
-        template.model_id = 0;
+        let mut template = land_template();
         template.spawn_x_offset = 5.0;
         template.spawn_y_offset = 5.0;
-        let near = ship_server_at(109.0, &[]);
+        let near = slope_server(100.0, 0.2, &[]);
         let (_client, p) = search_player(&near);
+        p.data().unit.transform.set_height(200.0);
         let world = near.world.world(0).unwrap();
         let t = summon_candidate_1_2(&near, &world, &p, &template).expect("candidate");
-        assert!((t.z - 109.0).abs() < 1e-4, "{t:?}");
-        let far = ship_server_at(111.0, &[]);
+        assert!((t.z - 201.0).abs() < 1e-4, "{t:?}");
+        // z = 100 + 2.5·y: 1350 at the player, 1362.5 at the first candidate (12.5 m).
+        let far = slope_server(100.0, 2.5, &[]);
         let (_client, p) = search_player(&far);
+        p.data().unit.transform.set_height(1350.0);
         let world = far.world.world(0).unwrap();
         assert!(summon_candidate_1_2(&far, &world, &p, &template).is_none());
+    }
+
+    /// 6 m up over 30 m: the candidate's ground is above the player's feet, so the ray must end
+    /// above the candidate's own ground (the 1.2 eye-to-eye rule), not at the player's feet.
+    #[tokio::test]
+    async fn an_uphill_land_summon_is_accepted() {
+        let s = slope_server(100.0, 0.2, &[]);
+        let (_client, p) = search_player(&s);
+        p.data().unit.transform.set_height(200.0);
+        let world = s.world.world(0).unwrap();
+        let t = summon_candidate_1_2(&s, &world, &p, &land_template()).expect("uphill candidate");
+        assert!((t.y - 530.0).abs() < 1e-4, "{t:?}");
+        assert!((t.z - 206.0).abs() < 1e-4, "{t:?}");
+    }
+
+    /// A client `SummonPos` uphill is validated with the same eye-to-eye ray.
+    #[tokio::test]
+    async fn an_uphill_client_placement_is_validated() {
+        let s = slope_server(100.0, 0.2, &[]);
+        let (_client, p) = search_player(&s);
+        p.data().unit.transform.set_height(200.0);
+        let world = s.world.world(0).unwrap();
+        let placement = SummonPlacement {
+            x: 500.0,
+            y: 530.0,
+            z: 206.0,
+            yaw: 0.0,
+        };
+        let t = validated_summon_placement(&s, &world, &p, &land_template(), Some(placement), 0.0)
+            .expect("uphill placement");
+        assert!((t.z - 206.0).abs() < 1e-4, "{t:?}");
+        assert!(summon_placement_clear_1_2(
+            &s,
+            &world,
+            &p,
+            &land_template(),
+            &t
+        ));
+    }
+
+    /// A wall between the player and the spot still refuses the summon.
+    #[tokio::test]
+    async fn a_wall_between_the_player_and_a_land_spot_refuses() {
+        let s = slope_server(
+            100.0,
+            0.0,
+            &[(Vec3::new(500.0, 515.0, 103.0), Vec3::new(5.0, 1.0, 3.0))],
+        );
+        let (_client, p) = search_player(&s);
+        p.data().unit.transform.set_height(100.0);
+        let world = s.world.world(0).unwrap();
+        assert!(summon_candidate_1_2(&s, &world, &p, &land_template()).is_none());
+    }
+
+    /// A cart summoned on a bridge/plaza/quay must spawn on the static floor, not on the terrain
+    /// under it: the search and the final spawn use the same static-aware ground.
+    #[tokio::test]
+    async fn a_land_summon_spawns_on_a_static_floor_above_the_terrain() {
+        // A 1 m slab with its top 5 m above the terrain, under the player and the candidate.
+        let s = world_on(
+            land_data(),
+            Plane {
+                a: 100.0,
+                b: 0.0,
+                c: 0.0,
+                n: 1024,
+            },
+            &[(
+                Vec3::new(500.0, 515.0, 104.5),
+                Vec3::new(10.0, 25.0, 0.5),
+                false,
+            )],
+        );
+        install_empty_hull_loader(&s);
+        let (_client, p) = search_player(&s);
+        p.data().unit.transform.set_height(105.0);
+        give_summon_item(&s, &p, 0x9110);
+        let slave = tokio::time::timeout(
+            Duration::from_secs(2),
+            create_for_owner(&s, &p, 0x9110, RULE_ITEM, false, None, None, 0.0),
+        )
+        .await
+        .expect("summon job")
+        .expect("the cart spawns on the floor");
+        let t = slave.data().unit.transform;
+        assert!(
+            (t.x - 500.0).abs() < 1e-4 && (t.y - 530.0).abs() < 1e-4,
+            "{t:?}"
+        );
+        assert!(
+            (t.z - 105.0).abs() < 1e-4,
+            "the floor, not the terrain below: {t:?}"
+        );
     }
 
     #[tokio::test]
@@ -5616,13 +5788,23 @@ mod summon_hull_overlap_tests {
         assert!(result.is_none());
         assert!(get_active_slave_by_owner_obj_id(&s.world.world(0).unwrap(), p.obj_id).is_none());
         assert!(s.items.item_by_id(0x9001).is_some());
-        let codes: Vec<i16> = client
-            .drain()
+        let frames = client.drain();
+        let codes: Vec<i16> = frames
             .iter()
             .filter(|f| f.0 == crate::opcodes::sc::SCErrorMsgPacket)
             .map(|f| i16::from_le_bytes([f.1[0], f.1[1]]))
             .collect();
         assert!(codes.contains(&100), "{codes:?}");
+        let reset = frames
+            .iter()
+            .find(|(op, _)| *op == crate::opcodes::sc::SCSkillCooldownResetPacket)
+            .expect("the client cooldown is reset too");
+        let mut e = PacketStream::new();
+        e.write_bc(p.obj_id)
+            .write_u32(RULE_SKILL)
+            .write_u32(0)
+            .write_bool(true);
+        assert_eq!(reset.1, e.into_bytes());
         assert!(!p.data().unit.cooldowns.cooldowns.contains_key(&RULE_SKILL));
         assert_eq!(p.data().unit.global_cooldown_ms, 0);
     }
@@ -5742,13 +5924,19 @@ mod summon_hull_overlap_tests {
             .await
             .expect("summon job");
         assert!(result.is_none());
-        let codes: Vec<i16> = client
-            .drain()
+        let frames = client.drain();
+        let codes: Vec<i16> = frames
             .iter()
             .filter(|f| f.0 == crate::opcodes::sc::SCErrorMsgPacket)
             .map(|f| i16::from_le_bytes([f.1[0], f.1[1]]))
             .collect();
         assert!(codes.contains(&100), "{codes:?}");
+        assert!(
+            !frames
+                .iter()
+                .any(|(op, _)| *op == crate::opcodes::sc::SCSkillCooldownResetPacket),
+            "the newer client cooldown must not be reset"
+        );
         assert_eq!(
             p.data().unit.global_cooldown_ms,
             20_000,
@@ -6038,6 +6226,15 @@ fn summon_terrain(server: &GameServer, world: &WorldInstance, x: f32, y: f32) ->
     })
 }
 
+/// The ground under a land summon candidate at (x, y), probed down from `z`: statics such as
+/// bridges, plazas and quays first, the heightmap when nothing is hit. Searching from the
+/// player's feet keeps a found floor on the spawn surface instead of the terrain below it.
+fn summon_ground(server: &GameServer, world: &WorldInstance, x: f32, y: f32, z: f32) -> f32 {
+    crate::systems::ai::collision::ground_height_or(server, world.id, x, y, z, || {
+        crate::systems::npcs::heightmap::world_height(server, world, x, y).unwrap_or(0.0)
+    })
+}
+
 /// The 1.2 line-of-sight rule: a ray from the player's eyes to the candidate hits nothing
 /// (static + terrain, rays 0x8F). No collision service counts as clear.
 fn summon_los_clear(server: &GameServer, instance_id: u32, from: [f32; 3], to: [f32; 3]) -> bool {
@@ -6159,12 +6356,12 @@ fn model_box_clear_at(
 
 /// The 1.2 client summon search (`FUN_39347fb0`): the first candidate that passes all four
 /// checks wins. The candidate z is the water surface for ships (terrain must not be above it)
-/// and the terrain for land slaves (at most 10 m above the player). The model box is the
-/// unclipped model bbox clamped to the candidate (statics + terrain) rotated by the player yaw
-/// plus 90 degrees; the distance cap is 80 m. Returns the final spawn transform, or `None` when
-/// none of the 120 candidates passes. Debug logs the per-check rejection counts; the separate
-/// `Physics:SummonDiagnostics` option keeps scanning after a valid spot to add the old
-/// `hull_clear_at` box count for comparison.
+/// and the ground for land slaves (statics such as bridges, plazas and quays first, then the
+/// heightmap; the terrain is at most 10 m above the player). The model box is the unclipped
+/// model bbox rotated by the player yaw plus 90 degrees; the distance cap is 80 m. Returns the
+/// final spawn transform, or `None` when none of the 120 candidates passes. Debug logs the
+/// per-check rejection counts; the separate `Physics:SummonDiagnostics` option keeps scanning
+/// after a valid spot to add the old `hull_clear_at` box count for comparison.
 pub(crate) fn summon_candidate_1_2(
     server: &GameServer,
     world: &WorldInstance,
@@ -6201,7 +6398,7 @@ pub(crate) fn summon_candidate_1_2(
         } else {
             None
         };
-        let z = water.unwrap_or(terrain);
+        let z = water.unwrap_or_else(|| summon_ground(server, world, x, y, me.z));
         let terrain_ok = water.map_or(terrain - me.z <= 10.0, |water| terrain <= water);
         if !terrain_ok {
             terrain_rej += 1;
@@ -6211,9 +6408,10 @@ pub(crate) fn summon_candidate_1_2(
         if !distance_ok {
             distance_rej += 1;
         }
-        // Ships are seen against the water surface; land candidates at eye height (the ground
-        // ray would otherwise end on the target terrain itself).
-        let los_to = if is_boat { [x, y, z] } else { [x, y, me.z] };
+        // Ships are seen against the water surface. Land candidates use an eye-to-eye ray like
+        // the 1.2 rule (from z + 1): ending at the player's foot height would put the endpoint
+        // under an uphill candidate's ground and refuse it.
+        let los_to = if is_boat { [x, y, z] } else { [x, y, z + 1.0] };
         let los_ok = summon_los_clear(server, world.id, [me.x, me.y, me.z + 1.0], los_to);
         if !los_ok {
             los_rej += 1;
@@ -6293,10 +6491,12 @@ pub(super) fn summon_placement_clear_1_2(
     } else if terrain - me.z > 10.0 {
         return false;
     }
+    // Land uses an eye-to-eye ray: `water` is the candidate's own (static-aware) ground, so the
+    // endpoint is above the floor it will spawn on, not at the player's foot height.
     let los_to = if is_boat {
         [transform.x, transform.y, water]
     } else {
-        [transform.x, transform.y, me.z]
+        [transform.x, transform.y, water + 1.0]
     };
     if !summon_los_clear(server, world.id, [me.x, me.y, me.z + 1.0], los_to) {
         return false;
@@ -6338,7 +6538,7 @@ fn revalidated_searched_placement(
     let surface = if is_boat {
         super::ship_physics::water_surface(server, world, [transform.x, transform.y, me.z])
     } else {
-        summon_terrain(server, world, transform.x, transform.y)
+        summon_ground(server, world, transform.x, transform.y, transform.z)
     };
     let mut check = transform;
     check.set_position(
@@ -6398,23 +6598,41 @@ fn summon_cooldown_token(
 /// The 1.2 client refuses before sending, so a server-side refusal must not leave the skill's
 /// cooldown or the GCD that the skill system started before the effect ran. Each entry is
 /// cleared only while it is still the one captured in `cooldown`: a skill used since then owns
-/// its newer GCD/cooldown and must keep it.
+/// its newer GCD/cooldown and must keep it. The cleared entries are also reset on the client
+/// with one `SCSkillCooldownResetPacket` (the same packet the skill system uses), so its
+/// cooldown icons do not stay greyed out until relog.
 fn refund_summon_cooldown(owner: &PlayerRef, cooldown: Option<SummonCooldownToken>) {
     let Some(token) = cooldown else {
         return;
     };
-    let mut c = owner.data();
-    if c.unit.global_cooldown_ms == token.gcd_end_ms {
-        c.unit.global_cooldown_ms = 0;
-    }
-    if token.skill_end_ms.is_some()
-        && c.unit.cooldowns.cooldowns.get(&token.skill_id).copied() == token.skill_end_ms
+    let (mut skill_cleared, mut tag_cleared, mut gcd_cleared) = (false, false, false);
     {
-        c.unit.cooldowns.remove_cooldown(token.skill_id);
+        let mut c = owner.data();
+        if c.unit.global_cooldown_ms == token.gcd_end_ms {
+            c.unit.global_cooldown_ms = 0;
+            gcd_cleared = token.gcd_end_ms != 0;
+        }
+        if token.skill_end_ms.is_some()
+            && c.unit.cooldowns.cooldowns.get(&token.skill_id).copied() == token.skill_end_ms
+        {
+            c.unit.cooldowns.remove_cooldown(token.skill_id);
+            skill_cleared = true;
+        }
+        if token.tag_id != 0
+            && c.unit.cooldowns.tag_cooldowns.get(&token.tag_id).copied() == token.tag_end_ms
+        {
+            c.unit.cooldowns.tag_cooldowns.remove(&token.tag_id);
+            tag_cleared = true;
+        }
     }
-    if token.tag_id != 0
-        && c.unit.cooldowns.tag_cooldowns.get(&token.tag_id).copied() == token.tag_end_ms
-    {
-        c.unit.cooldowns.tag_cooldowns.remove(&token.tag_id);
+    if skill_cleared || tag_cleared || gcd_cleared {
+        owner.send(
+            crate::systems::skills::packets::SCSkillCooldownResetPacket {
+                obj_id: owner.obj_id,
+                skill_id: if skill_cleared { token.skill_id } else { 0 },
+                tag_id: if tag_cleared { token.tag_id } else { 0 },
+                gcd: gcd_cleared,
+            },
+        );
     }
 }

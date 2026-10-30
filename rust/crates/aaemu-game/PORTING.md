@@ -2594,20 +2594,25 @@ Additional world-side fixes from the same audit:
   with lateral offsets `{0, +spawn_y_offset, -spawn_y_offset}`; the first passing candidate
   wins. A candidate passes when (ships) the collision terrain is not above the water surface at
   x/y, (land) the terrain is at most 10 m above the player, a ray from the player's eyes to the
-  candidate hits nothing (mask 0x107, flags 0x8F), the model box (the unclipped model bbox
-  from the prefab collision proxies; the clipped hull bounds when the model reference is
-  unavailable, e.g. no client assets) rotated to player yaw + 90 degrees overlaps no blocking
-  static and no terrain heightfield, and the 3D player-to-candidate distance is at most 80 m.
+  candidate hits nothing (mask `SOLID_TERRAIN` 0x107, flags 0x8F; ships end at the water surface,
+  land at the candidate's own ground + 1 m, i.e. the 1.2 eye-to-eye rule), the model box (the
+  unclipped model bbox from the prefab collision proxies; the inertia mass box of the ship model
+  when the model reference is unavailable, e.g. no client assets) rotated to player yaw + 90
+  degrees overlaps no blocking static and no terrain heightfield, and the 3D player-to-candidate
+  distance is at most 80 m. The land candidate z is the static-aware ground (`ground_height_or`:
+  bridges, plazas, quays, then the heightmap), and the final spawn re-grounds a positioned land
+  slave the same way, so a vehicle on a bridge or quay does not sink to the terrain below it.
   The box is an oriented `PrimitiveWorldIntersection` query (`box_obstacles`) for statics plus
   `box_overlaps_terrain` for the heightfield (the PWI box query does not report heightfield
   contacts); this 1.2 path has no +1 m top margin, no terrain point sampling and no
   containment rays. Statics with a world AABB under 2 m (buoys, bollards, mooring posts) and
   vegetation are ignored. If none of the 120 passes, the summon is refused with `SCErrorMsg`
   100 (`SLAVE_SPAWN_SHIP_NEED_MORE_SPACE`), the summon item is not committed, the skill
-  cooldown and GCD are refunded (also when a client `SummonPos` placement fails the data-range
-  or water checks with `SCErrorMsg` 583), and nothing is spawned. A client `SummonPos`
-  placement is validated with the same 1.2 checks instead of searching (the old data-range and
-  water sanity checks still run first). The old C# depth/overhead probes, the +1 m margin, the
+  cooldown and GCD are refunded — on the server and on the client with the same
+  `SCSkillCooldownResetPacket` the skill system uses — (also when a client `SummonPos` placement
+  fails the data-range or water checks with `SCErrorMsg` 583), and nothing is spawned. A client
+  `SummonPos` placement is validated with the same 1.2 checks instead of searching (the old
+  data-range and water sanity checks still run first). The old C# depth/overhead probes, the +1 m margin, the
   nine-point terrain sampling and the containment rays remain in `hull_clear_at` only for GM
   `/slave spawn` and spawner placement (no item), and its overhead probe now casts down and up
   the same segment: the upward ray finds the underside of a deck thick enough to contain the
