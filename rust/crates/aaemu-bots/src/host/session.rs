@@ -28,6 +28,9 @@ pub struct BotSession {
     pub(crate) roads: RoadGraphCache,
     /// Generation of the running navigation task: a `goto` bumps it and earlier walkers stop.
     nav_generation: Arc<AtomicU64>,
+    /// The generation [`BotSession::cancel_navigation`] produced: a walk that stops at exactly
+    /// this generation was cancelled (a removal), not replaced by a newer `goto`.
+    cancelled_generation: AtomicU64,
     /// The host's concurrent-plan gate (defaults to the server-wide gate in tests).
     plan_gate: OnceLock<Arc<PlanGate>>,
     /// Monotonic movement-packet time: `ms_of_day` wraps at UTC midnight and the verifier
@@ -52,6 +55,7 @@ impl BotSession {
             disconnected: AtomicBool::new(false),
             roads: RoadGraphCache,
             nav_generation: Arc::new(AtomicU64::new(0)),
+            cancelled_generation: AtomicU64::new(u64::MAX),
             plan_gate: OnceLock::new(),
             move_time_ms: AtomicU32::new(aaemu_game::systems::ai::npc::ms_of_day()),
             stuck_spots: Mutex::new(Vec::new()),
@@ -81,6 +85,24 @@ impl BotSession {
     /// Starts a new navigation generation; any older walker notices and stops.
     pub(crate) fn bump_nav_generation(&self) -> u64 {
         self.nav_generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Cancels the running walk (the bot is being removed): it ends `Interrupted`.
+    pub fn cancel_navigation(&self) {
+        let generation = self.bump_nav_generation();
+        self.cancelled_generation
+            .store(generation, Ordering::SeqCst);
+    }
+
+    /// Why a walk of an older generation stopped: cancelled, or replaced by a newer `goto`.
+    pub(crate) fn interrupt_reason(&self) -> &'static str {
+        if self.nav_generation.load(Ordering::SeqCst)
+            == self.cancelled_generation.load(Ordering::SeqCst)
+        {
+            "navigation cancelled"
+        } else {
+            "replaced by a newer goto"
+        }
     }
 
     /// A token that cancels the plan of `generation` once a newer `goto` replaces it.

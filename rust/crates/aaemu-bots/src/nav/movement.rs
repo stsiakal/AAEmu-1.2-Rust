@@ -153,11 +153,6 @@ impl BotSession {
         });
         Goto { rx }
     }
-
-    /// Cancels a running walk (the future resolves `Interrupted`).
-    pub fn cancel_navigation(&self) {
-        self.bump_nav_generation();
-    }
 }
 
 /// What the pure [`RouteWalker`] wants the caller to do next.
@@ -471,7 +466,7 @@ async fn walk(
         Ok(points) => points,
         Err(reason) => {
             if bot.nav_generation() != generation {
-                return NavOutcome::Failed(NavFailure::Interrupted("replaced by a newer goto"));
+                return NavOutcome::Failed(NavFailure::Interrupted(bot.interrupt_reason()));
             }
             return NavOutcome::Failed(NavFailure::Unreachable(reason));
         }
@@ -486,7 +481,7 @@ async fn walk(
     loop {
         tick.tick().await;
         if bot.nav_generation() != generation {
-            return NavOutcome::Failed(NavFailure::Interrupted("replaced by a newer goto"));
+            return NavOutcome::Failed(NavFailure::Interrupted(bot.interrupt_reason()));
         }
         let (hp, online, disabled, parent, now, instance) = {
             let c = player.data();
@@ -672,7 +667,7 @@ async fn replan(
         }
         Err(why) => {
             if bot.nav_generation() != generation {
-                return Some(NavFailure::Interrupted("replaced by a newer goto"));
+                return Some(NavFailure::Interrupted(bot.interrupt_reason()));
             }
             if let Some(spot) = avoid {
                 // The repath rung must not end the walk: keep the straight target so the next

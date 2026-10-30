@@ -133,12 +133,11 @@ async fn a_second_goto_cancels_the_first() {
     let second = bot.start_goto(&server, Vec3::new(110.0, 100.0, SURFACE), 1.0);
     assert_eq!(second.wait().await, NavOutcome::Arrived);
     let first = first.wait().await;
-    assert!(
-        matches!(
-            first,
-            NavOutcome::Failed(crate::nav::movement::NavFailure::Interrupted(_))
-        ),
-        "{first:?}"
+    assert_eq!(
+        first,
+        NavOutcome::Failed(crate::nav::movement::NavFailure::Interrupted(
+            "replaced by a newer goto"
+        ))
     );
 }
 
@@ -265,5 +264,43 @@ async fn a_walk_that_outlasts_its_deadline_times_out() {
     assert!(
         x > 101.0 && x < 390.0,
         "the bot walked part of the way: {x}"
+    );
+}
+
+/// `BotHost::remove` cancels the navigation before it logs the bot out: the walk ends as
+/// cancelled (not as "replaced by a newer goto") and no movement packet follows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelling_the_navigation_ends_the_walk_before_the_next_packet() {
+    let server = nav_server();
+    let mut observer = TestClient::new(&server, 1, 1000);
+    let observer_obj = server.ids.object.get_next_id().expect("object id");
+    spawn_player(
+        &server,
+        &observer,
+        test_character(1, "Observer", 90.0, 100.0),
+        observer_obj,
+    );
+    let bot = bot_at(&server, 2, "Walker", 100.0, 100.0).await;
+    let goto = bot.start_goto(&server, Vec3::new(400.0, 100.0, SURFACE), 1.0);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    bot.cancel_navigation();
+    let outcome = tokio::time::timeout(Duration::from_secs(3), goto.wait())
+        .await
+        .expect("the walk ended after the cancel");
+    assert_eq!(
+        outcome,
+        NavOutcome::Failed(crate::nav::movement::NavFailure::Interrupted(
+            "navigation cancelled"
+        ))
+    );
+    observer.drain();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let after = observer.drain();
+    assert!(
+        !after
+            .iter()
+            .any(|(op, _)| *op == sc::SCOneUnitMovementPacket),
+        "the cancelled bot still sent {} frames",
+        after.len()
     );
 }

@@ -763,3 +763,24 @@ fn the_plan_budget_reads_the_clock_after_a_large_charge() {
         assert!(budget.charge(37));
     }
 }
+
+/// Bilinear heightmap at 100 m, physics terrain 0.2 m above it (a twisted cell).
+struct Twisted;
+impl NavWorld for Twisted {
+    fn height(&self, _x: f32, _y: f32) -> Option<f32> {
+        Some(100.0)
+    }
+    fn terrain_height(&self, _x: f32, _y: f32) -> Option<f32> {
+        Some(100.2)
+    }
+}
+
+#[test]
+fn a_step_ends_on_the_physics_terrain_not_the_bilinear_height() {
+    let step = nav::next_step(&Twisted, at(0.0, 0.0), at(10.0, 0.0)).expect("a run step");
+    assert_eq!(step.action, StepAction::Run);
+    assert!(
+        (step.to.z - 100.2).abs() < 1e-4,
+        "the step must stand on the terrain the verifier compares to: {step:?}"
+    );
+}

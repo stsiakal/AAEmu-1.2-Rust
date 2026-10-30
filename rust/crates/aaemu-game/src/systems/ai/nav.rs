@@ -94,6 +94,15 @@ impl<'a> NavView<'a> {
         (self.template.ocean_level - ground).max(0.0)
     }
 
+    /// `GetTerrainElevation` at `(x, y)`: the physics terrain's two-triangle surface, which is
+    /// what the zone's movement verifier compares a position to and what a client's physics
+    /// stands on. It differs from the bilinear [`NavView::height`] by up to a quarter of a
+    /// cell's twist, so a mover that sends the bilinear height is sometimes under the terrain.
+    /// `None` without the collision service or where the engine has no elevation (0).
+    pub fn terrain_height(&self, x: f32, y: f32) -> Option<f32> {
+        collision::terrain_height(self.server, self.instance_id, x, y).filter(|z| *z != 0.0)
+    }
+
     /// The ground under `(x, y, z)` from the collision world (`None` without the service).
     pub fn ground_height(&self, x: f32, y: f32, z: f32) -> Option<f32> {
         collision::ground_height(self.server, self.instance_id, x, y, z)
@@ -230,6 +239,20 @@ mod tests {
         let want = (360.0f32.sqrt() * collision::fall::FALL_VEL_UNITS_PER_MPS) as u16;
         assert_eq!(v, want);
         assert_eq!(fall_velocity(0.0), 0);
+    }
+
+    #[tokio::test]
+    async fn terrain_height_is_the_physics_terrain_and_none_without_it() {
+        let server = crate::test_support::test_server();
+        let view = NavView::of_instance(&server, 0).expect("main world instance");
+        assert_eq!(
+            view.terrain_height(100.0, 100.0),
+            None,
+            "no terrain installed"
+        );
+        crate::test_support::install_test_terrain(&server, 100.0);
+        let view = NavView::of_instance(&server, 0).expect("main world instance");
+        assert_eq!(view.terrain_height(100.0, 100.0), Some(100.0));
     }
 
     #[test]

@@ -290,6 +290,14 @@ pub enum Obstacle {
 /// What the planner and the step executor need from the world.
 pub trait NavWorld: Send + Sync {
     fn height(&self, x: f32, y: f32) -> Option<f32>;
+    /// The height a mover stands at: the physics terrain's two-triangle surface (what the zone's
+    /// movement verifier compares positions to), which differs from the bilinear [`height`]
+    /// the planners use by up to a quarter of a cell's twist. Defaults to [`height`].
+    ///
+    /// [`height`]: NavWorld::height
+    fn terrain_height(&self, x: f32, y: f32) -> Option<f32> {
+        self.height(x, y)
+    }
     /// Water depth over the ground at `(x, y)` (`0` = dry).
     fn water_depth(&self, _x: f32, _y: f32, ground: f32) -> f32 {
         let _ = ground;
@@ -374,6 +382,10 @@ impl NavWorld for Avoid {
         self.world.height(x, y)
     }
 
+    fn terrain_height(&self, x: f32, y: f32) -> Option<f32> {
+        self.world.terrain_height(x, y)
+    }
+
     fn water_depth(&self, x: f32, y: f32, ground: f32) -> f32 {
         self.world.water_depth(x, y, ground)
     }
@@ -435,6 +447,10 @@ pub struct Retrace<'a>(pub &'a dyn NavWorld);
 impl NavWorld for Retrace<'_> {
     fn height(&self, x: f32, y: f32) -> Option<f32> {
         self.0.height(x, y)
+    }
+
+    fn terrain_height(&self, x: f32, y: f32) -> Option<f32> {
+        self.0.terrain_height(x, y)
     }
 
     fn water_depth(&self, x: f32, y: f32, ground: f32) -> f32 {
@@ -1541,6 +1557,12 @@ impl NavWorld for GameNav<'_> {
         self.view.height(x, y)
     }
 
+    fn terrain_height(&self, x: f32, y: f32) -> Option<f32> {
+        self.view
+            .terrain_height(x, y)
+            .or_else(|| self.view.height(x, y))
+    }
+
     fn water_depth(&self, x: f32, y: f32, ground: f32) -> f32 {
         self.view.water_depth(x, y, ground)
     }
@@ -1675,6 +1697,11 @@ impl OwnedGameNav {
 impl NavWorld for OwnedGameNav {
     fn height(&self, x: f32, y: f32) -> Option<f32> {
         self.view()?.height(x, y)
+    }
+
+    fn terrain_height(&self, x: f32, y: f32) -> Option<f32> {
+        let view = self.view()?;
+        view.terrain_height(x, y).or_else(|| view.height(x, y))
     }
 
     fn water_depth(&self, x: f32, y: f32, ground: f32) -> f32 {
@@ -1870,8 +1897,10 @@ pub fn next_step_with_speeds(
     let step_len = (speed * STEP_MS as f32 / 1000.0).min(dist);
     let nx = from.x + (target.x - from.x) / dist * step_len;
     let ny = from.y + (target.y - from.y) / dist * step_len;
+    // The step ends on the terrain the physics (and the zone's verifier) knows, not on the
+    // bilinear heightmap the planner used: a real client stands on the former.
     let nz = world
-        .height(nx, ny)
+        .terrain_height(nx, ny)
         .unwrap_or_else(|| from.z + (target.z - from.z) * (step_len / dist));
     let to = Vec3::new(nx, ny, nz);
     let dy = to.z - from.z;
@@ -1920,7 +1949,7 @@ pub fn next_step_with_speeds(
 /// safe fall and the whole arc is free. The landing height is the terrain at the landing
 /// point (the arc interpolates to it, so it never ends at the take-off height).
 fn jump_step(world: &dyn NavWorld, from: Vec3, landing: Vec3, height: f32) -> Option<MoveStep> {
-    let jz = world.height(landing.x, landing.y)?;
+    let jz = world.terrain_height(landing.x, landing.y)?;
     let to = Vec3::new(landing.x, landing.y, jz);
     if from.z - jz > MAX_SAFE_DROP_M {
         return None;
