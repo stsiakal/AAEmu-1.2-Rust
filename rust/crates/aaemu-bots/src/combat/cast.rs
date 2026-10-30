@@ -20,7 +20,9 @@ use aaemu_game::packets::c2g_world::CSMoveUnitPacket;
 use aaemu_game::server::GameServer;
 use aaemu_game::systems::skills::controllers::roll_pitch_yaw_sbytes_movement;
 use aaemu_game::systems::skills::handlers::CSStartSkillPacket;
-use aaemu_game::systems::skills::types::{SkillCastTarget, SkillCaster, SkillObject};
+use aaemu_game::systems::skills::types::{
+    skill_result, SkillCastTarget, SkillCaster, SkillObject,
+};
 use aaemu_game::world::PlayerRef;
 
 use crate::host::BotSession;
@@ -53,8 +55,48 @@ impl RefusalKey {
 pub enum CastOutcome {
     /// The server took the cast.
     Started,
-    /// It refused; the skill is in back-off.
+    /// The target moved out of (or too close into) the skill's range between the precheck and
+    /// the server's check: close in rather than back the skill off.
+    OutOfRange,
+    /// The unit was on cooldown / already casting: wait, do not back the skill off.
+    Cooldown,
+    /// It refused for another reason; the skill is in back-off.
     Refused,
+}
+
+/// The result byte of the last `SCSkillStarted` in `frames` (`None` when absent or unparsed).
+fn cast_result(frames: &[(u16, Vec<u8>)]) -> Option<u8> {
+    use aaemu_commons::PacketStream;
+
+    for (op, body) in frames.iter().rev() {
+        if *op != sc::SCSkillStartedPacket {
+            continue;
+        }
+        let mut s = PacketStream::from_bytes(body.clone());
+        let parsed = (|| -> Option<u8> {
+            let _id = s.read_u32().ok()?;
+            let _tl = s.read_u16().ok()?;
+            let caster_type = s.read_u8().ok()?;
+            SkillCaster::read(caster_type, &mut s).ok()?;
+            let target_type = s.read_u8().ok()?;
+            SkillCastTarget::read(target_type, &mut s).ok()?;
+            let object_flag = s.read_u8().ok()?;
+            SkillObject::read(object_flag, &mut s).ok()?;
+            let _real_cast = s.read_u16().ok()?;
+            let _base_cast = s.read_u16().ok()?;
+            let _synergy = s.read_u8().ok()?;
+            let flags = s.read_u8().ok()?;
+            if flags & 1 != 0 {
+                s.read_u8().ok()
+            } else {
+                Some(0)
+            }
+        })();
+        if parsed.is_some() {
+            return parsed;
+        }
+    }
+    None
 }
 
 /// The `S->C` skill frames the server wrote to this bot during a cast (what a client sees).
@@ -158,6 +200,17 @@ pub async fn cast(
         let _ = (x, y);
         CastOutcome::Started
     } else {
+        match cast_result(&frames) {
+            Some(result) if result == skill_result::TOO_FAR_RANGE || result == skill_result::TOO_CLOSE_RANGE => {
+                state.casts_out_of_range += 1;
+                return CastOutcome::OutOfRange;
+            }
+            Some(result) if result == skill_result::COOLDOWN_TIME || result == skill_result::ON_CASTING => {
+                state.casts_on_cooldown += 1;
+                return CastOutcome::Cooldown;
+            }
+            _ => {}
+        }
         state.casts_refused += 1;
         let (x, y, _) = {
             let t = player.data().unit.transform;
@@ -308,6 +361,38 @@ mod tests {
         assert_eq!(replies.started, 1);
         assert_eq!(replies.fired, 1);
         assert_eq!(replies.ended, 1);
+    }
+
+    #[test]
+    fn a_refused_skill_started_frame_carries_its_result() {
+        use aaemu_commons::PacketStream;
+        use aaemu_game::net::packet::ServerPacket;
+
+        let mut packet = aaemu_game::systems::skills::packets::SCSkillStartedPacket::new(
+            60001,
+            7,
+            SkillCaster::Unit(0x100),
+            SkillCastTarget::Unit(0x400),
+            SkillObject::None,
+        );
+        packet.set_skill_result(skill_result::TOO_FAR_RANGE);
+        let mut s = PacketStream::new();
+        packet.write_body(&mut s);
+        let frames = vec![(sc::SCSkillStartedPacket, s.as_bytes().to_vec())];
+        assert_eq!(cast_result(&frames), Some(skill_result::TOO_FAR_RANGE));
+
+        let mut packet = aaemu_game::systems::skills::packets::SCSkillStartedPacket::new(
+            60001,
+            7,
+            SkillCaster::Unit(0x100),
+            SkillCastTarget::Unit(0x400),
+            SkillObject::None,
+        );
+        packet.set_skill_result(skill_result::SUCCESS);
+        let mut s = PacketStream::new();
+        packet.write_body(&mut s);
+        let frames = vec![(sc::SCSkillStartedPacket, s.as_bytes().to_vec())];
+        assert_eq!(cast_result(&frames), Some(0));
     }
 
     #[test]

@@ -129,7 +129,7 @@ impl BotHost {
                 },
             );
             tracing::info!(
-                "Bots: '{}' {:?} hp {hp}/{max_hp} mp {mp}/{max_mp} battle {battle} target {:?} resting {} at ({x:.0}, {y:.0}, {z:.0}) kills {} deaths {} casts {} refused {} looted {}",
+                "Bots: '{}' {:?} hp {hp}/{max_hp} mp {mp}/{max_mp} battle {battle} target {:?} resting {} at ({x:.0}, {y:.0}, {z:.0}) kills {} deaths {} casts {} out-of-range {} cooldown {} refused {} looted {}",
                 bot.name,
                 state.mode,
                 state.target,
@@ -137,6 +137,8 @@ impl BotHost {
                 state.kills,
                 state.deaths,
                 state.casts_started,
+                state.casts_out_of_range,
+                state.casts_on_cooldown,
                 state.casts_refused,
                 state.looted_items
             );

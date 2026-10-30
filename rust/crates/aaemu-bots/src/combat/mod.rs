@@ -89,6 +89,10 @@ pub struct CombatState {
     pub deaths: u32,
     pub casts_started: u32,
     pub casts_refused: u32,
+    /// Range races (the target moved between the precheck and the server's check).
+    pub casts_out_of_range: u32,
+    /// Casts the unit's cooldown / running cast refused (waited out, not backed off).
+    pub casts_on_cooldown: u32,
     pub looted_items: u32,
     pub last_cast_skill: u32,
     last_cast_ms: i64,
@@ -155,6 +159,8 @@ impl Default for CombatState {
             deaths: 0,
             casts_started: 0,
             casts_refused: 0,
+            casts_out_of_range: 0,
+            casts_on_cooldown: 0,
             looted_items: 0,
             last_cast_skill: 0,
             last_cast_ms: 0,
@@ -428,6 +434,22 @@ pub async fn think(bot: &Arc<BotSession>, server: &Arc<GameServer>) -> Duration 
             .await;
             match outcome {
                 CastOutcome::Started => Duration::from_millis(300),
+                CastOutcome::OutOfRange => {
+                    // The target slipped out of range after the precheck: close in instead of
+                    // backing the skill off.
+                    approach(
+                        bot,
+                        server,
+                        &mut state,
+                        &player,
+                        obj_id,
+                        t.x,
+                        t.y,
+                        MELEE_RANGE_M - 1.0,
+                    );
+                    Duration::from_millis(300)
+                }
+                CastOutcome::Cooldown => Duration::from_millis(300),
                 CastOutcome::Refused => Duration::from_millis(900),
             }
         }
