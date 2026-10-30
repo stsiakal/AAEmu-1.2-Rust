@@ -97,7 +97,7 @@ pub struct AggroEffect {
     pub charged_mul: f32,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct BuffEffect {
     pub id: u32,
     /// `Buff?.Id` (`None` when buff_id has no template; `BuffId` then throws in C#).
@@ -117,7 +117,7 @@ pub struct ConversionEffect {
     pub target_value: i32,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct DamageEffect {
     pub id: u32,
     pub damage_type: i32,

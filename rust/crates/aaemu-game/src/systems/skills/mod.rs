@@ -91,6 +91,7 @@ use crate::systems::{SaveStage, UnitHooks};
 use crate::world::{PlayerRef, WorldObject};
 
 pub use data::Data;
+pub use validation::precheck;
 
 /// The `AppConfiguration.World` values the skill code reads (defaults = the shipped
 /// `Configurations/World.json`).

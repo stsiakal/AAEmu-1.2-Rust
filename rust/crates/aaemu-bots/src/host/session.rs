@@ -12,11 +12,16 @@ use aaemu_game::GameServer;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
+use crate::combat::{self, CombatState, Mode};
+use crate::nav::movement::{NavFailure, NavOutcome};
 use crate::nav::{PlanCancel, PlanGate, RoadGraphCache};
+use crate::rotation::ClassData;
+
+/// A hook run between a cast's state read and its dispatch, for every cast (tests only).
+#[cfg(test)]
+type BeforeCastHook = Box<dyn Fn(u32, &PlayerRef) + Send + Sync>;
 
 /// Idle cadence of a bot between thinks (the cadence table / governor comes in P2/P3).
-const IDLE_THINK: Duration = Duration::from_millis(1_000);
-
 /// A bot character in the world on a socketless connection.
 pub struct BotSession {
     pub character_id: u32,
@@ -48,6 +53,19 @@ pub struct BotSession {
     /// Test hook: parks the next walk step between choosing it and sending it.
     #[cfg(test)]
     step_pause: std::sync::Mutex<Option<Arc<StepPause>>>,
+    /// Test hook: runs between a cast's state read and its dispatch, to stage a server-side
+    /// answer (a cooldown / refusal) the bot's own snapshot did not see. It gets the skill id,
+    /// so a test can stage the race for one skill only.
+    #[cfg(test)]
+    before_cast: std::sync::Mutex<Option<BeforeCastHook>>,
+    /// The combat / survival brain (target, rotation, resting, death, counters).
+    brain: Mutex<CombatState>,
+    /// Generation of the navigation task that owns the walk (`0` = none). A walk replaced or
+    /// cancelled by a newer generation is not walking any more, even before its task ends.
+    walk_generation: Arc<AtomicU64>,
+    /// The outcome of the last walk that ended, with its generation (combat reads it back to
+    /// tell a failed approach from a completed one).
+    last_walk: Mutex<Option<(u64, NavOutcome)>>,
 }
 
 /// What became of one packet of a walk ([`BotSession::dispatch_walk`]).
@@ -94,7 +112,65 @@ impl BotSession {
             walk_deadline_cap_ms: AtomicU64::new(0),
             #[cfg(test)]
             step_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            before_cast: std::sync::Mutex::new(None),
+            brain: Mutex::new(CombatState::default()),
+            walk_generation: Arc::new(AtomicU64::new(0)),
+            last_walk: Mutex::new(None),
         }
+    }
+
+    /// The combat brain (tests, the `/bot` commands and the live report).
+    pub fn brain(&self) -> &Mutex<CombatState> {
+        &self.brain
+    }
+
+    /// `/bot fight` / `/bot grind`: switch what the bot hunts and think right away. A new
+    /// command drops the old fight (its target, approach walk and refusals).
+    pub async fn set_mode(&self, mode: Mode) {
+        {
+            let mut state = self.brain.lock().await;
+            state.mode = mode;
+            state.disengage();
+            state.loot_target = None;
+            state.ignored.clear();
+        }
+        *self.next_think.lock().await = Instant::now();
+    }
+
+    /// A running navigation task (`goto`, the combat approach / flee / loot walks) of the
+    /// current generation.
+    pub fn walking(&self) -> bool {
+        let generation = self.walk_generation.load(Ordering::Relaxed);
+        generation != 0 && generation == self.nav_generation()
+    }
+
+    pub(crate) fn set_walk_generation(&self, generation: u64) {
+        self.walk_generation.store(generation, Ordering::Relaxed);
+    }
+
+    /// Ends the walk of `generation` (a newer walk keeps the flag).
+    pub(crate) fn clear_walk_generation(&self, generation: u64) {
+        let _ = self.walk_generation.compare_exchange(
+            generation,
+            0,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Installs the class data of this bot: its archetype, rotation, level gap and cadence.
+    /// Called by the host before the bot is on the roster.
+    pub async fn configure(&self, class: Option<&ClassData>, max_gap: u8, tick_ms: u64) {
+        let ability = self.player().await.map(|p| p.data().ability1);
+        let archetype = ability
+            .and_then(|a| class.and_then(|c| c.for_ability(a)))
+            .cloned();
+        let rotation = archetype
+            .as_ref()
+            .and_then(|a| class.and_then(|c| c.rotation_for(a)));
+        let mut brain = self.brain.lock().await;
+        combat::configure(&mut brain, archetype, rotation, max_gap, tick_ms);
     }
 
     /// The active character (`None` in the lobby or after a logout).
@@ -207,16 +283,42 @@ impl BotSession {
         }
     }
 
-    /// Dispatches one client packet through the real handler on this bot's connection.
+    /// Dispatches one client packet through the real handler on this bot's connection. A bot
+    /// that left the world (removal / logout / a closed connection) sends nothing: the check
+    /// runs under the connection lock a logout holds, like [`BotSession::dispatch_walk`]'s.
     pub async fn dispatch<P: ClientPacket + std::fmt::Debug>(
         &self,
         server: &GameServer,
         packet: P,
     ) -> anyhow::Result<()> {
         let mut conn = self.conn.lock().await;
+        let online = conn
+            .conn
+            .active_char
+            .as_ref()
+            .is_some_and(|player| player.data().is_online);
+        if !online {
+            anyhow::bail!("bot '{}' is not in the world", self.name);
+        }
         self.dispatched.fetch_add(1, Ordering::Relaxed);
         conn.dispatch(server, packet).await?;
         Ok(())
+    }
+
+    /// Records the outcome of the walk of `generation` (the walk task calls it once).
+    pub(crate) async fn record_walk_outcome(&self, generation: u64, outcome: NavOutcome) {
+        *self.last_walk.lock().await = Some((generation, outcome));
+    }
+
+    /// Did the walk of `generation` end failed? A walk replaced or cancelled is not a failure
+    /// (something newer took over), so only unreachable / stuck / timeout count.
+    pub(crate) async fn walk_failed(&self, generation: u64) -> bool {
+        match self.last_walk.lock().await.as_ref() {
+            Some((g, NavOutcome::Failed(failure))) => {
+                *g == generation && !matches!(failure, NavFailure::Interrupted(_))
+            }
+            _ => false,
+        }
     }
 
     /// Dispatches one packet of the walk of `generation`, unless that walk is stale by the time
@@ -269,6 +371,22 @@ impl BotSession {
         pause
     }
 
+    /// Test hook: runs `hook(skill_id, player)` before every cast packet is dispatched (after
+    /// the bot read its own state, before the server handler answers).
+    #[cfg(test)]
+    pub(crate) fn before_next_cast(&self, hook: impl Fn(u32, &PlayerRef) + Send + Sync + 'static) {
+        *self.before_cast.lock().expect("before-cast hook poisoned") = Some(Box::new(hook));
+    }
+
+    /// Runs the pending [`BotSession::before_next_cast`] hook (a no-op without one).
+    #[cfg(test)]
+    pub(crate) fn run_before_cast(&self, skill_id: u32, player: &PlayerRef) {
+        let hook = self.before_cast.lock().expect("before-cast hook poisoned");
+        if let Some(hook) = hook.as_ref() {
+            hook(skill_id, player);
+        }
+    }
+
     /// The park point of [`BotSession::pause_next_step`] (a no-op without a pending pause).
     #[cfg(test)]
     pub(crate) async fn pause_before_send(&self) {
@@ -300,31 +418,37 @@ impl BotSession {
     /// One scheduler pass. Services the connection's commands every tick; the think itself
     /// (draining replies; the AI in P2) runs on the per-bot `next_think` cadence.
     /// `false` = the connection is closing and the host must disconnect it.
-    pub async fn tick(&self, server: &GameServer) -> bool {
-        let mut conn = self.conn.lock().await;
-        if !conn.service_commands(server).await {
-            return false;
-        }
-        let now = Instant::now();
-        let mut next = self.next_think.lock().await;
-        if now >= *next {
-            let jitter = Duration::from_millis(u64::from(self.character_id % 250));
-            *next = now + IDLE_THINK + jitter;
-            let replies = conn.drain();
-            if !replies.is_empty() {
-                tracing::trace!(
-                    character_id = self.character_id,
-                    frames = replies.len(),
-                    "Bots: drained replies"
-                );
+    pub async fn tick(self: &Arc<Self>, server: &Arc<GameServer>) -> bool {
+        {
+            let mut conn = self.conn.lock().await;
+            if !conn.service_commands(server).await {
+                return false;
             }
         }
+        let due = {
+            let next = self.next_think.lock().await;
+            Instant::now() >= *next
+        };
+        if !due {
+            return true;
+        }
+        let mut next = self.next_think.lock().await;
+        if Instant::now() < *next {
+            return true;
+        }
+        let wait = combat::think(self, server).await;
+        *next = Instant::now() + wait.max(Duration::from_millis(20));
         true
     }
 
     /// The normal logout without the client's logout timer: save + remove from the world. The
     /// connection stays alive (in the lobby) until [`BotSession::disconnect`].
     pub async fn logout(&self, server: &GameServer) {
+        // The fight belongs to the session: clear it under the brain lock (the same
+        // brain-then-connection order a think takes) so no think can start another packet
+        // between the clear and the leave.
+        let mut brain = self.brain.lock().await;
+        brain.clear_session();
         let mut conn = self.conn.lock().await;
         session::leave_world_now(server, &mut conn.conn, leave_target::CHARACTER_SELECT).await;
     }
@@ -338,6 +462,7 @@ impl BotSession {
         let Some(server) = server.self_arc() else {
             return;
         };
+        self.brain.lock().await.clear_session();
         let mut conn = self.conn.lock().await;
         aaemu_game::net::listener::on_disconnect(&server, &mut conn.conn).await;
     }

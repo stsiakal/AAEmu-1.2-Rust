@@ -158,10 +158,15 @@ impl BotSession {
     ) -> Goto {
         let (tx, rx) = oneshot::channel();
         let generation = self.bump_nav_generation();
+        self.set_walk_generation(generation);
         let bot = self.clone();
         let server = server.clone();
         tokio::spawn(async move {
             let outcome = walk(&bot, &server, target, radius, generation).await;
+            // Record first, then clear "walking": a think that sees the walk finished must
+            // also see its outcome (the other order loses a failure in the gap).
+            bot.record_walk_outcome(generation, outcome.clone()).await;
+            bot.clear_walk_generation(generation);
             let at = bot.position().await;
             tracing::info!(
                 "Bots: '{}' goto ({:.1}, {:.1}, {:.1}) r={radius:.1}: {:?} at {:?}",
