@@ -50,8 +50,9 @@ pub struct BotSession {
     step_pause: std::sync::Mutex<Option<Arc<StepPause>>>,
     /// The combat / survival brain (target, rotation, resting, death, counters).
     brain: Mutex<CombatState>,
-    /// A navigation task is running (started by `goto` / the combat approach).
-    walking: Arc<AtomicBool>,
+    /// Generation of the navigation task that owns the walk (`0` = none). A walk replaced or
+    /// cancelled by a newer generation is not walking any more, even before its task ends.
+    walk_generation: Arc<AtomicU64>,
 }
 
 /// What became of one packet of a walk ([`BotSession::dispatch_walk`]).
@@ -99,7 +100,7 @@ impl BotSession {
             #[cfg(test)]
             step_pause: std::sync::Mutex::new(None),
             brain: Mutex::new(CombatState::default()),
-            walking: Arc::new(AtomicBool::new(false)),
+            walk_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -114,13 +115,25 @@ impl BotSession {
         *self.next_think.lock().await = Instant::now();
     }
 
-    /// A running navigation task (`goto`, the combat approach / flee / loot walks).
+    /// A running navigation task (`goto`, the combat approach / flee / loot walks) of the
+    /// current generation.
     pub fn walking(&self) -> bool {
-        self.walking.load(Ordering::Relaxed)
+        let generation = self.walk_generation.load(Ordering::Relaxed);
+        generation != 0 && generation == self.nav_generation()
     }
 
-    pub(crate) fn set_walking(&self, walking: bool) {
-        self.walking.store(walking, Ordering::Relaxed);
+    pub(crate) fn set_walk_generation(&self, generation: u64) {
+        self.walk_generation.store(generation, Ordering::Relaxed);
+    }
+
+    /// Ends the walk of `generation` (a newer walk keeps the flag).
+    pub(crate) fn clear_walk_generation(&self, generation: u64) {
+        let _ = self.walk_generation.compare_exchange(
+            generation,
+            0,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
     }
 
     /// Installs the class data of this bot: its archetype, rotation, level gap and cadence.

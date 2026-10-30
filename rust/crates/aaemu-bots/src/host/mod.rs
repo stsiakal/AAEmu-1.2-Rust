@@ -340,6 +340,26 @@ mod tests {
     /// roster insert (the test holds the roster), after whatever it does first; the gate
     /// asked for now must already be the host's, because an early `goto` that reaches a bot
     /// without one pins the server-wide fallback gate for good (the first call wins).
+    /// A walk that a newer generation replaced (the combat approach cancels one before a cast)
+    /// is not "walking" any more, even while its task is still unrolling; otherwise the bot
+    /// would wait for it forever.
+    #[tokio::test]
+    async fn a_replaced_walk_is_not_walking() {
+        use aaemu_game::net::socketless::SocketlessConnection;
+        use aaemu_game::systems::skills::controllers::Vec3;
+        use aaemu_game::test_support::{test_character, test_server};
+
+        let server = Arc::new(test_server());
+        server.set_self();
+        let conn = SocketlessConnection::new(&server, 1_000_003);
+        let bot = life::enter_loaded(&server, conn, test_character(3, "Walker", 100.0, 100.0))
+            .expect("the bot enters");
+        bot.start_goto(&server, Vec3::new(200.0, 100.0, 100.0), 1.0);
+        assert!(bot.walking(), "the walk started");
+        bot.bump_nav_generation();
+        assert!(!bot.walking(), "a replaced walk is not running");
+    }
+
     #[tokio::test]
     async fn a_bot_gets_the_hosts_gate_before_it_is_on_the_roster() {
         let server = Arc::new(test_server());

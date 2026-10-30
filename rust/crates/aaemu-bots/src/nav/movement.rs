@@ -158,14 +158,12 @@ impl BotSession {
     ) -> Goto {
         let (tx, rx) = oneshot::channel();
         let generation = self.bump_nav_generation();
-        self.set_walking(true);
+        self.set_walk_generation(generation);
         let bot = self.clone();
         let server = server.clone();
         tokio::spawn(async move {
             let outcome = walk(&bot, &server, target, radius, generation).await;
-            if bot.nav_generation() == generation {
-                bot.set_walking(false);
-            }
+            bot.clear_walk_generation(generation);
             let at = bot.position().await;
             tracing::info!(
                 "Bots: '{}' goto ({:.1}, {:.1}, {:.1}) r={radius:.1}: {:?} at {:?}",
