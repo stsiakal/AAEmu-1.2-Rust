@@ -38,12 +38,15 @@ $TC crawl --race nuian \
   first character is created (`accounts` / `characters` in the lane's game database). Without
   it the GM bootstrap prints the SQL the account needs.
 - `--min-level` raises the character before each quest (setup); `0` uses the quest level.
-  `--limit` counts quests the crawler can actually attempt, not unsupported/gated ones.
+  `--limit` counts quests the crawler can actually attempt, not unsupported/gated ones;
+  without it the crawler attempts every quest currently available in the level band.
 - `--from-quest` starts at the first catalog quest with that id or later; `--levels a-b`
   restricts the level band.
 - Results are appended to `<out>/<race>.jsonl` and are resumable: quests that already passed
   in that file are skipped. Unsupported and skipped quests are re-recorded but do not consume
-  the limit.
+  the limit. A quest that passes (or that the server reports as already completed) unlocks the
+  quests chained behind it later in the same run; a prerequisite that failed keeps its
+  dependants skipped until it passes in a later run.
 - Enable `BugReports.Enabled` in the lane's `rs-game/Config.Local.json` (Directory empty =
   `<app>/BugReports`) to attach report paths to failures. The crawler ignores teleport /
   closed-zone report noise.
