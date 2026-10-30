@@ -2010,9 +2010,11 @@ fn jump_over(
     Err(last)
 }
 
-/// A jump step only when the landing has ground, is not deep water, is not a drop beyond the
-/// safe fall and the whole arc is free. The landing height is the terrain at the landing
-/// point (the arc interpolates to it, so it never ends at the take-off height).
+/// A jump step only when the landing has ground, is neither above a jump's reach nor beyond
+/// the safe fall below, is not deep water and the whole arc is free. The landing height is the
+/// terrain at the landing point (the arc interpolates to it, so it never ends at the take-off
+/// height). Every jump (an obstacle jump of any length and a climb onto the next step's
+/// ledge) is made here, so the limits hold on every path.
 fn jump_step(
     world: &dyn NavWorld,
     from: Vec3,
@@ -2023,6 +2025,9 @@ fn jump_step(
         return Err("no ground at the jump landing");
     };
     let to = Vec3::new(landing.x, landing.y, jz);
+    if jz - from.z > JUMP_HEIGHT_M {
+        return Err("the jump would land above a jump's height");
+    }
     if from.z - jz > MAX_SAFE_DROP_M {
         return Err("the jump would land below a safe fall");
     }

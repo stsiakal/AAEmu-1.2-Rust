@@ -922,6 +922,75 @@ fn a_clear_obstacle_gets_the_running_jump_and_a_blocked_one_none() {
     );
 }
 
+/// A low fence at x = 105 and ground that rises by `rise` metres behind it (the landing of
+/// every jump over the fence is `rise` above the take-off).
+struct FenceThenLedge {
+    rise: f32,
+}
+
+impl NavWorld for FenceThenLedge {
+    fn height(&self, x: f32, _y: f32) -> Option<f32> {
+        Some(if x >= 105.0 { 100.0 + self.rise } else { 100.0 })
+    }
+    fn obstacle(&self, from: Vec3, to: Vec3) -> Option<Obstacle> {
+        (from.x < 105.0 && to.x >= 105.0).then_some(Obstacle::Low(0.9))
+    }
+}
+
+#[test]
+fn a_jump_over_a_fence_never_lands_above_the_jump_height() {
+    let from = Vec3::new(104.5, 100.0, 100.0);
+    // A ledge within a jump's height behind the fence is landed on ...
+    let step = nav::next_step(&FenceThenLedge { rise: 1.2 }, from, at(110.0, 100.0))
+        .expect("a ledge within the jump height is jumped onto");
+    assert!(matches!(step.action, StepAction::Jump(_)), "{step:?}");
+    assert!((step.to.z - 101.2).abs() < 0.01, "{step:?}");
+    // ... one above it is not, whatever the jump length: the old check only looked down.
+    for rise in [1.4, 3.0, 5.0] {
+        assert!(
+            nav::next_step(&FenceThenLedge { rise }, from, at(110.0, 100.0)).is_none(),
+            "a {rise} m higher landing is beyond a jump of {} m",
+            nav::JUMP_HEIGHT_M
+        );
+    }
+}
+
+#[test]
+fn no_jump_path_lands_above_the_jump_height() {
+    // The direct path (the next step rises over the step height): a 2 m rise is no jump.
+    struct Wall;
+    impl NavWorld for Wall {
+        fn height(&self, x: f32, _y: f32) -> Option<f32> {
+            Some(if x >= 105.0 { 102.0 } else { 100.0 })
+        }
+    }
+    assert!(
+        nav::next_step(&Wall, Vec3::new(104.8, 100.0, 100.0), at(110.0, 100.0)).is_none(),
+        "a 2 m rise ahead is not jumped"
+    );
+    // The steered path tries other headings (a plain run step along one is fine) but never
+    // jumps onto the high ledge either.
+    let mut bias = 1i8;
+    let steered = nav::next_step_steered(
+        &FenceThenLedge { rise: 4.0 },
+        Vec3::new(104.5, 100.0, 100.0),
+        at(110.0, 100.0),
+        &mut bias,
+        5.4,
+        3.0,
+    );
+    assert!(
+        !matches!(
+            steered,
+            Some(nav::MoveStep {
+                action: StepAction::Jump(_),
+                ..
+            })
+        ),
+        "{steered:?}"
+    );
+}
+
 #[test]
 fn a_jump_reports_its_real_horizontal_speed() {
     // A 1.57 m jump takes the full air time: its per-tick displacement is a tenth of the
