@@ -437,6 +437,17 @@ fn read_doodad(s: &mut PacketStream) -> anyhow::Result<DoodadInfo> {
     })
 }
 
+/// A house of the selected character: the head of `SCMyHousePacket` (which the server sends for
+/// every owned house at character select and for a newly created one) or of its own
+/// `SCHouseStatePacket` (`House.Write`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MyHouse {
+    pub obj_id: u32,
+    pub tl: u16,
+    pub template_id: u32,
+    pub owner_id: u32,
+}
+
 /// The last `SCMateSpawnedPacket`: the owner's own view of the summoned mate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MateSpawn {
@@ -583,6 +594,9 @@ pub struct GameState {
     pub units: HashMap<u32, UnitInfo>,
     /// Doodads announced by `SCDoodad(s)CreatedPacket` and not removed since.
     pub doodads: HashMap<u32, DoodadInfo>,
+    /// Houses of the selected character the server announced and has not demolished since, in
+    /// arrival order. Kept whoever consumed the packet, so a house announced late is never lost.
+    pub my_houses: Vec<MyHouse>,
     /// First item of the bag (`SCCharacterInvenContentsPacket`, slot type 2): `(item id, slot)`.
     pub bag_items: Vec<(u64, u8, u32)>,
     pub bag_slots: u8,
@@ -674,6 +688,17 @@ impl GameState {
                 st.self_pos = pos;
                 st.observed_self_pos = Some(pos);
             }
+            // A unit announced again while it is still known (it re-entered the view without an
+            // `SCUnitsRemoved` in between) keeps its first announcement: that one says where it
+            // spawned, and a later one would pass an old unit off as new to the scenarios that
+            // match announcements to their own spawn commands.
+            let (announced_pos, announced_seq) = st
+                .units
+                .get(&obj_id)
+                .filter(|known| known.unit_type == unit_type && known.id == id)
+                .map_or((pos, st.observation_seq), |known| {
+                    (known.announced_pos, known.announced_seq)
+                });
             st.units.insert(
                 obj_id,
                 UnitInfo {
@@ -683,8 +708,8 @@ impl GameState {
                     id,
                     pos,
                     tl_id,
-                    announced_pos: pos,
-                    announced_seq: st.observation_seq,
+                    announced_pos,
+                    announced_seq,
                 },
             );
         } else if p.is_sc(sc::SCOneUnitMovementPacket) {
@@ -713,6 +738,31 @@ impl GameState {
             st.last_teleport = Some(pos);
             st.self_pos = pos;
             st.observed_self_pos = Some(pos);
+        } else if p.is_sc(sc::SCMyHousePacket) || p.is_sc(sc::SCHouseStatePacket) {
+            // `House.Write` head: tl, database id, object id, template, model, co-owner, owner.
+            let tl = s.read_u16()?;
+            s.read_u32()?;
+            let obj_id = s.read_bc()?;
+            let template_id = s.read_u32()?;
+            s.read_u32()?;
+            s.read_u32()?;
+            let owner_id = s.read_u32()?;
+            // `SCMyHouse` is always the receiver's own; a state broadcast is any house in view.
+            if p.is_sc(sc::SCMyHousePacket) || (owner_id == st.selected_char && owner_id != 0) {
+                let house = MyHouse {
+                    obj_id,
+                    tl,
+                    template_id,
+                    owner_id,
+                };
+                match st.my_houses.iter_mut().find(|h| h.tl == tl) {
+                    Some(known) => *known = house,
+                    None => st.my_houses.push(house),
+                }
+            }
+        } else if p.is_sc(sc::SCMyHouseRemovedPacket) || p.is_sc(sc::SCHouseDemolishedPacket) {
+            let tl = s.read_u16()?;
+            st.my_houses.retain(|h| h.tl != tl);
         } else if p.is_sc(sc::SCDoodadCreatedPacket) {
             let d = read_doodad(&mut s)?;
             st.doodads.insert(d.obj_id, d);
@@ -1607,6 +1657,257 @@ mod observed_position_tests {
         assert_eq!(state.observed_self_pos, Some((10.0, 20.0, 29.9995)));
         assert_eq!(state.self_pos, (900.0, 900.0, 900.0));
         assert_eq!(state.observation_seq, 1);
+    }
+}
+
+#[cfg(test)]
+mod announcement_tests {
+    use super::test_packets::npc_state;
+    use super::*;
+
+    fn removed(obj_id: u32) -> Packet {
+        let mut body = PacketStream::new();
+        body.write_u16(1).write_bc(obj_id);
+        Packet {
+            level: LEVEL_GAME,
+            opcode: sc::SCUnitsRemovedPacket,
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    fn ambient(state: &mut GameState) {
+        let mut body = PacketStream::new();
+        body.write_i16(7)
+            .write_i16(0)
+            .write_u32(0)
+            .write_bool(false);
+        let packet = Packet {
+            level: LEVEL_GAME,
+            opcode: sc::SCErrorMsgPacket,
+            body: body.as_bytes().to_vec(),
+        };
+        state.observe(&packet).unwrap();
+    }
+
+    #[test]
+    fn a_unit_announced_again_keeps_its_first_announcement() {
+        let mut state = GameState::default();
+        state
+            .observe(&npc_state(9, 3475, (100.0, 203.0, 50.0)))
+            .unwrap();
+        let first = state.units[&9].clone();
+        ambient(&mut state);
+        ambient(&mut state);
+        // The same unit re-enters the view somewhere else, after the bot's next command.
+        state
+            .observe(&npc_state(9, 3475, (140.0, 260.0, 52.0)))
+            .unwrap();
+        let again = &state.units[&9];
+        assert_eq!(again.announced_seq, first.announced_seq);
+        assert_eq!(again.announced_pos, first.announced_pos);
+        // Where it is now follows the new announcement.
+        assert!((again.pos.0 - 140.0).abs() < 0.01 && (again.pos.1 - 260.0).abs() < 0.01);
+        assert!(state.observation_seq > again.announced_seq);
+    }
+
+    #[test]
+    fn a_unit_removed_and_announced_again_is_announced_anew() {
+        let mut state = GameState::default();
+        state
+            .observe(&npc_state(9, 3475, (100.0, 203.0, 50.0)))
+            .unwrap();
+        let first = state.units[&9].announced_seq;
+        state.observe(&removed(9)).unwrap();
+        assert!(!state.units.contains_key(&9));
+        state
+            .observe(&npc_state(9, 3475, (140.0, 260.0, 52.0)))
+            .unwrap();
+        let again = &state.units[&9];
+        assert!(again.announced_seq > first);
+        assert!((again.announced_pos.0 - 140.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_recycled_object_id_of_another_template_is_a_new_announcement() {
+        let mut state = GameState::default();
+        state
+            .observe(&npc_state(9, 3475, (100.0, 203.0, 50.0)))
+            .unwrap();
+        let first = state.units[&9].announced_seq;
+        // The server gave the id to a different NPC without a removal the client saw.
+        state
+            .observe(&npc_state(9, 3512, (100.0, 203.0, 50.0)))
+            .unwrap();
+        let again = &state.units[&9];
+        assert_eq!(again.id, 3512);
+        assert!(again.announced_seq > first);
+    }
+}
+
+/// Packet bodies shared by the unit tests of this crate.
+#[cfg(test)]
+pub(crate) mod test_packets {
+    use super::*;
+
+    /// A `House.Write` body (`SCMyHouse`, `SCHouseState`; `SCLoginCharInfoHouse` prefixes the
+    /// owner id).
+    pub(crate) fn house_body(
+        tl: u16,
+        obj_id: u32,
+        template: u32,
+        owner: u32,
+        all_action: i32,
+        current_action: i32,
+    ) -> Vec<u8> {
+        let mut s = PacketStream::new();
+        s.write_u16(tl)
+            .write_u32(77) // database id
+            .write_bc(obj_id)
+            .write_u32(template)
+            .write_u32(0) // model
+            .write_u32(0) // co-owner
+            .write_u32(owner)
+            .write_str("owner")
+            .write_u32(5) // account
+            .write_u8(1) // permission
+            .write_i32(all_action)
+            .write_i32(current_action)
+            .write_i32(0) // tax
+            .write_i64(aaemu_commons::helpers::convert_coord_to_long(13944.5))
+            .write_i64(aaemu_commons::helpers::convert_coord_to_long(14216.25))
+            .write_f32(120.0)
+            .write_str("house");
+        s.into_bytes()
+    }
+
+    pub(crate) fn packet(opcode: u16, body: Vec<u8>) -> Packet {
+        Packet {
+            level: LEVEL_GAME,
+            opcode,
+            body,
+        }
+    }
+
+    /// The body of an NPC's `SCUnitStatePacket`.
+    pub(crate) fn npc_state_body(obj_id: u32, template: u32, pos: (f32, f32, f32)) -> Vec<u8> {
+        let mut body = PacketStream::new();
+        body.write_bc(obj_id)
+            .write_str("npc")
+            .write_u8(1)
+            .write_bc(0)
+            .write_u32(template)
+            .write_u32(0)
+            .write_u8(0)
+            .write_str("")
+            .write_position(pos.0, pos.1, pos.2);
+        body.into_bytes()
+    }
+
+    pub(crate) fn npc_state(obj_id: u32, template: u32, pos: (f32, f32, f32)) -> Packet {
+        packet(sc::SCUnitStatePacket, npc_state_body(obj_id, template, pos))
+    }
+}
+
+#[cfg(test)]
+mod my_house_tests {
+    use super::test_packets::{house_body, packet};
+    use super::*;
+
+    fn state() -> GameState {
+        GameState {
+            selected_char: 42,
+            ..GameState::default()
+        }
+    }
+
+    fn house(obj_id: u32, tl: u16) -> MyHouse {
+        MyHouse {
+            obj_id,
+            tl,
+            template_id: 172,
+            owner_id: 42,
+        }
+    }
+
+    #[test]
+    fn my_house_packets_are_remembered_whoever_reads_them() {
+        let mut st = state();
+        st.observe(&packet(
+            sc::SCMyHousePacket,
+            house_body(7, 900, 172, 42, 0, 0),
+        ))
+        .unwrap();
+        assert_eq!(st.my_houses, [house(900, 7)]);
+        // Announced again (a re-select, a state change): updated in place, not duplicated.
+        st.observe(&packet(
+            sc::SCMyHousePacket,
+            house_body(7, 901, 172, 42, 3, 1),
+        ))
+        .unwrap();
+        st.observe(&packet(
+            sc::SCMyHousePacket,
+            house_body(8, 950, 172, 42, 3, 1),
+        ))
+        .unwrap();
+        assert_eq!(st.my_houses, [house(901, 7), house(950, 8)]);
+    }
+
+    #[test]
+    fn a_house_state_broadcast_counts_only_for_the_characters_own_house() {
+        let mut st = state();
+        // Another player's house in view is not ours.
+        st.observe(&packet(
+            sc::SCHouseStatePacket,
+            house_body(5, 800, 172, 43, 0, 0),
+        ))
+        .unwrap();
+        assert!(st.my_houses.is_empty());
+        st.observe(&packet(
+            sc::SCHouseStatePacket,
+            house_body(7, 900, 172, 42, 0, 0),
+        ))
+        .unwrap();
+        assert_eq!(st.my_houses, [house(900, 7)]);
+        // Before a character is selected nothing can be ours.
+        let mut st = GameState::default();
+        st.observe(&packet(
+            sc::SCHouseStatePacket,
+            house_body(7, 900, 172, 0, 0, 0),
+        ))
+        .unwrap();
+        assert!(st.my_houses.is_empty());
+    }
+
+    #[test]
+    fn a_demolished_or_removed_house_is_forgotten() {
+        let mut st = state();
+        for (tl, obj) in [(7, 900), (8, 901), (9, 902)] {
+            st.observe(&packet(
+                sc::SCMyHousePacket,
+                house_body(tl, obj, 172, 42, 0, 0),
+            ))
+            .unwrap();
+        }
+        st.observe(&packet(
+            sc::SCHouseDemolishedPacket,
+            7u16.to_le_bytes().to_vec(),
+        ))
+        .unwrap();
+        st.observe(&packet(
+            sc::SCMyHouseRemovedPacket,
+            9u16.to_le_bytes().to_vec(),
+        ))
+        .unwrap();
+        assert_eq!(st.my_houses, [house(901, 8)]);
+    }
+
+    #[test]
+    fn a_truncated_house_packet_is_an_observation_error_not_a_house() {
+        let mut st = state();
+        let mut body = house_body(7, 900, 172, 42, 0, 0);
+        body.truncate(6);
+        assert!(st.observe(&packet(sc::SCMyHousePacket, body)).is_err());
+        assert!(st.my_houses.is_empty());
     }
 }
 

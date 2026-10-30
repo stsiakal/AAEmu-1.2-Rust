@@ -134,15 +134,58 @@ pub(super) fn detached(p: &Packet) -> anyhow::Result<(u32, u8)> {
     Ok((s.read_bc()?, s.read_u8()?))
 }
 
+/// The longest logout timer of a normal leave (the server's 10 s); a longer one is the combat
+/// timer (5 minutes), which a quitting bot does not wait out.
+const NORMAL_LOGOUT_MS: i32 = 10_000;
+
+/// How long the server may take from `SCPrepareLeaveWorld` to `SCLeaveWorldGranted`: the logout
+/// timer plus the departure save, which queues behind the other bots' saves.
+const GRANT_PATIENCE: Duration = Duration::from_secs(30);
+
+/// What the server answered to a `CSLeaveWorld`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct LeaveAnswer {
+    /// The logout timer (ms) of `SCPrepareLeaveWorld`; `None` when the grant came first.
+    pub logout_ms: Option<i32>,
+    /// `SCLeaveWorldGranted` arrived: the character left the world.
+    pub granted: bool,
+}
+
+/// Waits for the answers to a `CSLeaveWorld`: `SCPrepareLeaveWorld` starts the logout timer and
+/// `SCLeaveWorldGranted` ends it. Whichever arrives first is read, none is dropped while waiting
+/// for the other. With `must_grant` the call returns once the character left the world;
+/// otherwise (a quitting bot) a combat timer of minutes ends the wait at its announcement.
+pub(super) async fn await_leave(
+    game: &mut GameClient,
+    must_grant: bool,
+) -> anyhow::Result<LeaveAnswer> {
+    let first = game
+        .wait_for("SCPrepareLeaveWorld or SCLeaveWorldGranted", |p| {
+            p.is_sc(sc::SCPrepareLeaveWorldPacket) || p.is_sc(sc::SCLeaveWorldGrantedPacket)
+        })
+        .await?;
+    let granted = first.is_sc(sc::SCLeaveWorldGrantedPacket);
+    let mut answer = LeaveAnswer {
+        logout_ms: (!granted).then(|| first.stream().read_i32().unwrap_or(0)),
+        granted,
+    };
+    let timer_ends_soon = answer.logout_ms.is_none_or(|ms| ms <= NORMAL_LOGOUT_MS);
+    if !answer.granted && (must_grant || timer_ends_soon) {
+        let saved = game.timeout;
+        game.timeout = saved.max(GRANT_PATIENCE);
+        let granted = game.wait_sc(sc::SCLeaveWorldGrantedPacket).await;
+        game.timeout = saved;
+        granted?;
+        answer.granted = true;
+    }
+    Ok(answer)
+}
+
 /// `CSLeaveWorldPacket(quit)` and, for the normal logout timer, `SCLeaveWorldGranted`. Waiting
 /// keeps the next run of the same character from being denied ("enter world denied").
 pub(super) async fn leave_world(game: &mut GameClient) -> anyhow::Result<()> {
     game.leave_world(0).await?;
-    let prep = game.wait_sc(sc::SCPrepareLeaveWorldPacket).await?;
-    let logout_ms = prep.stream().read_i32().unwrap_or(0);
-    if logout_ms <= 10_000 {
-        game.wait_sc(sc::SCLeaveWorldGrantedPacket).await?;
-    }
+    await_leave(game, false).await?;
     game.drain(Duration::from_millis(300), Duration::from_secs(2))
         .await
         .ok();
@@ -360,10 +403,15 @@ pub(super) async fn self_position(game: &mut GameClient) -> anyhow::Result<(f32,
 pub(super) mod tests {
     use std::collections::HashSet;
 
+    use aaemu_commons::net::FrameCodec;
     use aaemu_commons::Marshal;
     use aaemu_game::models::item::Item;
     use aaemu_game::models::item_task::ItemTask;
+    use aaemu_game::opcodes::cs;
     use aaemu_game::systems::economy::item_packets::SCItemTaskSuccessPacket;
+    use futures::{SinkExt, StreamExt};
+    use tokio::io::DuplexStream;
+    use tokio_util::codec::Framed;
 
     use super::*;
     use crate::game::LEVEL_GAME;
@@ -512,5 +560,177 @@ pub(super) mod tests {
         };
         aaemu_game::systems::vehicles::slaves::add_distance_to_front(&mut npc, SPAWN_DISTANCE);
         assert_eq!((npc.x, npc.y), spawn_point((100.0, 200.0, 50.0)));
+    }
+
+    /// The server end of an in-memory game connection: what a scenario sent, and what it is
+    /// answered. The fixtures answer each client packet in order; nothing arrives unprompted.
+    pub(in crate::scenario) struct Peer {
+        framed: Framed<DuplexStream, FrameCodec>,
+        /// The opcode of every client packet read so far, in order.
+        pub received: Vec<u16>,
+    }
+
+    impl Peer {
+        /// The next client packet's opcode.
+        pub(in crate::scenario) async fn next(&mut self) -> u16 {
+            let frame = tokio::time::timeout(Duration::from_secs(5), self.framed.next())
+                .await
+                .expect("the client sent no packet")
+                .expect("the client closed the connection")
+                .expect("a frame");
+            let opcode = u16::from_le_bytes([frame[4], frame[5]]);
+            self.received.push(opcode);
+            opcode
+        }
+
+        /// Reads the next client packet and requires it to be `opcode`.
+        pub(in crate::scenario) async fn expect(&mut self, opcode: u16) {
+            let got = self.next().await;
+            assert_eq!(
+                got,
+                opcode,
+                "expected {} but the client sent {}",
+                crate::game::packet_name(crate::record::Dir::C2S, LEVEL_GAME, opcode),
+                crate::game::packet_name(crate::record::Dir::C2S, LEVEL_GAME, got)
+            );
+        }
+
+        /// Sends a level-1 packet to the client.
+        pub(in crate::scenario) async fn send(&mut self, opcode: u16, body: &[u8]) {
+            let mut frame = vec![0xdd, LEVEL_GAME, 0, 0];
+            frame.extend_from_slice(&opcode.to_le_bytes());
+            frame.extend_from_slice(body);
+            self.framed.send(frame).await.expect("the client is gone");
+        }
+    }
+
+    /// A game client wired to an in-memory server end; its waits time out after 400 ms.
+    pub(in crate::scenario) fn scripted_game() -> (GameClient, Peer) {
+        let (io, peer) = tokio::io::duplex(64 * 1024);
+        let mut game = GameClient::from_io(io, crate::record::Recorder::new(false));
+        game.timeout = Duration::from_millis(400);
+        let peer = Peer {
+            framed: Framed::new(peer, FrameCodec),
+            received: Vec::new(),
+        };
+        (game, peer)
+    }
+
+    /// `SCPrepareLeaveWorldPacket(time, target, idleKick)`.
+    fn prepare_body(logout_ms: i32) -> Vec<u8> {
+        let mut s = PacketStream::new();
+        s.write_i32(logout_ms).write_u8(1).write_bool(false);
+        s.into_bytes()
+    }
+
+    #[tokio::test]
+    async fn a_grant_that_comes_before_the_prepare_is_not_lost() {
+        let (mut game, mut peer) = scripted_game();
+        let server = tokio::spawn(async move {
+            peer.expect(cs::CSLeaveWorldPacket).await;
+            peer.send(sc::SCLeaveWorldGrantedPacket, &[1]).await;
+            peer.send(sc::SCPrepareLeaveWorldPacket, &prepare_body(10_000))
+                .await;
+            peer
+        });
+        game.leave_world(1).await.unwrap();
+        let answer = await_leave(&mut game, true).await.unwrap();
+        assert_eq!(
+            answer,
+            LeaveAnswer {
+                logout_ms: None,
+                granted: true
+            }
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_prepare_then_the_grant_end_a_normal_leave() {
+        let (mut game, mut peer) = scripted_game();
+        let server = tokio::spawn(async move {
+            peer.expect(cs::CSLeaveWorldPacket).await;
+            peer.send(sc::SCPrepareLeaveWorldPacket, &prepare_body(10_000))
+                .await;
+            peer.send(sc::SCLeaveWorldGrantedPacket, &[0]).await;
+            peer
+        });
+        game.leave_world(0).await.unwrap();
+        let answer = await_leave(&mut game, false).await.unwrap();
+        assert_eq!(
+            answer,
+            LeaveAnswer {
+                logout_ms: Some(10_000),
+                granted: true
+            }
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_combat_timer_ends_a_quit_but_not_a_leave_that_must_be_granted() {
+        // A quitting bot does not wait out the 5 minute combat timer ...
+        let (mut game, mut peer) = scripted_game();
+        let server = tokio::spawn(async move {
+            peer.expect(cs::CSLeaveWorldPacket).await;
+            peer.send(sc::SCPrepareLeaveWorldPacket, &prepare_body(300_000))
+                .await;
+            peer
+        });
+        game.leave_world(0).await.unwrap();
+        let answer = await_leave(&mut game, false).await.unwrap();
+        assert_eq!(
+            answer,
+            LeaveAnswer {
+                logout_ms: Some(300_000),
+                granted: false
+            }
+        );
+        server.await.unwrap();
+
+        // ... a re-select needs the character out of the world and waits for the grant.
+        let (mut game, mut peer) = scripted_game();
+        let server = tokio::spawn(async move {
+            peer.expect(cs::CSLeaveWorldPacket).await;
+            peer.send(sc::SCPrepareLeaveWorldPacket, &prepare_body(300_000))
+                .await;
+            peer.send(sc::SCLeaveWorldGrantedPacket, &[1]).await;
+            peer
+        });
+        game.leave_world(1).await.unwrap();
+        let answer = await_leave(&mut game, true).await.unwrap();
+        assert!(answer.granted);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_leave_nobody_answers_times_out() {
+        let (mut game, mut peer) = scripted_game();
+        let server = tokio::spawn(async move {
+            peer.expect(cs::CSLeaveWorldPacket).await;
+            peer
+        });
+        game.leave_world(0).await.unwrap();
+        let error = await_leave(&mut game, true).await.unwrap_err();
+        assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn the_house_builder_matches_the_reader() {
+        let body = crate::game::test_packets::house_body(7, 900, 172, 42, 2, 1);
+        let view = house_view(&body).unwrap();
+        assert_eq!(
+            (
+                view.tl,
+                view.obj_id,
+                view.template_id,
+                view.owner_id,
+                view.all_action,
+                view.current_action,
+                view.name.as_str()
+            ),
+            (7, 900, 172, 42, 2, 1, "house")
+        );
     }
 }

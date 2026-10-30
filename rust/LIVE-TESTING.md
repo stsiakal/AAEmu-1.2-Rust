@@ -283,9 +283,13 @@ the single backpack slot must be free for the next one), asserting each material
 and finally demolishes the house with the GM `/house forcedemo` command and requires
 `SCHouseDemolished`. Tries nearby offsets if an earlier run's house still occupies the plot. Every item the run
 added that the server did not consume (design item and certificates when the creation fails, the material of a
-failed step) is destroyed on the cleanup path, also when the run fails during the re-select (the cleanup waits for
-the pending leave and re-enters the world before it demolishes). A client that is killed mid-build cannot clean up:
-its unfinished house stays on the plot (the next run builds at another offset); the server still finishes the cast.
+failed step) is destroyed on the cleanup path, also when the run fails during the re-select: the run records how far
+the way back into the world got (leave, lobby, select, spawn) and the cleanup finishes the missing steps (pending
+grant, lobby steps, spawn, in-game notices) before it demolishes, so the GM command always runs in the world. The
+cleanup demolishes every house of the bot's character the server announced (`SCMyHouse`, which the game state keeps
+whoever read the packet): a house announced after the create step stopped listening, or left by an earlier run, is
+demolished too. A client that is killed mid-build cannot clean up: its unfinished house stays on the plot (the next
+run builds at another offset and demolishes it); the server still finishes the cast.
 
 `mount` (GM account) adds the brown Lilliot horse whistle (item 8159), summons it with use skill 10602, sends
 `CSMountMate` (driver point 1) and requires its own `SCUnitAttached`, moves the mate with `CSMoveUnit` (20 m at
