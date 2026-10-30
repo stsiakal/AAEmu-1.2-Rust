@@ -19,7 +19,7 @@ use aaemu_game::server::GameServer;
 use aaemu_game::systems::skills::buffs;
 use aaemu_game::world::{NpcRef, PlayerRef, WorldObject};
 
-use super::skills::{cast_state, off_cooldown, skill_gate, SkillBlock, DEFAULT_ATTACKS};
+use super::skills::{cast_state, off_cooldown, skill_gate, Aim, SkillBlock, DEFAULT_ATTACKS};
 use super::target::{dist2, enemies_within, me_pos};
 use super::CombatState;
 use crate::rotation::{Action, Condition};
@@ -131,17 +131,21 @@ impl Context<'_> {
 
 /// The first action of `actions` the server would take now, and whether it targets the bot.
 ///
-/// The skill's own `target_type` decides the target: a hostile-target skill (a damage skill,
-/// even one that also heals, like Antithesis) goes to the monster; self and friendly skills go
-/// on the bot. The same loadout signature, refusal back-off and active-skillset filter as the
-/// data scoring apply, so the two paths cannot disagree about a skill being usable.
+/// The skill's own aim decides the target: a target skill (a damage skill, even one that also
+/// heals, like Antithesis) goes to the monster; self / friendly skills go on the bot; a skill
+/// with a placement or doodad target type is skipped (the bot cannot aim it). The same loadout
+/// signature, refusal back-off and active-skillset filter as the data scoring apply, so the two
+/// paths cannot disagree about a skill being usable.
 fn first_castable(
     context: &mut Context<'_>,
     state: &mut CombatState,
     actions: &[Action],
 ) -> Option<(u32, bool)> {
     for action in actions {
-        if state.info(context.server, action.skill).is_none() {
+        let Some(info) = state.info(context.server, action.skill) else {
+            continue;
+        };
+        if info.aim == Aim::Unaimable {
             continue;
         }
         if !context.learned.contains(&action.skill) && !DEFAULT_ATTACKS.contains(&action.skill) {
@@ -177,7 +181,7 @@ fn first_castable(
         if template.ability_id != 0 && !context.ability_active(template.ability_id) {
             continue;
         }
-        let self_target = !matches!(template.target_type, 4 | 5);
+        let self_target = info.aim == Aim::SelfOnly;
         let me = WorldObject::from(context.player);
         let target = if self_target { &me } else { context.target };
         match skill_gate(

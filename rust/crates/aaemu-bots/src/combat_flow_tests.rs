@@ -825,3 +825,79 @@ async fn a_new_command_clears_the_old_target() {
     let state = bot.brain().lock().await;
     assert_eq!(state.target, None, "the old target outlived the command");
 }
+
+/// A monster that keeps attacking from a spot the bot cannot walk to must not be re-acquired
+/// after it was ignored: the bot retreats instead of standing still under its hits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreachable_attacker_is_not_reacquired_and_the_bot_retreats() {
+    let server = combat_server();
+    let bot = bot(&server, 2, "Bait", 100.0, 100.0, &[KILL_SKILL]).await;
+    let player = player_of(&bot);
+    bot.set_walk_deadline_cap(Duration::from_millis(1));
+    let mob = spawn_monster(&server, 0x400, MONSTER, 2, 50_000, 135.0, 100.0);
+    mob.data().current_aggro_target = player.obj_id;
+    bot.set_mode(Mode::Fight {
+        wanted: Vec::new(),
+        radius: 60.0,
+    })
+    .await;
+
+    let ignored = wait_until(&server, &bot, Duration::from_secs(8), || {
+        bot.brain()
+            .try_lock()
+            .ok()
+            .is_some_and(|s| s.is_ignored(0x400, aaemu_game::world::now_ms()))
+    })
+    .await;
+    assert!(ignored, "the unreachable attacker was never ignored");
+
+    let retreated = wait_until(&server, &bot, Duration::from_secs(5), || {
+        bot.brain()
+            .try_lock()
+            .ok()
+            .is_some_and(|s| s.target != Some(0x400) && s.fleeing_to.is_some())
+    })
+    .await;
+    assert!(
+        retreated,
+        "the bot re-acquired or stood under the unreachable attacker"
+    );
+    let state = bot.brain().lock().await;
+    assert_ne!(state.target, Some(0x400));
+    assert!(state.is_ignored(0x400, aaemu_game::world::now_ms()));
+}
+
+/// With an ignored attacker that is nearer than a live one, the bot engages the live attacker
+/// instead of the ignored one (the attacker path applies the ignore window too).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ignored_attacker_does_not_shadow_a_live_one() {
+    let server = combat_server();
+    let bot = bot(&server, 2, "Split", 100.0, 100.0, &[KILL_SKILL]).await;
+    let player = player_of(&bot);
+    let ignored = spawn_monster(&server, 0x400, MONSTER, 2, 50_000, 102.0, 100.0);
+    ignored.data().current_aggro_target = player.obj_id;
+    let live = spawn_monster(&server, 0x401, MONSTER_B, 2, 500, 104.0, 100.0);
+    live.data().current_aggro_target = player.obj_id;
+    bot.set_mode(Mode::Fight {
+        wanted: Vec::new(),
+        radius: 20.0,
+    })
+    .await;
+    bot.brain()
+        .lock()
+        .await
+        .ignored
+        .insert(0x400, aaemu_game::world::now_ms() + 60_000);
+
+    let targeted = wait_until(&server, &bot, Duration::from_secs(5), || {
+        bot.brain()
+            .try_lock()
+            .ok()
+            .is_some_and(|s| s.target == Some(0x401))
+    })
+    .await;
+    assert!(
+        targeted,
+        "the live attacker was shadowed by the ignored one"
+    );
+}

@@ -51,6 +51,8 @@ pub use self::survival::{AttackerSeen, HEAL_BELOW, REST_BELOW, REST_UNTIL};
 
 /// Monsters that could not be reached are left alone this long.
 pub const IGNORE_MS: i64 = 120_000;
+/// How often the ignored map is pruned of entries whose expiry has passed.
+const IGNORE_PRUNE_MS: i64 = 30_000;
 /// Without line of sight to a target for this long the bot gives it up.
 pub const NO_SIGHT_GIVE_UP_MS: i64 = 8_000;
 /// A target nothing can be cast on for this long (an evading / uncastable monster) is left.
@@ -115,13 +117,15 @@ pub struct CombatState {
     waiting_since: Option<(u32, i64)>,
     /// Monsters that could not be reached, ignored until the given time.
     pub ignored: HashMap<u32, i64>,
+    /// When expired ignore entries were last pruned.
+    ignore_pruned_ms: i64,
     /// The last monster seen attacking the bot (the likely killer when it dies).
     pub last_attacker: Option<AttackerSeen>,
     /// The last place the bot stood calm and healthy.
     pub safe_pos: Option<(f32, f32)>,
     pub safe_pos_ms: i64,
     /// Where the running flee walk goes, and how many flee walks failed in a row.
-    fleeing_to: Option<(f32, f32)>,
+    pub(crate) fleeing_to: Option<(f32, f32)>,
     flee_fails: u8,
     /// Since when the bot has had no line of sight to its target.
     pub no_sight: Option<(u32, i64)>,
@@ -185,6 +189,7 @@ impl Default for CombatState {
             approach_walk: None,
             waiting_since: None,
             ignored: HashMap::new(),
+            ignore_pruned_ms: 0,
             last_attacker: None,
             safe_pos: None,
             safe_pos_ms: 0,
@@ -248,6 +253,19 @@ impl CombatState {
         self.safe_pos = None;
         self.casts_this_think = 0;
         self.max_casts_per_think = 0;
+    }
+
+    /// Is the monster still inside its ignore window?
+    pub fn is_ignored(&self, obj_id: u32, now: i64) -> bool {
+        self.ignored.get(&obj_id).is_some_and(|until| *until > now)
+    }
+
+    /// Drops ignore entries whose window has passed (the map is bounded by the monsters the
+    /// bot actually failed to reach, and pruned so a long session does not sit on stale ids).
+    pub fn prune_ignored(&mut self, now: i64) -> usize {
+        let before = self.ignored.len();
+        self.ignored.retain(|_, until| *until > now);
+        before - self.ignored.len()
     }
 
     /// The health / mana fraction a resting bot rests up to.
@@ -349,6 +367,13 @@ pub async fn think(bot: &Arc<BotSession>, server: &Arc<GameServer>) -> Duration 
     state.max_casts_per_think = state.max_casts_per_think.max(state.casts_this_think);
     state.casts_this_think = 0;
     let now = aaemu_game::world::now_ms();
+    if now - state.ignore_pruned_ms >= IGNORE_PRUNE_MS {
+        state.ignore_pruned_ms = now;
+        let pruned = state.prune_ignored(now);
+        if pruned > 0 {
+            tracing::debug!(pruned, "Bots: pruned expired ignore entries");
+        }
+    }
 
     // The frames of the server's answers since the last think (a client's socket read).
     let frames = bot.drain_replies().await;
@@ -393,12 +418,31 @@ pub async fn think(bot: &Arc<BotSession>, server: &Arc<GameServer>) -> Duration 
         &player,
         radius.clamp(SEARCH_RADIUS_M, MAX_SCAN_RADIUS_M),
     );
-    let attacker = target::find_attacker(&scan, &player);
+    let attackers = target::attackers(&scan, &player);
+    // An attacker the bot already failed to reach is not re-acquired: answer a live attacker
+    // if there is one, else retreat from the one that is still hitting it (never stand still).
+    let live_attacker = attackers
+        .iter()
+        .copied()
+        .find(|view| !state.is_ignored(view.obj_id, now));
+    let ignored_attacker = attackers
+        .iter()
+        .copied()
+        .find(|view| state.is_ignored(view.obj_id, now));
     // A resting bot that something attacks stops resting and fights back on this think.
-    let resting = survival::update_rest(&player, &mut state, attacker.is_some());
+    let resting = survival::update_rest(&player, &mut state, !attackers.is_empty());
 
-    // What cannot be fought: run away (the danger index keeps the area).
-    if let Some(threat) = survival::threat_to_flee(&scan, &player, &mut state, now, attacker) {
+    // What cannot be fought: run away (the danger index keeps the area). A monster the bot
+    // cannot reach but that keeps attacking is retreated from like a losing fight.
+    let unreachable_attacker = live_attacker.is_none() && ignored_attacker.is_some();
+    if let Some(threat) = survival::threat_to_flee(
+        &scan,
+        &player,
+        &mut state,
+        now,
+        live_attacker.or(ignored_attacker),
+        unreachable_attacker,
+    ) {
         flee(bot, server, &mut state, &player, &threat, now);
         return Duration::from_millis(300);
     }
@@ -460,7 +504,9 @@ pub async fn think(bot: &Arc<BotSession>, server: &Arc<GameServer>) -> Duration 
     }
 
     if state.target.is_none() {
-        if let Some(view) = acquire_target(server, &scan, &player, attacker, &state, &mode, now) {
+        if let Some(view) =
+            acquire_target(server, &scan, &player, live_attacker, &state, &mode, now)
+        {
             state.target = Some(view.obj_id);
             state.walk_to = None;
             state.waiting_since = None;
@@ -652,7 +698,11 @@ fn acquire_target(
     };
     let my_level = player.data().unit.level;
     if let Some(attacker) = attacker {
-        if attacker.level <= my_level.saturating_add(state.max_target_level_gap) {
+        // A monster the bot already failed to reach is not re-targeted, also when the caller's
+        // snapshot predates the ignore (the failed-walk check runs earlier in the think).
+        if !state.is_ignored(attacker.obj_id, now)
+            && attacker.level <= my_level.saturating_add(state.max_target_level_gap)
+        {
             return Some(attacker);
         }
     }
@@ -750,7 +800,7 @@ fn flee(
             character = %bot.name,
             attacker = attacker.obj_id,
             level = attacker.level,
-            "Bots: fleeing a monster above the level gap"
+            "Bots: fleeing a monster it cannot fight"
         );
     }
     if bot.walking() {
@@ -942,7 +992,12 @@ async fn heal_if_hurt(
     let sig = state.loadout_signature(player);
     let mut options: Vec<(u32, Option<(u64, u32)>)> = Vec::new();
     for id in skills::candidate_ids(server, player) {
-        if state.info(server, id).is_some_and(|i| i.heals) {
+        // Only a self / friendly heal is a self-heal: a hostile damage+heal skill (Antithesis)
+        // belongs to the rotation on the monster, and a ground / doodad heal cannot be aimed.
+        if state
+            .info(server, id)
+            .is_some_and(|i| i.heals && i.aim == skills::Aim::SelfOnly)
+        {
             options.push((id, None));
         }
     }
@@ -997,13 +1052,34 @@ async fn heal_if_hurt(
                 .await
             }
         };
-        if outcome == CastOutcome::Started {
-            tracing::debug!(character = %bot.name, skill = id, "Bots: healed");
-        }
-        // One attempt per think, whatever its outcome (a refusal already backed the skill off).
-        return Some(outcome);
+        return heal_attempt_outcome(state, player, id, now, outcome);
     }
     None
+}
+
+/// Reads one heal attempt's outcome. A server-side cooldown the bot's own state missed is
+/// backed off for that skill and does not end the think (the bot keeps fighting instead of
+/// standing still while the cooldown ticks); every other outcome ends it (a refusal already
+/// backed the skill off).
+fn heal_attempt_outcome(
+    state: &mut CombatState,
+    player: &PlayerRef,
+    skill: u32,
+    now: i64,
+    outcome: CastOutcome,
+) -> Option<CastOutcome> {
+    if outcome == CastOutcome::Cooldown {
+        cast::back_off(state, player, skill, player.obj_id, now);
+        tracing::debug!(
+            skill,
+            "Bots: heal on the server's cooldown, backing the skill off and fighting on"
+        );
+        return None;
+    }
+    if outcome == CastOutcome::Started {
+        tracing::debug!(skill, "Bots: healed");
+    }
+    Some(outcome)
 }
 
 #[cfg(test)]
@@ -1036,6 +1112,24 @@ mod state_tests {
             !wait_expired(&mut state, 8, now),
             "another target starts over"
         );
+    }
+
+    #[test]
+    fn expired_ignore_entries_are_pruned() {
+        let mut state = CombatState::default();
+        state.ignored.insert(1, 100);
+        state.ignored.insert(2, 500);
+        assert!(state.is_ignored(1, 50));
+        assert!(
+            !state.is_ignored(1, 100),
+            "the window is exclusive at its end"
+        );
+        assert_eq!(state.prune_ignored(200), 1);
+        assert!(
+            !state.ignored.contains_key(&1),
+            "the expired id was dropped"
+        );
+        assert!(state.ignored.contains_key(&2));
     }
 
     #[test]

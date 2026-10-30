@@ -49,6 +49,23 @@ impl RefusalKey {
     }
 }
 
+/// Backs `skill` off for this target from the bot's 2 m cell with its loadout (a refusal, or a
+/// server-side cooldown the bot's own state did not see).
+pub fn back_off(state: &mut CombatState, player: &PlayerRef, skill: u32, target: u32, now: i64) {
+    let t = player.data().unit.transform;
+    let cell = ((t.x / 2.0).floor() as i32, (t.y / 2.0).floor() as i32);
+    let loadout = state.loadout_signature(player);
+    state.refused_on.insert(
+        skill,
+        RefusalKey {
+            target,
+            cell,
+            loadout,
+            until: now + REFUSAL_BACKOFF_MS,
+        },
+    );
+}
+
 /// Is `skill` still backed off for this target from the bot's 2 m cell with its loadout?
 pub fn refused(state: &CombatState, player: &PlayerRef, skill: u32, target: u32, now: i64) -> bool {
     let t = player.data().unit.transform;
@@ -234,20 +251,7 @@ pub async fn cast(
             _ => {}
         }
         state.casts_refused += 1;
-        let (x, y, _) = {
-            let t = player.data().unit.transform;
-            (t.x, t.y, t.z)
-        };
-        let loadout = state.loadout_signature(&player);
-        state.refused_on.insert(
-            skill_id,
-            RefusalKey {
-                target: target_obj_id,
-                cell: ((x / 2.0).floor() as i32, (y / 2.0).floor() as i32),
-                loadout,
-                until: now + REFUSAL_BACKOFF_MS,
-            },
-        );
+        back_off(state, &player, skill_id, target_obj_id, now);
         tracing::info!(
             character = %bot.name,
             skill = skill_id,

@@ -229,11 +229,12 @@ pub fn find_target(
     best.map(|(_, v)| v)
 }
 
-/// A hostile monster that is already attacking the bot (self-defence).
-pub fn find_attacker(all: &[NpcRef], player: &PlayerRef) -> Option<NpcView> {
+/// Every hostile monster that is already attacking the bot (self-defence), nearest first.
+pub fn attackers(all: &[NpcRef], player: &PlayerRef) -> Vec<NpcView> {
     let me = player.obj_id;
     let (px, py, _) = me_pos(player);
-    all.iter()
+    let mut views: Vec<NpcView> = all
+        .iter()
         .filter(|npc| {
             let n = npc.data();
             n.unit.hp > 0
@@ -242,7 +243,14 @@ pub fn find_attacker(all: &[NpcRef], player: &PlayerRef) -> Option<NpcView> {
         })
         .map(view_of)
         .filter(|v| dist2(px, py, v.x, v.y) <= ATTACKER_RADIUS_M)
-        .min_by(|a, b| dist2(px, py, a.x, a.y).total_cmp(&dist2(px, py, b.x, b.y)))
+        .collect();
+    views.sort_by(|a, b| dist2(px, py, a.x, a.y).total_cmp(&dist2(px, py, b.x, b.y)));
+    views
+}
+
+/// A hostile monster that is already attacking the bot (self-defence).
+pub fn find_attacker(all: &[NpcRef], player: &PlayerRef) -> Option<NpcView> {
+    attackers(all, player).into_iter().next()
 }
 
 /// How many hostile monsters attack the bot right now (within [`ATTACKER_RADIUS_M`]).

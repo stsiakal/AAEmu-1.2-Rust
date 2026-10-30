@@ -14,8 +14,9 @@ use aaemu_game::systems::skills::data::SkillTemplate;
 use aaemu_game::test_support::{spawn_player, test_character, test_server_with, TestClient};
 use aaemu_game::world::PlayerRef;
 
+use super::cast::CastOutcome;
 use super::rotation::choose_rotation;
-use super::skills::{build_info, choose_data, Choice, SkillKind};
+use super::skills::{aim_of, build_info, choose_data, Aim, Choice, SkillKind};
 use super::target::{self, scan_npcs};
 use super::CombatState;
 use crate::rotation::Rotation;
@@ -23,6 +24,9 @@ use crate::rotation::Rotation;
 pub(crate) const KILL_SKILL: u32 = 60_001;
 const DAMAGE_HEAL_SKILL: u32 = 60_006;
 const INACTIVE_ABILITY_SKILL: u32 = 60_007;
+const SELF_SKILL: u32 = 60_008;
+const GROUND_SKILL: u32 = 60_009;
+const DOODAD_SKILL: u32 = 60_010;
 
 /// A server whose game data has one 5 000 damage skill (`KILL_SKILL`) and one slow one.
 pub(crate) fn combat_server(slow_skill: Option<u32>) -> Arc<GameServer> {
@@ -31,6 +35,9 @@ pub(crate) fn combat_server(slow_skill: Option<u32>) -> Arc<GameServer> {
     add_damage_skill(&mut data, 3, 50, 4, 0);
     add_damage_heal_skill(&mut data, DAMAGE_HEAL_SKILL);
     add_damage_skill_with_ability(&mut data, INACTIVE_ABILITY_SKILL, 5_000, 25, 5);
+    add_skill_with_target_type(&mut data, SELF_SKILL, 0);
+    add_skill_with_target_type(&mut data, GROUND_SKILL, 6);
+    add_skill_with_target_type(&mut data, DOODAD_SKILL, 8);
     if let Some(id) = slow_skill {
         add_damage_skill(&mut data, id, 5_000, 25, 800);
     }
@@ -138,6 +145,42 @@ fn add_damage_heal_skill(data: &mut GameData, id: u32) {
     template.effects.push(SkillEffect {
         effect_id: heal_id,
         template: Some((EffectKind::HealEffect, heal_id)),
+        start_level: 0,
+        end_level: 255,
+        chance: 100,
+        application_method: 1,
+        ..Default::default()
+    });
+    data.systems.skills.add_skill(template);
+}
+
+/// A 5 000 damage skill with an explicit 1.2 `target_type_id` (the skill's aim fixture).
+fn add_skill_with_target_type(data: &mut GameData, id: u32, target_type: i32) {
+    let effect_id = 950_000 + id;
+    data.systems.skills.add_effect(
+        EffectKind::DamageEffect,
+        EffectTemplate::Damage(Box::new(DamageEffect {
+            id: effect_id,
+            damage_type: 1,
+            fixed_min: 5_000,
+            fixed_max: 5_000,
+            multiplier: 1.0,
+            use_fixed_damage: true,
+            dps_multiplier: 1.0,
+            ..Default::default()
+        })),
+        effect_id,
+    );
+    let mut template = SkillTemplate {
+        id,
+        target_type,
+        max_range: 25,
+        casting_time: 0,
+        ..Default::default()
+    };
+    template.effects.push(SkillEffect {
+        effect_id,
+        template: Some((EffectKind::DamageEffect, effect_id)),
         start_level: 0,
         end_level: 255,
         chance: 100,
@@ -380,4 +423,90 @@ async fn a_heal_rule_keeps_a_damage_heal_skill_on_the_monster() {
         Some((DAMAGE_HEAL_SKILL, false)),
         "the damage+heal skill must target the monster"
     );
+}
+
+/// The 1.2 `target_type_id` values map to what a unit-targeting bot can aim: only self /
+/// friendly (0..=3) and hostile / any-unit (4, 5); ground (`Pos=6`), doodad (`8`) and the other
+/// placement types need a target the bot does not send and are never cast.
+#[tokio::test]
+async fn the_target_type_decides_whether_the_bot_can_aim_a_skill() {
+    assert_eq!(aim_of(0), Aim::SelfOnly);
+    assert_eq!(aim_of(1), Aim::SelfOnly);
+    assert_eq!(aim_of(2), Aim::SelfOnly);
+    assert_eq!(aim_of(3), Aim::SelfOnly);
+    assert_eq!(aim_of(4), Aim::Target);
+    assert_eq!(aim_of(5), Aim::Target);
+    for unaimable in [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19] {
+        assert_eq!(aim_of(unaimable), Aim::Unaimable, "target_type {unaimable}");
+    }
+    let server = combat_server(None);
+    assert_eq!(
+        build_info(&server, KILL_SKILL).expect("skill").aim,
+        Aim::Target
+    );
+    assert_eq!(
+        build_info(&server, SELF_SKILL).expect("skill").aim,
+        Aim::SelfOnly
+    );
+    assert_eq!(
+        build_info(&server, DAMAGE_HEAL_SKILL).expect("skill").aim,
+        Aim::Target,
+        "Antithesis is a hostile skill, not a self heal"
+    );
+    assert_eq!(
+        build_info(&server, GROUND_SKILL).expect("skill").aim,
+        Aim::Unaimable
+    );
+    assert_eq!(
+        build_info(&server, DOODAD_SKILL).expect("skill").aim,
+        Aim::Unaimable
+    );
+}
+
+/// A rotation that names a ground or doodad skill does not cast it on the bot.
+#[tokio::test]
+async fn the_rotation_skips_ground_and_doodad_skills() {
+    let server = combat_server(None);
+    let (player, _client) = learning_bot(&server, &[GROUND_SKILL, DOODAD_SKILL]);
+    let npc = target::spawn_monster(&server, 0x300, 900, 2, 500, 103.0, 100.0);
+    let target_obj = aaemu_game::world::WorldObject::from(&npc);
+    let now = aaemu_game::world::now_ms();
+    let scan = scan_npcs(&server, &player, target::SEARCH_RADIUS_M);
+    for skill in [GROUND_SKILL, DOODAD_SKILL] {
+        let mut state = CombatState {
+            rotation: Some(Arc::new(
+                Rotation::parse(&format!(
+                    r#"{{"archetype":"Test","role":"melee_dps","rules":[],
+                    "fillers":[{{"skill":{skill},"name":"Aimed elsewhere"}}]}}"#
+                ))
+                .expect("rotation"),
+            )),
+            ..Default::default()
+        };
+        assert_eq!(
+            choose_rotation(&server, &player, &mut state, &target_obj, 3.0, now, &scan),
+            None,
+            "skill {skill} has no unit target the bot can aim"
+        );
+    }
+}
+
+/// A server-side heal cooldown (the bot's own state said the skill was ready) backs that skill
+/// off without ending the think: `None` lets the bot keep fighting in the same think.
+#[tokio::test]
+async fn a_server_side_heal_cooldown_is_backed_off_and_does_not_stop_the_fight() {
+    let server = combat_server(None);
+    let (player, _client) = learning_bot(&server, &[]);
+    let mut state = CombatState::default();
+    let now = aaemu_game::world::now_ms();
+    let outcome =
+        super::heal_attempt_outcome(&mut state, &player, KILL_SKILL, now, CastOutcome::Cooldown);
+    assert_eq!(outcome, None, "the fight continues in the same think");
+    assert!(
+        state.refused_on.contains_key(&KILL_SKILL),
+        "the heal is backed off"
+    );
+    let outcome =
+        super::heal_attempt_outcome(&mut state, &player, KILL_SKILL, now, CastOutcome::Started);
+    assert_eq!(outcome, Some(CastOutcome::Started));
 }

@@ -64,10 +64,29 @@ pub struct SkillInfo {
     /// The skill's `target_type` as the static data has it (`0` self, `4`/`5` hostile, else a
     /// friendly / ground target).
     pub target_type: i32,
+    /// Who the bot can aim the skill at with a unit cast target.
+    pub aim: Aim,
     /// The skill has a heal effect (possibly beside damage, e.g. Antithesis).
     pub heals: bool,
     /// The skill has a damage effect.
     pub damages: bool,
+}
+
+/// Who a skill can be aimed at, from its 1.2 `SkillTargetType` (`skills.target_type_id`).
+///
+/// The bot only ever sends a unit target: self / friendly skills resolve to the bot, hostile
+/// skills to the current monster. Everything else in the 1.2 table needs a placement, a
+/// doodad, an item or another unit the bot has no target for (ground `Pos=6`, `Doodad=8`,
+/// `Item=9`, the ballistic / summon / relative / artillery positions, ...) and is never cast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Aim {
+    /// `SelfTarget=0`, `Friendly=1`, `Party=2`, `Raid=3`: cast on the bot, the only ally a
+    /// solo bot has.
+    SelfOnly,
+    /// `Hostile=4`, `AnyUnit=5`: cast on the monster being fought.
+    Target,
+    /// A target the bot cannot aim (ground / doodad / item / placement types): never cast.
+    Unaimable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,9 +182,19 @@ pub fn build_info(server: &GameServer, skill_id: u32) -> Option<SkillInfo> {
         gcd_free: t.ignore_global_cooldown,
         aoe: t.target_area_count > 1,
         target_type: t.target_type,
+        aim: aim_of(t.target_type),
         heals: has_heal,
         damages: has_damage,
     })
+}
+
+/// The aim a 1.2 `target_type_id` gives a bot's unit-target cast.
+pub fn aim_of(target_type: i32) -> Aim {
+    match target_type {
+        0..=3 => Aim::SelfOnly,
+        4 | 5 => Aim::Target,
+        _ => Aim::Unaimable,
+    }
 }
 
 /// The unit state a skill choice reads: mana, global cooldown, last use, a running cast and the
@@ -520,7 +549,8 @@ pub fn choose_data(
         if !matches!(
             info.kind,
             SkillKind::Damage | SkillKind::Control | SkillKind::SelfBuff
-        ) {
+        ) || info.aim == Aim::Unaimable
+        {
             continue;
         }
         // Facts, not delays: a skill that can never hit this kind of target, and a skill the
@@ -632,9 +662,9 @@ pub fn choose_data(
         }
         score /= 1.0 + info.cast_ms as f32 / 2_000.0;
         if best.as_ref().is_none_or(|(s, ..)| score > *s) {
-            // The skill's own target type decides who it is cast on: only hostile-target
+            // The skill's own target type decides who it is cast on: only aimable-at-a-target
             // skills go to the monster (a damage+heal skill like Antithesis stays hostile).
-            best = Some((score, info.id, !matches!(info.target_type, 4 | 5)));
+            best = Some((score, info.id, info.aim == Aim::SelfOnly));
         }
     }
     if let Some((_, id, self_target)) = best {

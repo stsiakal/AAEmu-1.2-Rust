@@ -213,13 +213,14 @@ pub fn note_attacker(state: &mut CombatState, view: super::target::NpcView, now:
 }
 
 /// A hostile monster within the aggro radius that is above the level gap (or a pack the bot
-/// cannot survive): what it flees from.
+/// cannot survive, or one the bot cannot reach but that keeps hitting it): what it flees from.
 pub fn threat_to_flee(
     all: &[NpcRef],
     player: &PlayerRef,
     state: &mut CombatState,
     now: i64,
     attacker: Option<super::target::NpcView>,
+    unreachable: bool,
 ) -> Option<super::target::NpcView> {
     let (hp, _, _) = vitals(player);
     let attacker = attacker?;
@@ -227,7 +228,7 @@ pub fn threat_to_flee(
     let my_level = player.data().unit.level;
     let too_strong = attacker.level > my_level.saturating_add(state.max_target_level_gap);
     let losing = hp < LOSING_BELOW && super::target::attackers_on_me(all, player) > 1;
-    (too_strong || losing).then_some(attacker)
+    (unreachable || too_strong || losing).then_some(attacker)
 }
 
 #[cfg(test)]
