@@ -766,10 +766,33 @@ impl CrimeFakeTrialSubCommand {
 
         // Generate evidence
         let crimes = &server.systems.social.crimes;
-        let hooks = server.systems.social.hooks.get();
         let target_obj = WorldObject::from(&target);
         for i in 0..evidence_count {
-            let pos = world_position(server, &target_obj);
+            // Around the target, not on it: the fake pine now goes through the 1.2 placement
+            // rules (`CreatePlayerDoodad`), which refuse a doodad standing inside a unit (the
+            // C# placed it at the target's feet). Each evidence doodad gets its own spot on a
+            // 3 m ring, 120 degrees apart, one ring further out per three of them (see
+            // PORTING.md).
+            let target_pose = server.world.world_of(&target_obj).map_or_else(
+                || {
+                    let t = target_obj.transform();
+                    crate::models::transform::PositionAndRotation::new(
+                        t.x, t.y, t.z, t.rot_x, t.rot_y, t.rot_z,
+                    )
+                },
+                |w| w.world_pos_rot(&target_obj),
+            );
+            let ring = 3.0 + (i / 3) as f32 * 4.5;
+            let angle = target_pose.rot_z
+                + std::f32::consts::FRAC_PI_6
+                + (i % 3) as f32 * std::f32::consts::TAU / 3.0;
+            let (px, py) = crate::utils::math::add_distance_to_front(
+                ring,
+                target_pose.x,
+                target_pose.y,
+                angle,
+            );
+            let pos = [px, py, target_pose.z];
             let mut fake_pine = None;
             let mut skill_id = 0u32;
             let rng: u32 = rand::random::<u32>() % 3;
@@ -789,19 +812,23 @@ impl CrimeFakeTrialSubCommand {
                 ),
                 _ => {
                     // CreatePlayerDoodad spawns the doodad (the C# `Spawn()` again is skipped).
-                    let pine = hooks
-                        .create_player_doodad(
-                            server,
-                            &victim,
-                            FAKE_PINE_DOODAD,
-                            (pos[0], pos[1], pos[2]),
-                            0.0,
-                            FAKE_PINE_ITEM,
-                            0,
-                        )
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("Object reference not set to an instance of an object.")
-                        })?;
+                    // The checked entry point: the fake pine is a planted doodad.
+                    let pine = crate::systems::npcs::doodad::manager::create_player_doodad(
+                        server,
+                        &victim,
+                        FAKE_PINE_DOODAD,
+                        (pos[0], pos[1], pos[2]),
+                        0.0,
+                        1.0,
+                        0,
+                        crate::systems::npcs::public_farm::farm_group_kind::INVALID,
+                        FAKE_PINE_ITEM,
+                        0,
+                        true,
+                    )
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Object reference not set to an instance of an object.")
+                    })?;
                     skill_id = UPROOT_SKILL; // uproot
                     let e = crimes.generate_evidence_from_theft(server, Some(&target), &pine);
                     fake_pine = Some(pine);
