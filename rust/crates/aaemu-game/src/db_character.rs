@@ -1702,6 +1702,78 @@ mod tests {
         pool.close().await;
     }
 
+    /// The death penalty's recoverable experience survives the relog: `save_character` writes it
+    /// and `load_character` reads it back, so the priest prayer after a new session restores the
+    /// exp lost before the logout (the prayer flow itself is in
+    /// `systems::skills::exp_recovery_tests`).
+    #[tokio::test]
+    #[ignore = "requires private MySQL3317 via AAEMU_TEST_MYSQL; uses only temporary tables"]
+    async fn private_mysql_recoverable_exp_survives_reload() {
+        use crate::systems::social::achievement_persistence::temporary_shadow_definition;
+        use crate::test_support::{test_character, test_experience, test_server_with};
+
+        let Ok(url) = std::env::var("AAEMU_TEST_MYSQL") else {
+            return;
+        };
+        let options = MySqlConnectOptions::from_str(&url).expect("valid private MySQL URL");
+        assert_eq!(
+            options.get_port(),
+            3317,
+            "only private MySQL3317 is allowed"
+        );
+        let pool = MySqlPoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("private MySQL");
+        // `save_character` writes `characters`; `load_character` also reads `accounts` (labor)
+        // and `options`. Connection-local copies keep the shared live rows untouched.
+        for table in ["characters", "accounts", "options"] {
+            let (_, definition): (String, String) =
+                sqlx::query_as(&format!("SHOW CREATE TABLE `{table}`"))
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert!(definition.starts_with("CREATE TABLE "));
+            sqlx::query(&temporary_shadow_definition(&definition))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO `accounts` (`account_id`, `labor`) VALUES (1, 100)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut data = crate::data::GameData::empty();
+        data.experience = test_experience(55);
+        let mut server = test_server_with(data);
+        server.db = pool.clone();
+        let mut character = test_character(1, "Recoverable", 100.0, 100.0);
+        character.account_id = 1;
+        character.unit.level = 10;
+        character.experience = 10_450; // level 10 death: 50 lost, 40 recoverable
+        character.recoverable_exp = 40;
+        character.created = Utc::now().timestamp();
+        let mut transaction = pool.begin().await.unwrap();
+        save_character(&mut transaction, &mut character, Utc::now().timestamp())
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+
+        let (loaded, _) = load_character(&server, 1, 1)
+            .await
+            .unwrap()
+            .expect("saved character");
+        assert_eq!(loaded.experience, 10_450);
+        assert_eq!(
+            loaded.recoverable_exp, 40,
+            "the death penalty's recoverable exp must survive the relog"
+        );
+        assert_eq!(loaded.labor_power, 100);
+        pool.close().await;
+    }
+
     /// The real labor save path (`SaveManager` snapshot capture/write/commit and the departing
     /// save) against one online character: a rolled-back snapshot must not move the wallet, a
     /// committed retry must flush only the captured delta while a spend races it, and the
