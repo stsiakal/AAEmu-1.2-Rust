@@ -144,7 +144,6 @@ pub struct PlanBudget {
     /// Work units since the clock was last read (the clock is read every [`CLOCK_BATCH`]).
     since_clock: usize,
     deadline: std::time::Instant,
-    max_ms: u64,
     stopped: bool,
     cancel: PlanCancel,
 }
@@ -160,7 +159,6 @@ impl PlanBudget {
             expanded: 0,
             since_clock: 0,
             deadline: std::time::Instant::now() + std::time::Duration::from_millis(max_ms),
-            max_ms,
             stopped: false,
             cancel: PlanCancel::never(),
         }
@@ -201,7 +199,7 @@ impl PlanBudget {
         if self.since_clock >= CLOCK_BATCH {
             self.since_clock = 0;
             std::thread::yield_now();
-            if self.deadline.elapsed().as_millis() as u64 > self.max_ms {
+            if std::time::Instant::now() >= self.deadline {
                 self.stopped = true;
                 return false;
             }
@@ -214,7 +212,7 @@ impl PlanBudget {
         if self.stopped {
             return false;
         }
-        if self.cancel.is_cancelled() || self.deadline.elapsed().as_millis() as u64 > self.max_ms {
+        if self.cancel.is_cancelled() || std::time::Instant::now() >= self.deadline {
             self.stopped = true;
             return false;
         }
@@ -2103,4 +2101,43 @@ pub fn next_step_steered_explained(
         }
     }
     Err(straight)
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    /// The deadline is `now + max`, not twice that: a budget checked after its wall-clock limit
+    /// ran out stops (the old `elapsed() > max` let it run for another `max`).
+    #[test]
+    fn the_wall_clock_limit_stops_at_the_deadline() {
+        let mut budget = PlanBudget::with_limits(1_000_000, 10);
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        assert!(!budget.poll(), "poll after the deadline reports stopped");
+        assert!(budget.stopped());
+
+        let mut budget = PlanBudget::with_limits(1_000_000, 10);
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        let mut stopped_after = None;
+        for n in 1..=CLOCK_BATCH * 4 {
+            if !budget.tick() {
+                stopped_after = Some(n);
+                break;
+            }
+        }
+        assert!(
+            stopped_after.is_some_and(|n| n <= CLOCK_BATCH),
+            "tick stops at the first clock read past the deadline ({stopped_after:?})"
+        );
+    }
+
+    /// A zero budget is already over when it is created (the clock is read at the first batch).
+    #[test]
+    fn a_zero_budget_stops_at_the_first_clock_check() {
+        let mut budget = PlanBudget::with_limits(1_000_000, 0);
+        for _ in 0..CLOCK_BATCH {
+            budget.tick();
+        }
+        assert!(!budget.tick(), "a 0 ms budget stops at its first clock read");
+    }
 }
