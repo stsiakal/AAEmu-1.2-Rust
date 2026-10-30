@@ -324,8 +324,39 @@ async fn unrelated_item_and_remote_or_nonfinite_client_positions_are_rejected() 
 }
 
 #[tokio::test]
-async fn placement_range_is_strictly_30_metres_in_3d() {
-    // F1: 29 m valid, 30 m `TOO_FAR_AWAY`; the decompile checks `dist3D^2 > 900` (z counts).
+async fn placement_range_is_30_metres_in_3d_inclusive() {
+    // `FUN_393a8fa0` refuses only `900.0 < d²` (~761319), so exactly 30 m is allowed. F1's
+    // screen-projected sweep cannot pin the boundary.
+    let (server, player, id, mut client) = fixture_with_client();
+    player.data().unit.transform.set_xyz(100.0, 100.0, DRY_Z);
+    let codes = send_placement(
+        &mut client,
+        &server,
+        &player,
+        4000,
+        id,
+        (130.0, 100.0, DRY_Z),
+    );
+    assert!(codes.is_empty(), "exactly 30 m (d² = 900) is allowed");
+    assert_eq!(Inv::of(&player).item_by_id(id).unwrap().count, 1);
+
+    let (server, player, id, mut client) = fixture_with_client();
+    player.data().unit.transform.set_xyz(100.0, 100.0, DRY_Z);
+    let codes = send_placement(
+        &mut client,
+        &server,
+        &player,
+        4000,
+        id,
+        (130.01, 100.0, DRY_Z),
+    );
+    assert_eq!(
+        codes,
+        vec![error_message::TOO_FAR_AWAY],
+        "30.01 m (d² > 900) is refused"
+    );
+    assert_eq!(Inv::of(&player).item_by_id(id).unwrap().count, 2);
+
     let (server, player, id, mut client) = fixture_with_client();
     let codes = send_placement(
         &mut client,
@@ -336,23 +367,6 @@ async fn placement_range_is_strictly_30_metres_in_3d() {
         (129.9, 100.0, 100.5),
     );
     assert!(codes.is_empty(), "29.9 m flat, 0.5 m up = 29.904 m");
-    assert_eq!(Inv::of(&player).item_by_id(id).unwrap().count, 1);
-
-    let (server, player, id, mut client) = fixture_with_client();
-    let codes = send_placement(
-        &mut client,
-        &server,
-        &player,
-        4000,
-        id,
-        (130.0, 100.0, 100.5),
-    );
-    assert_eq!(
-        codes,
-        vec![error_message::TOO_FAR_AWAY],
-        "30.0 m is refused"
-    );
-    assert_eq!(Inv::of(&player).item_by_id(id).unwrap().count, 2);
 
     let (server, player, id, mut client) = fixture_with_client();
     let codes = send_placement(
@@ -465,7 +479,9 @@ async fn round_doodads_refuse_a_spot_inside_the_sum_of_their_radii() {
 }
 
 #[tokio::test]
-async fn non_round_doodads_keep_the_flat_radius_until_the_box_is_decoded() {
+async fn non_round_doodads_skip_the_undecoded_box_overlap() {
+    // The client tests oriented boxes / physics colliders for non-round doodads; that shape is
+    // not decoded, so the server is permissive (never stricter than the client).
     let (server, player, _, mut client) = fixture_with_client();
     let first = give(&server, &player, 1005, 1);
     assert!(send_placement(
@@ -484,13 +500,25 @@ async fn non_round_doodads_keep_the_flat_radius_until_the_box_is_decoded() {
         &player,
         4005,
         second,
-        (102.4, 100.0, DRY_Z + 10.0),
+        (102.0, 100.0, DRY_Z),
     );
+    assert!(codes.is_empty(), "a non-round pair is not tested");
     assert_eq!(
-        codes,
-        vec![error_message::DOODAD_SIM_TOO_CLOSE_TO_OTHER_DOODAD],
-        "the flat 0.4 m < 0.5 m radius ignores the height"
+        server.world.world(0).unwrap().all_doodads().len(),
+        2,
+        "both non-round doodads stay"
     );
+
+    // The same for a unit next to a non-round doodad (the client uses a physics collider).
+    let other_client = TestClient::new(&server, 2, 1002);
+    let other = spawn_player(
+        &server,
+        &other_client,
+        test_character(2, "Bystander", 100.0, 100.0),
+        0x500,
+    );
+    other.data().unit.hp = 100;
+    other.data().unit.max_hp = 100;
     let third = give(&server, &player, 1005, 1);
     let codes = send_placement(
         &mut client,
@@ -498,9 +526,9 @@ async fn non_round_doodads_keep_the_flat_radius_until_the_box_is_decoded() {
         &player,
         4005,
         third,
-        (102.6, 100.0, DRY_Z + 10.0),
+        (100.3, 100.0, 100.4),
     );
-    assert!(codes.is_empty(), "flat 0.6 m > 0.5 m");
+    assert!(codes.is_empty(), "a non-round doodad skips the unit test");
 }
 
 #[tokio::test]
@@ -688,13 +716,41 @@ fn real_seed_and_sapling_templates_use_the_1_2_placement_rules() {
     assert_eq!(marine.group_id, placement::MARINE_CROPS);
     assert_eq!(placement::radius(marine), 1.0);
 
+    // Non-round plantables keep their real radius but are not overlap-tested (the client's
+    // oriented boxes / physics colliders are not decoded): groups 72 (3 m) and 69 (2 m).
+    for (id, radius) in [
+        (5287, 3.0),
+        (5288, 3.0),
+        (5289, 3.0),
+        (5290, 3.0),
+        (6591, 3.0),
+        (3596, 2.0),
+    ] {
+        let template = doodads.template(id).expect("non-round plantable");
+        assert!(!placement::is_round(template), "template {id}");
+        assert!(
+            (placement::radius(template) - radius).abs() < 1e-6,
+            "template {id}: radius {} != {radius}",
+            placement::radius(template)
+        );
+        let same = placement::Shape::of(template, (0.0, 0.0, 110.0));
+        assert!(
+            !placement::doodad_overlaps(same, same),
+            "template {id} must not be refused against a same-spot doodad"
+        );
+        assert!(
+            !placement::unit_overlaps(same, (0.0, 0.0, 110.0)),
+            "template {id} must not be refused against a unit"
+        );
+    }
+
     // A rice and a fig at 1.2 m overlap (0.5 + 1.0); at 1.6 m they do not.
     let rice_shape = placement::Shape::of(rice, (0.0, 0.0, 110.0));
     let fig_shape = placement::Shape::of(fig, (1.2, 0.0, 110.0));
     assert!(placement::doodad_overlaps(rice_shape, fig_shape));
     let fig_shape = placement::Shape::of(fig, (1.6, 0.0, 110.0));
     assert!(!placement::doodad_overlaps(rice_shape, fig_shape));
-    // The 30 m rule is strict and uses z.
+    // The 30 m rule is inclusive (`> 900` refuses) and uses z.
     let far = |x: f32, z: f32| x.powi(2) + (z - 110.0).powi(2) >= 900.0;
     assert!(!far(29.0, 110.0));
     assert!(far(30.0, 110.0));
@@ -772,6 +828,19 @@ async fn real_seed_and_sapling_placements_drive_the_handler() {
         (103.6, 100.0, DRY_Z),
     );
     assert!(codes.is_empty(), "fig sapling at 1.6 m: {codes:?}");
+
+    // A group 72 plantable (item 4868 -> 5287, 3 m radius, non-round) on top of the rice: the
+    // client's box test is not decoded, so the server must not refuse it.
+    let group72 = give(&server, &player, 4868, 1);
+    let codes = send_placement(
+        &mut client,
+        &server,
+        &player,
+        5287,
+        group72,
+        (102.0, 100.0, DRY_Z),
+    );
+    assert!(codes.is_empty(), "group 72 on the rice: {codes:?}");
 
     // Brown seaweed 4867 -> 411 is a marine crop: water is required.
     let marine = give(&server, &player, 4867, 1);

@@ -27,6 +27,9 @@ pub mod error_message {
     pub const NO_INTERACTION_AVAILABLE: i16 = 3;
     pub const LABOR_POWER_NEEDED: i16 = 9;
     pub const TOO_FAR_AWAY: i16 = 154;
+    /// Server answer for a seed use that cannot start (missing / foreign item, unknown template).
+    /// **Inference:** the 1.2 client shows `failed_to_use_item` when a seed use is cancelled, but
+    /// no capture of a server-to-client answer for this case exists.
     pub const FAILED_TO_USE_ITEM: i16 = 207;
     pub const INTERACTION_PERMISSION_DENY: i16 = 232;
     pub const DOODAD_SIM_AREA: i16 = 276;

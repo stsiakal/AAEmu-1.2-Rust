@@ -341,8 +341,7 @@ pub fn do_despawn(server: &GameServer, doodad: &DoodadRef) {
 
 /// `CreatePlayerDoodad(character, id, x, y, z, zRot, scale, itemId, farmGroupKind,
 /// itemTemplateId, customData, ignoreHouses)`: creates, initialises, spawns and saves a *planted*
-/// player doodad (`CSCreateDoodadPacket`, the fake-trial GM command). The 1.2 seed-builder rules
-/// run first, so every planting path answers its refusal the same way.
+/// player doodad (`CSCreateDoodadPacket`). The 1.2 seed-builder rules run first.
 #[allow(clippy::too_many_arguments)]
 pub fn create_player_doodad(
     server: &GameServer,
@@ -374,10 +373,10 @@ pub fn create_player_doodad(
     )
 }
 
-/// `CreatePlayerDoodad` for doodads the server spawns itself (crime evidence: bloodstains and
-/// footprints, `SocialManager.GenerateEvidence`). These are forensic markers, not player
-/// plantings: the 1.2 client never places them, so the seed-builder rules do not apply and they
-/// may stand under the unit they describe.
+/// `CreatePlayerDoodad` for doodads the server spawns itself (crime evidence: bloodstains,
+/// footprints and the fake-trial pine). These are server-side placements, not player plantings:
+/// the 1.2 client never places them, so the seed-builder rules do not apply and they may stand
+/// under the unit they describe or away from the owner.
 #[allow(clippy::too_many_arguments)]
 pub fn create_player_doodad_server_spawned(
     server: &GameServer,
@@ -436,9 +435,9 @@ fn create_player_doodad_with_labor(
         tracing::warn!("{char_name}: doodad {id} not placed: character is in no world");
         return None;
     };
-    // Every planting path (`CSCreateDoodad`, the fake-trial GM command) uses the 1.2 seed
-    // builder's rules here; the packet handler checks them too, in its earlier order. Crime
-    // evidence is server-spawned and skips them (`create_player_doodad_server_spawned`).
+    // The planting path (`CSCreateDoodad`) uses the 1.2 seed builder's rules here; the packet
+    // handler checks them too, in its earlier order. Server-spawned doodads (crime evidence and
+    // the fake-trial pine) skip them (`create_player_doodad_server_spawned`).
     if validate_placement {
         if let Some(template) = server.game_data.systems.npcs.doodad.template(id) {
             if let Some(refusal) = placement::refusal(server, &world, player, template, pos) {
@@ -630,8 +629,9 @@ pub fn handle_create_doodad(server: &GameServer, player: &PlayerRef, p: &CSCreat
         .and_then(|h| h.doodad_source_item(server, player, p.item_id, true))
     else {
         tracing::warn!("CreateDoodad, provided an invalid ItemId: {}", p.item_id);
-        // `item_use_zone_allowed` already answered 440 when the zone bans the item; only an item
-        // that is not in the bag needs the 1.2 failed-item-use answer.
+        // Inference: `FAILED_TO_USE_ITEM` 207 is the 1.2 client's seed-use cancellation, not a
+        // captured server answer. `item_use_zone_allowed` already answered 440 when the zone
+        // bans the item; only an item that is not in the bag needs this answer.
         let in_bag = crate::systems::economy::inventory::Inv::of(player)
             .bag()
             .lock()
@@ -653,11 +653,13 @@ pub fn handle_create_doodad(server: &GameServer, player: &PlayerRef, p: &CSCreat
             item.template_id,
             p.id
         );
+        // Inference (no capture): see `error_message::FAILED_TO_USE_ITEM`.
         player.send(error_msg(error_message::FAILED_TO_USE_ITEM));
         return;
     }
     let Some(template) = server.game_data.systems.npcs.doodad.template(p.id) else {
         tracing::warn!("CreateDoodad, unknown doodad template {}", p.id);
+        // Inference (no capture): see `error_message::FAILED_TO_USE_ITEM`.
         player.send(error_msg(error_message::FAILED_TO_USE_ITEM));
         return;
     };

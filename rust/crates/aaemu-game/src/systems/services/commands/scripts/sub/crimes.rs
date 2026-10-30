@@ -713,6 +713,22 @@ const FAKE_PINE_DOODAD: u32 = 398;
 const FAKE_PINE_ITEM: u32 = 14898;
 const UPROOT_SKILL: u32 = 13789;
 
+/// Test-only override of the fake trial's evidence kind (`0` damage, `1` kill, `2` fake pine).
+#[cfg(test)]
+static FORCED_FAKE_TRIAL_RNG: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
+
+fn fake_trial_evidence_kind() -> u32 {
+    #[cfg(test)]
+    if let Some(v) = FORCED_FAKE_TRIAL_RNG
+        .lock()
+        .expect("fake trial rng poisoned")
+        .take()
+    {
+        return v;
+    }
+    rand::random::<u32>() % 3
+}
+
 impl CrimeFakeTrialSubCommand {
     async fn run(
         &self,
@@ -766,36 +782,13 @@ impl CrimeFakeTrialSubCommand {
 
         // Generate evidence
         let crimes = &server.systems.social.crimes;
+        let hooks = server.systems.social.hooks.get();
         let target_obj = WorldObject::from(&target);
         for i in 0..evidence_count {
-            // Around the target, not on it: the fake pine now goes through the 1.2 placement
-            // rules (`CreatePlayerDoodad`), which refuse a doodad standing inside a unit (the
-            // C# placed it at the target's feet). Each evidence doodad gets its own spot on a
-            // 3 m ring, 120 degrees apart, one ring further out per three of them (see
-            // PORTING.md).
-            let target_pose = server.world.world_of(&target_obj).map_or_else(
-                || {
-                    let t = target_obj.transform();
-                    crate::models::transform::PositionAndRotation::new(
-                        t.x, t.y, t.z, t.rot_x, t.rot_y, t.rot_z,
-                    )
-                },
-                |w| w.world_pos_rot(&target_obj),
-            );
-            let ring = 3.0 + (i / 3) as f32 * 4.5;
-            let angle = target_pose.rot_z
-                + std::f32::consts::FRAC_PI_6
-                + (i % 3) as f32 * std::f32::consts::TAU / 3.0;
-            let (px, py) = crate::utils::math::add_distance_to_front(
-                ring,
-                target_pose.x,
-                target_pose.y,
-                angle,
-            );
-            let pos = [px, py, target_pose.z];
+            let pos = world_position(server, &target_obj);
             let mut fake_pine = None;
             let mut skill_id = 0u32;
-            let rng: u32 = rand::random::<u32>() % 3;
+            let rng: u32 = fake_trial_evidence_kind();
             // rng = 1; // for fixed murder
             let evidence = match rng {
                 0 => crimes.generate_evidence_from_damage(
@@ -812,23 +805,19 @@ impl CrimeFakeTrialSubCommand {
                 ),
                 _ => {
                     // CreatePlayerDoodad spawns the doodad (the C# `Spawn()` again is skipped).
-                    // The checked entry point: the fake pine is a planted doodad.
-                    let pine = crate::systems::npcs::doodad::manager::create_player_doodad(
-                        server,
-                        &victim,
-                        FAKE_PINE_DOODAD,
-                        (pos[0], pos[1], pos[2]),
-                        0.0,
-                        1.0,
-                        0,
-                        crate::systems::npcs::public_farm::farm_group_kind::INVALID,
-                        FAKE_PINE_ITEM,
-                        0,
-                        true,
-                    )
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Object reference not set to an instance of an object.")
-                    })?;
+                    let pine = hooks
+                        .create_player_doodad(
+                            server,
+                            &victim,
+                            FAKE_PINE_DOODAD,
+                            (pos[0], pos[1], pos[2]),
+                            0.0,
+                            FAKE_PINE_ITEM,
+                            0,
+                        )
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Object reference not set to an instance of an object.")
+                        })?;
                     skill_id = UPROOT_SKILL; // uproot
                     let e = crimes.generate_evidence_from_theft(server, Some(&target), &pine);
                     fake_pine = Some(pine);
@@ -1566,5 +1555,36 @@ mod tests {
             .all_doodads()
             .iter()
             .any(|d| d.data().template_id == 398));
+    }
+
+    /// The fake trial creates its pine through `CreatePlayerDoodad`, which is a server-side
+    /// evidence placement: a victim far away or standing in water must not refuse it (the
+    /// checked planting entry would answer 154/276 and abort the command).
+    #[tokio::test]
+    async fn crime_fake_trial_spawns_a_pine_for_a_far_wet_victim() {
+        let server = server();
+        let gm = harness::pc(&server, 1, "Gm", 100.0, 100.0);
+        let _crook = harness::pc(&server, 2, "Crook", 105.0, 100.0);
+        let victim = harness::pc(&server, 3, "Victim", 500.0, 100.0);
+        victim.p.data().unit.transform.z = 50.0; // below the synthetic ocean (100 m)
+        for (id, name) in [(1, "Gm"), (2, "Crook"), (3, "Victim")] {
+            server.names.add_character(id, name, 1000 + id);
+        }
+        *super::FORCED_FAKE_TRIAL_RNG.lock().expect("fake trial rng") = Some(2); // the fake-pine branch
+        let (_, out) = harness::run(&server, &gm.p, "crime fake crook victim evidence=1").await;
+        assert_eq!(
+            out,
+            ["|cFFFFFFFF[Crime Fake Trial] Putting Crook on trial by using 1 new evidence(s) to frame them with Victim as the victim.|r"]
+        );
+        let events = server.systems.social.crimes.crimes_of_player(2, true);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].reporter, 3);
+        assert_eq!(server.systems.social.trials.trial_ids().len(), 1);
+        // The pine was spawned at the target and deleted after the report.
+        let world = server.world.world(0).unwrap();
+        assert!(!world
+            .all_doodads()
+            .iter()
+            .any(|d| d.data().template_id == super::FAKE_PINE_DOODAD));
     }
 }
