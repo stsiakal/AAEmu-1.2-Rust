@@ -131,3 +131,45 @@ async fn real_transfer_roads_build_a_connected_graph() {
     assert_eq!(*route.first().unwrap(), a);
     assert_eq!(*route.last().unwrap(), b);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs AAEMU_GAME_PAK and AAEMU_COMPACT_DB"]
+async fn real_far_road_nodes_plan_within_the_budget() {
+    let Some(server) = real_server() else { return };
+    let template = server.world.world(0).expect("world 0").template.id;
+    let Some(graph) = RoadGraph::from_server(&server, template) else {
+        println!("no transfer roads loaded for template {template}");
+        return;
+    };
+    // Two ground-road nodes 600-1500 m apart on one connected network, each 20 m off the road.
+    let points = graph.points();
+    let a = points[points.len() / 2];
+    let planar = |p: Vec3, q: Vec3| ((p.x - q.x).powi(2) + (p.y - q.y).powi(2)).sqrt();
+    let b = points
+        .iter()
+        .copied()
+        .find(|p| (600.0..1500.0).contains(&planar(a, *p)) && graph.route(a, *p).is_some())
+        .expect("a far node on the same road network");
+    let cache = crate::nav::RoadGraphCache;
+    let nav = GameNav::of_instance(&server, 0, Some(&cache)).expect("main world instance");
+    let (from, to) = (
+        Vec3::new(a.x + 20.0, a.y, a.z),
+        Vec3::new(b.x, b.y + 20.0, b.z),
+    );
+    let started = std::time::Instant::now();
+    let report = nav::plan_explain(&nav, from, to);
+    let took = started.elapsed();
+    println!(
+        "road nodes {:.0} m apart: planner {} waypoints {:?} in {} ms; notes {:?}",
+        planar(from, to),
+        report.planner(),
+        report.plan.as_ref().map(|p| p.points.len()),
+        took.as_millis(),
+        report.notes
+    );
+    assert!(report.plan.is_some(), "no route: {:?}", report.notes);
+    assert!(
+        took < std::time::Duration::from_millis(crate::nav::PLAN_MAX_MS + 1_500),
+        "the plan overran its budget: {took:?}"
+    );
+}
