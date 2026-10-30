@@ -28,9 +28,9 @@ use aaemu_game::systems::skills::geometry::Target;
 use aaemu_game::systems::skills::state::SkillRun;
 use aaemu_game::systems::skills::types::{skill_result, SkillCaster};
 use aaemu_game::systems::skills::{buffs, precheck, skill, unit_reqs};
-use aaemu_game::world::{PlayerRef, WorldObject};
+use aaemu_game::world::{NpcRef, PlayerRef, WorldObject};
 
-use super::target::{attackable, dist2, me_pos, npcs_of, view_of};
+use super::target::{attackable, hostiles_around, view_of};
 use super::CombatState;
 
 /// Melee reach when no ready skill gives a better one.
@@ -61,6 +61,9 @@ pub struct SkillInfo {
     pub self_buffs: Vec<u32>,
     pub gcd_free: bool,
     pub aoe: bool,
+    /// The skill's `target_type` as the static data has it (`0` self, `4`/`5` hostile, else a
+    /// friendly / ground target).
+    pub target_type: i32,
     /// The skill has a heal effect (possibly beside damage, e.g. Antithesis).
     pub heals: bool,
     /// The skill has a damage effect.
@@ -159,6 +162,7 @@ pub fn build_info(server: &GameServer, skill_id: u32) -> Option<SkillInfo> {
         },
         gcd_free: t.ignore_global_cooldown,
         aoe: t.target_area_count > 1,
+        target_type: t.target_type,
         heals: has_heal,
         damages: has_damage,
     })
@@ -480,6 +484,7 @@ pub enum Choice {
 }
 
 /// Picks the next skill against `target` at distance `dist` (metres) by scoring the skill data.
+/// `all` is the think's one neighbourhood scan (the crowd count of the area-scored skills).
 pub fn choose_data(
     server: &GameServer,
     player: &PlayerRef,
@@ -487,6 +492,7 @@ pub fn choose_data(
     target: &WorldObject,
     dist: f32,
     now: i64,
+    all: &[NpcRef],
 ) -> Choice {
     let cs = cast_state(player);
     if cs.casting {
@@ -496,23 +502,11 @@ pub fn choose_data(
     // (and would look like a refusal because the server takes it without new cast marks).
     let auto_attack = player.data().unit.is_auto_attack;
     let crowd = target.as_npc().map_or(0, |npc| {
-        let all = npcs_of(server, player);
-        let v = view_of(npc);
-        all.iter()
-            .filter(|other| other.obj_id != v.obj_id)
-            .filter(|other| {
-                let n = other.data();
-                n.unit.hp > 0
-                    && dist2(n.unit.transform.x, n.unit.transform.y, v.x, v.y) <= AOE_RADIUS_M
-            })
-            .filter(|other| attackable(server, player, other))
-            .count()
+        hostiles_around(server, player, all, &view_of(npc), AOE_RADIUS_M)
     });
     let target_template = target.with_base_unit(|b| b.template_id());
     let target_obj = target.obj_id();
     let sig = state.loadout_signature(player);
-    let (bx, by, _) = me_pos(player);
-    let cell = ((bx / 2.0).floor() as i32, (by / 2.0).floor() as i32);
     let ids = candidate_ids(server, player);
     struct Ready {
         info: Arc<SkillInfo>,
@@ -535,11 +529,7 @@ pub fn choose_data(
         if state.never.contains(&(id, target_template)) || state.dropped.get(&id) == Some(&sig) {
             continue;
         }
-        if state
-            .refused_on
-            .get(&id)
-            .is_some_and(|r| r.matches(target_obj, cell, sig, now))
-        {
+        if super::cast::refused(state, player, id, target_obj, now) {
             continue;
         }
         let Some(template) = server.game_data.systems.skills.skill(id).cloned() else {
@@ -559,7 +549,7 @@ pub fn choose_data(
     }
     let me = WorldObject::from(player);
     let has_tag = |tag: u32| buffs::check_buffs_by_tag(server, target, tag);
-    let mut best: Option<(f32, u32)> = None;
+    let mut best: Option<(f32, u32, bool)> = None;
     let mut reach = 0.0f32;
     let mut no_sight = false;
     for r in &ready {
@@ -591,7 +581,7 @@ pub fn choose_data(
             if !active {
                 let score = 50.0;
                 if best.as_ref().is_none_or(|(s, ..)| score > *s) {
-                    best = Some((score, info.id));
+                    best = Some((score, info.id, true));
                 }
             }
             continue;
@@ -642,14 +632,16 @@ pub fn choose_data(
         }
         score /= 1.0 + info.cast_ms as f32 / 2_000.0;
         if best.as_ref().is_none_or(|(s, ..)| score > *s) {
-            best = Some((score, info.id));
+            // The skill's own target type decides who it is cast on: only hostile-target
+            // skills go to the monster (a damage+heal skill like Antithesis stays hostile).
+            best = Some((score, info.id, !matches!(info.target_type, 4 | 5)));
         }
     }
-    if let Some((_, id)) = best {
+    if let Some((_, id, self_target)) = best {
         state.no_sight = None;
         return Choice::Cast {
             skill: id,
-            self_target: false,
+            self_target,
         };
     }
     if reach > 0.0 && dist > reach - 1.0 {

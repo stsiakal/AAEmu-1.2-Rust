@@ -14,14 +14,17 @@ use aaemu_game::models::char_data::Skill;
 use aaemu_game::net::socketless::SocketlessConnection;
 use aaemu_game::server::GameServer;
 use aaemu_game::systems::economy::loot_data::{Loot, LootPack};
+use aaemu_game::systems::skills::data::templates::BuffTemplate;
 use aaemu_game::systems::skills::data::SkillTemplate;
+use aaemu_game::systems::skills::types::SkillCaster;
 use aaemu_game::test_support::{
     install_flat_heightmap, install_test_terrain, test_character, test_server_with,
 };
 use aaemu_game::world::PlayerRef;
 
+use crate::combat::cast::{self, CastOutcome};
 use crate::combat::target::spawn_monster;
-use crate::combat::Mode;
+use crate::combat::{loot, Mode};
 use crate::host::BotSession;
 use crate::life;
 use crate::rotation::Rotation;
@@ -29,6 +32,10 @@ use crate::rotation::Rotation;
 const KILL_SKILL: u32 = 60_001;
 const SLOW_SKILL: u32 = 60_002;
 const INACTIVE_SKILL: u32 = 60_003;
+/// Denied by the [`REFUSAL_BUFF`] while it is active (the server's buff-skill requirement).
+const REFUSED_SKILL: u32 = 60_004;
+const REFUSED_HEAL: u32 = 60_005;
+const REFUSAL_BUFF: u32 = 90_001;
 const MONSTER: u32 = 900;
 const MONSTER_B: u32 = 901;
 const DROP_ITEM: u32 = 7_001;
@@ -74,6 +81,56 @@ fn add_damage_skill(data: &mut GameData, id: u32, damage: i32, cast_ms: i32, abi
     data.systems.skills.add_skill(template);
 }
 
+fn add_heal_skill(data: &mut GameData, id: u32, heal: i32) {
+    use aaemu_game::systems::skills::data::effects::{EffectKind, EffectTemplate, HealEffect};
+
+    let effect_id = 910_000 + id;
+    let effect = HealEffect {
+        id: effect_id,
+        use_fixed_heal: true,
+        fixed_min: heal,
+        fixed_max: heal,
+        use_level_heal: false,
+        level_md: 0.0,
+        level_va_start: 0,
+        level_va_end: 0,
+        percent: false,
+        use_charged_buff: false,
+        charged_buff_id: 0,
+        charged_mul: 0.0,
+        slave_applicable: false,
+        ignore_heal_aggro: false,
+        dps_multiplier: 0.0,
+        actability_group_id: 0,
+        actability_step: 0,
+        actability_mul: 0.0,
+        actability_add: 0.0,
+    };
+    data.systems.skills.add_effect(
+        EffectKind::HealEffect,
+        EffectTemplate::Heal(effect),
+        effect_id,
+    );
+    let mut template = SkillTemplate {
+        id,
+        target_type: 0,
+        max_range: 0,
+        casting_time: 0,
+        ..Default::default()
+    };
+    use aaemu_game::systems::skills::data::templates::SkillEffect;
+    template.effects.push(SkillEffect {
+        effect_id,
+        template: Some((EffectKind::HealEffect, effect_id)),
+        start_level: 0,
+        end_level: 255,
+        chance: 100,
+        application_method: 1,
+        ..Default::default()
+    });
+    data.systems.skills.add_skill(template);
+}
+
 /// The test world: a flat surface, the combat skills, a default melee attack and an always-drop
 /// loot pack on the monster template.
 fn combat_server() -> Arc<GameServer> {
@@ -82,6 +139,22 @@ fn combat_server() -> Arc<GameServer> {
     add_damage_skill(&mut data, SLOW_SKILL, 5_000, 800, 0);
     add_damage_skill(&mut data, INACTIVE_SKILL, 5_000, 0, 5);
     add_damage_skill(&mut data, 3, 50, 0, 0);
+    add_damage_skill(&mut data, REFUSED_SKILL, 5_000, 0, 0);
+    add_heal_skill(&mut data, REFUSED_HEAL, 5_000);
+    data.systems.skills.add_buff(BuffTemplate {
+        id: REFUSAL_BUFF,
+        duration: 600_000,
+        ..Default::default()
+    });
+    data.systems.skills.buff_skill_requirements.push(
+        aaemu_game::systems::skills::buff_reqs::BuffSkillRequirement {
+            id: 1,
+            buff_id: REFUSAL_BUFF,
+            default_result: true,
+            skill_ids: [REFUSED_SKILL, REFUSED_HEAL].into(),
+            ..Default::default()
+        },
+    );
     data.skills
         .default_skills
         .push(aaemu_game::data::skills::DefaultSkill {
@@ -164,6 +237,29 @@ async fn bot(
 
 fn player_of(bot: &Arc<BotSession>) -> PlayerRef {
     futures::executor::block_on(bot.player()).expect("a live bot")
+}
+
+/// Gives the bot the buff a buff-skill requirement denies [`REFUSED_SKILL`] / [`REFUSED_HEAL`]
+/// with: the server refuses those casts while every bot-side check passes.
+fn apply_refusal_buff(server: &Arc<GameServer>, player: &PlayerRef) {
+    use aaemu_game::systems::skills::buffs;
+    let template = BuffTemplate {
+        id: REFUSAL_BUFF,
+        duration: 600_000,
+        ..Default::default()
+    };
+    let me = aaemu_game::world::WorldObject::from(player);
+    let buff = buffs::new_buff(
+        server,
+        &template,
+        Some(&me),
+        &SkillCaster::Unit(player.obj_id),
+        None,
+        aaemu_game::world::now_ms(),
+    );
+    // Put the effect on the unit directly: the fixture has no stat formulas, and a buff event
+    // would recalculate (and zero) the test character's max hp.
+    player.data().unit.buffs.effects.push(buff);
 }
 
 async fn run_for(server: &Arc<GameServer>, bot: &Arc<BotSession>, duration: Duration) {
@@ -346,22 +442,23 @@ async fn a_dead_bot_resurrects_like_a_client_and_resumes_the_hunt() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_cast_is_backed_off_and_not_retried_in_a_loop() {
     let server = combat_server();
-    // The skill's tree is not active: the server refuses it as an inactive ability, while the
-    // quiet precheck passes. The bot must see the refusal and back the skill off.
+    // A buff the bot carries denies this skill server-side (a buff-skill requirement the quiet
+    // precheck does not apply). The bot must see the refusal and back the skill off.
     let bot = bot(
         &server,
         2,
         "Refused",
         100.0,
         100.0,
-        &[INACTIVE_SKILL, KILL_SKILL],
+        &[REFUSED_SKILL, KILL_SKILL],
     )
     .await;
+    apply_refusal_buff(&server, &bot.player().await.expect("a live bot"));
     spawn_monster(&server, 0x400, MONSTER, 2, 5_000, 102.0, 100.0);
     {
         let rotation = Rotation::parse(
             r#"{"archetype":"Test","role":"melee_dps","rules":[],
-                "fillers":[{"skill":60003,"name":"Inactive"},{"skill":60001,"name":"Hit"}]}"#,
+                "fillers":[{"skill":60004,"name":"Denied"},{"skill":60001,"name":"Hit"}]}"#,
         )
         .expect("rotation");
         bot.brain().lock().await.rotation = Some(Arc::new(rotation));
@@ -381,7 +478,7 @@ async fn a_refused_cast_is_backed_off_and_not_retried_in_a_loop() {
             state.casts_refused
         );
         assert!(
-            state.refused_on.contains_key(&INACTIVE_SKILL),
+            state.refused_on.contains_key(&REFUSED_SKILL),
             "the skill is backed off for this target and spot"
         );
     }
@@ -463,4 +560,268 @@ async fn a_bot_without_learned_skills_auto_attacks_its_target_down() {
     })
     .await;
     assert!(killed, "the default auto-attack killed the monster");
+}
+
+/// Every walk of this test times out at once (a real failed `goto`): a target beyond the
+/// skill's reach is never given up before this fix and its plan replanned every 300 ms.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreachable_target_is_ignored_and_the_next_one_attacked() {
+    let server = combat_server();
+    let bot = bot(&server, 2, "Blocker", 100.0, 100.0, &[KILL_SKILL]).await;
+    bot.set_walk_deadline_cap(Duration::from_millis(1));
+    let now = aaemu_game::world::now_ms();
+    spawn_monster(&server, 0x400, MONSTER, 2, 5_000, 140.0, 100.0);
+    bot.set_mode(Mode::Fight {
+        wanted: Vec::new(),
+        radius: 60.0,
+    })
+    .await;
+
+    let ignored = wait_until(&server, &bot, Duration::from_secs(8), || {
+        bot.brain()
+            .try_lock()
+            .ok()
+            .is_some_and(|s| s.ignored.get(&0x400).is_some_and(|t| *t > now))
+    })
+    .await;
+    assert!(ignored, "the unreachable target was left alone");
+    assert_eq!(monster_hp(&server, 0x400), 5_000, "it was never reached");
+
+    spawn_monster(&server, 0x401, MONSTER_B, 2, 500, 101.0, 100.0);
+    let killed = wait_until(&server, &bot, Duration::from_secs(8), || {
+        monster_hp(&server, 0x401) <= 0
+    })
+    .await;
+    assert!(killed, "the next target was attacked");
+}
+
+/// A corpse the walker cannot reach is given up after one failed walk, not walked to forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreachable_corpse_is_skipped() {
+    let server = combat_server();
+    let bot = bot(&server, 2, "Looter", 100.0, 100.0, &[KILL_SKILL]).await;
+    bot.set_walk_deadline_cap(Duration::from_millis(1));
+    spawn_monster(&server, 0x400, MONSTER, 2, 0, 140.0, 100.0);
+    let owner = server.world.object(0x400).expect("corpse");
+    let killer = aaemu_game::world::WorldObject::from(player_of(&bot));
+    aaemu_game::systems::economy::looting::LootManager::generate_loot(
+        &server,
+        &owner,
+        Some(&killer),
+    );
+    assert!(
+        loot::loot_count(&server, 0x400).is_some_and(|n| n > 0),
+        "the corpse has loot"
+    );
+    bot.set_mode(Mode::Fight {
+        wanted: Vec::new(),
+        radius: 20.0,
+    })
+    .await;
+    bot.brain().lock().await.loot_target = Some(0x400);
+
+    let skipped = wait_until(&server, &bot, Duration::from_secs(8), || {
+        bot.brain()
+            .try_lock()
+            .ok()
+            .is_some_and(|s| s.loot_target.is_none())
+    })
+    .await;
+    assert!(skipped, "the unreachable corpse was given up");
+    let state = bot.brain().lock().await;
+    assert_eq!(state.looted_items, 0, "nothing was looted from afar");
+}
+
+/// A resting bot that a monster starts attacking breaks the rest and fights back on the next
+/// think (it used to keep resting, and the early return skipped target selection).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resting_bot_hit_by_a_monster_fights_back() {
+    let server = combat_server();
+    let bot = bot(&server, 2, "Sleeper", 100.0, 100.0, &[KILL_SKILL]).await;
+    let player = player_of(&bot);
+    {
+        let mut c = player.data();
+        c.unit.hp = 200; // below REST_BELOW, out of battle: the bot rests
+    }
+    bot.set_mode(Mode::Fight {
+        wanted: Vec::new(),
+        radius: 20.0,
+    })
+    .await;
+    run_for(&server, &bot, Duration::from_millis(300)).await;
+    assert!(
+        bot.brain().lock().await.resting,
+        "the hurt bot started resting"
+    );
+
+    let mob = spawn_monster(&server, 0x400, MONSTER, 2, 5_000, 104.0, 100.0);
+    mob.data().current_aggro_target = player.obj_id;
+    let fought = wait_until(&server, &bot, Duration::from_secs(8), || {
+        monster_hp(&server, 0x400) < 5_000
+    })
+    .await;
+    assert!(fought, "the resting bot fought back");
+    assert!(!bot.brain().lock().await.resting, "the rest was broken");
+}
+
+/// A grind answers an attacker even when the bot was pulled outside its radius (the radius is
+/// only a pull filter, never a reason to ignore something hitting the bot).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bot_outside_its_grind_radius_answers_an_attacker() {
+    let server = combat_server();
+    let bot = bot(&server, 2, "Pulled", 140.0, 100.0, &[KILL_SKILL]).await;
+    let player = player_of(&bot);
+    let mob = spawn_monster(&server, 0x400, MONSTER, 2, 500, 144.0, 100.0);
+    mob.data().current_aggro_target = player.obj_id;
+    bot.set_mode(Mode::Grind {
+        center: (100.0, 100.0),
+        radius: 20.0,
+    })
+    .await;
+
+    let killed = wait_until(&server, &bot, Duration::from_secs(8), || {
+        monster_hp(&server, 0x400) <= 0
+    })
+    .await;
+    assert!(
+        killed,
+        "the bot answered the attacker outside its grind radius"
+    );
+}
+
+/// A refused heal is backed off like any cast and no second `CSStartSkill` leaves in the same
+/// think (the rotation used to cast right after the refused heal).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_heal_is_backed_off_and_only_one_cast_leaves_per_think() {
+    let server = combat_server();
+    let bot = bot(
+        &server,
+        2,
+        "Healer",
+        100.0,
+        100.0,
+        &[REFUSED_HEAL, KILL_SKILL],
+    )
+    .await;
+    let player = bot.player().await.expect("a live bot");
+    {
+        let mut c = player.data();
+        c.unit.hp = 300; // below HEAL_BELOW: the heal is tried first
+    }
+    apply_refusal_buff(&server, &player);
+    spawn_monster(&server, 0x400, MONSTER, 2, 5_000, 101.0, 100.0);
+    bot.set_mode(Mode::Fight {
+        wanted: Vec::new(),
+        radius: 20.0,
+    })
+    .await;
+
+    bot.tick(&server).await;
+    {
+        let state = bot.brain().lock().await;
+        assert_eq!(state.casts_refused, 1, "the heal was refused once");
+        assert!(
+            state.refused_on.contains_key(&REFUSED_HEAL),
+            "the heal is backed off"
+        );
+        assert_eq!(
+            state.casts_started, 0,
+            "the rotation cast in the same think as the refused heal"
+        );
+    }
+    // Inside the back-off window the heal is not resent; the fight still goes on.
+    run_for(&server, &bot, Duration::from_millis(600)).await;
+    let state = bot.brain().lock().await;
+    assert_eq!(state.casts_refused, 1, "the refused heal was not retried");
+    assert!(
+        state.max_casts_per_think <= 1,
+        "one think sent {} casts",
+        state.max_casts_per_think
+    );
+}
+
+/// A removed bot sends nothing (no combat packet reaches the handler) and its fight state is
+/// gone with the session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removed_bot_sends_nothing_and_clears_its_combat_state() {
+    let server = combat_server();
+    let bot = bot(&server, 2, "Removed", 100.0, 100.0, &[KILL_SKILL]).await;
+    spawn_monster(&server, 0x400, MONSTER, 2, 50_000, 101.0, 100.0);
+    bot.set_mode(Mode::Fight {
+        wanted: Vec::new(),
+        radius: 20.0,
+    })
+    .await;
+    let fighting = wait_until(&server, &bot, Duration::from_secs(5), || {
+        bot.brain()
+            .try_lock()
+            .ok()
+            .is_some_and(|s| s.target == Some(0x400) && s.casts_started > 0)
+    })
+    .await;
+    assert!(fighting, "the bot was fighting");
+
+    bot.cancel_navigation();
+    bot.logout(&server).await;
+    bot.disconnect(&server).await;
+    let sent = bot.packets_dispatched_settled().await;
+
+    let player = player_of(&bot);
+    let mut state = bot.brain().lock().await;
+    assert_eq!(state.target, None);
+    assert_eq!(state.mode, Mode::Idle);
+    assert!(state.refused_on.is_empty(), "refusals outlived the session");
+    assert!(state.ignored.is_empty(), "ignores outlived the session");
+    assert_eq!(state.loot_target, None);
+    assert!(!state.resting);
+    let outcome = cast::cast(
+        &bot,
+        &server,
+        &mut state,
+        KILL_SKILL,
+        SkillCaster::Unit(player.obj_id),
+        0x400,
+        MONSTER,
+        aaemu_game::world::now_ms(),
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        CastOutcome::Refused,
+        "an offline bot's cast is refused locally"
+    );
+    drop(state);
+    assert_eq!(
+        bot.packets_dispatched(),
+        sent,
+        "a packet left the removed bot"
+    );
+}
+
+/// A new `/bot fight` or `/bot grind` command drops the old fight state with its target.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_command_clears_the_old_target() {
+    let server = combat_server();
+    let bot = bot(&server, 2, "Redirected", 100.0, 100.0, &[KILL_SKILL]).await;
+    spawn_monster(&server, 0x400, MONSTER, 2, 50_000, 101.0, 100.0);
+    bot.set_mode(Mode::Fight {
+        wanted: Vec::new(),
+        radius: 20.0,
+    })
+    .await;
+    let targeted = wait_until(&server, &bot, Duration::from_secs(5), || {
+        bot.brain()
+            .try_lock()
+            .ok()
+            .is_some_and(|s| s.target == Some(0x400))
+    })
+    .await;
+    assert!(targeted, "the bot targeted the monster");
+    bot.set_mode(Mode::Fight {
+        wanted: Vec::new(),
+        radius: 10.0,
+    })
+    .await;
+    let state = bot.brain().lock().await;
+    assert_eq!(state.target, None, "the old target outlived the command");
 }

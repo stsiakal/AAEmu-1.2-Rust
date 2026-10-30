@@ -36,7 +36,7 @@ use aaemu_game::server::GameServer;
 use aaemu_game::systems::skills::controllers::Vec3;
 use aaemu_game::systems::skills::handlers::CSChangeTargetPacket;
 use aaemu_game::systems::skills::types::SkillCaster;
-use aaemu_game::world::{PlayerRef, WorldObject};
+use aaemu_game::world::{NpcRef, PlayerRef, WorldObject};
 
 use crate::host::BotSession;
 use crate::nav::danger::DangerMark;
@@ -44,7 +44,7 @@ use crate::rotation::{Archetype, Rotation};
 
 use self::cast::{CastOutcome, RefusalKey};
 use self::skills::{cast_state, Choice, SkillInfo, MELEE_RANGE_M};
-use self::target::{dist2, me_pos, NpcView, PullRules};
+use self::target::{dist2, me_pos, NpcView, PullRules, SEARCH_RADIUS_M};
 
 pub use self::skills::DEFAULT_ATTACKS;
 pub use self::survival::{AttackerSeen, HEAL_BELOW, REST_BELOW, REST_UNTIL};
@@ -53,6 +53,11 @@ pub use self::survival::{AttackerSeen, HEAL_BELOW, REST_BELOW, REST_UNTIL};
 pub const IGNORE_MS: i64 = 120_000;
 /// Without line of sight to a target for this long the bot gives it up.
 pub const NO_SIGHT_GIVE_UP_MS: i64 = 8_000;
+/// A target nothing can be cast on for this long (an evading / uncastable monster) is left.
+pub const WAIT_GIVE_UP_MS: i64 = 10_000;
+/// The widest neighbourhood scan a think takes (the grid's neighbouring regions reach further;
+/// a larger `/bot fight` radius simply sees no farther than this).
+pub const MAX_SCAN_RADIUS_M: f32 = 150.0;
 /// The server's own minimum between two casts (a trace detail, the gate reads its own copy).
 pub const CAST_SPACING_MS: i64 = 200;
 /// A death to a monster this many levels above the bot is a level problem, not bad luck.
@@ -89,6 +94,10 @@ pub struct CombatState {
     pub deaths: u32,
     pub casts_started: u32,
     pub casts_refused: u32,
+    /// `CSStartSkill` packets sent in the think that just ended, and the largest count one think
+    /// ever sent (the live report's "casts per think"; more than one is the double-cast bug).
+    casts_this_think: u32,
+    pub max_casts_per_think: u32,
     /// Range races (the target moved between the precheck and the server's check).
     pub casts_out_of_range: u32,
     /// Casts the unit's cooldown / running cast refused (waited out, not backed off).
@@ -98,6 +107,12 @@ pub struct CombatState {
     last_cast_ms: i64,
     /// Where the running approach walk goes (`None` = no walk).
     walk_to: Option<(f32, f32)>,
+    /// The combat approach walk last started: its navigation generation and target object id.
+    /// The walk task records its outcome; a think that finds it ended failed (unreachable,
+    /// stuck, timed out) leaves the target alone instead of replanning every tick.
+    approach_walk: Option<(u64, u32)>,
+    /// Since when the bot has had a live target it can cast nothing at (the Wait give-up).
+    waiting_since: Option<(u32, i64)>,
     /// Monsters that could not be reached, ignored until the given time.
     pub ignored: HashMap<u32, i64>,
     /// The last monster seen attacking the bot (the likely killer when it dies).
@@ -159,12 +174,16 @@ impl Default for CombatState {
             deaths: 0,
             casts_started: 0,
             casts_refused: 0,
+            casts_this_think: 0,
+            max_casts_per_think: 0,
             casts_out_of_range: 0,
             casts_on_cooldown: 0,
             looted_items: 0,
             last_cast_skill: 0,
             last_cast_ms: 0,
             walk_to: None,
+            approach_walk: None,
+            waiting_since: None,
             ignored: HashMap::new(),
             last_attacker: None,
             safe_pos: None,
@@ -208,6 +227,27 @@ impl CombatState {
     pub fn disengage(&mut self) {
         self.target = None;
         self.walk_to = None;
+        self.approach_walk = None;
+        self.waiting_since = None;
+    }
+
+    /// The session ended (logout / removal): no fight, walk or learned refusal outlives it.
+    pub fn clear_session(&mut self) {
+        self.mode = Mode::Idle;
+        self.disengage();
+        self.target_sent = 0;
+        self.resting = false;
+        self.fleeing_to = None;
+        self.flee_fails = 0;
+        self.loot_target = None;
+        self.ignored.clear();
+        self.refused_on.clear();
+        self.dropped.clear();
+        self.never.clear();
+        self.last_attacker = None;
+        self.safe_pos = None;
+        self.casts_this_think = 0;
+        self.max_casts_per_think = 0;
     }
 
     /// The health / mana fraction a resting bot rests up to.
@@ -306,6 +346,8 @@ pub fn configure(
 /// One think of a live bot. Returns how long until the next think.
 pub async fn think(bot: &Arc<BotSession>, server: &Arc<GameServer>) -> Duration {
     let mut state = bot.brain().lock().await;
+    state.max_casts_per_think = state.max_casts_per_think.max(state.casts_this_think);
+    state.casts_this_think = 0;
     let now = aaemu_game::world::now_ms();
 
     // The frames of the server's answers since the last think (a client's socket read).
@@ -334,13 +376,29 @@ pub async fn think(bot: &Arc<BotSession>, server: &Arc<GameServer>) -> Duration 
     }
 
     survival::note_safe_position(&player, &mut state, now);
-    let resting = survival::update_rest(&player, &mut state);
     if matches!(state.mode, Mode::Idle) {
+        survival::update_rest(&player, &mut state, false);
         return state.base_tick;
     }
 
+    // One neighbourhood scan per think (`World::around`, distance-filtered): the attacker, the
+    // threat, the pull, the crowd counts and the revive check all reuse this list instead of
+    // walking every object of the world instance once per question.
+    let radius = match &state.mode {
+        Mode::Fight { radius, .. } | Mode::Grind { radius, .. } => *radius,
+        Mode::Idle => 0.0,
+    };
+    let scan = target::scan_npcs(
+        server,
+        &player,
+        radius.clamp(SEARCH_RADIUS_M, MAX_SCAN_RADIUS_M),
+    );
+    let attacker = target::find_attacker(&scan, &player);
+    // A resting bot that something attacks stops resting and fights back on this think.
+    let resting = survival::update_rest(&player, &mut state, attacker.is_some());
+
     // What cannot be fought: run away (the danger index keeps the area).
-    if let Some(threat) = survival::threat_to_flee(server, &player, &mut state, now) {
+    if let Some(threat) = survival::threat_to_flee(&scan, &player, &mut state, now, attacker) {
         flee(bot, server, &mut state, &player, &threat, now);
         return Duration::from_millis(300);
     }
@@ -352,8 +410,12 @@ pub async fn think(bot: &Arc<BotSession>, server: &Arc<GameServer>) -> Duration 
         return Duration::from_millis(300);
     }
 
-    // Heal / potion before the next action.
-    if heal_if_hurt(bot, server, &mut state, &player, now).await {
+    // Heal / potion before the next action; an attempt (even a refused one) ends the think, so
+    // no second `CSStartSkill` follows it.
+    if heal_if_hurt(bot, server, &mut state, &player, now)
+        .await
+        .is_some()
+    {
         return Duration::from_millis(300);
     }
     if resting {
@@ -381,10 +443,27 @@ pub async fn think(bot: &Arc<BotSession>, server: &Arc<GameServer>) -> Duration 
         }
     }
 
+    // A combat walk that ended unreachable / stuck / timed out is not replanned every think:
+    // the target is left alone for the bounded ignore window and the bot moves on.
+    if let (Some(obj_id), false) = (state.target, bot.walking()) {
+        if let Some((generation, walked_to)) = state.approach_walk {
+            if walked_to == obj_id && bot.walk_failed(generation).await {
+                tracing::info!(
+                    character = %bot.name,
+                    target = obj_id,
+                    "Bots: target unreachable, leaving it alone"
+                );
+                state.ignored.insert(obj_id, now + IGNORE_MS);
+                state.disengage();
+            }
+        }
+    }
+
     if state.target.is_none() {
-        if let Some(view) = acquire_target(server, &player, &state, &mode, now) {
+        if let Some(view) = acquire_target(server, &scan, &player, attacker, &state, &mode, now) {
             state.target = Some(view.obj_id);
             state.walk_to = None;
+            state.waiting_since = None;
             tracing::debug!(
                 character = %bot.name,
                 target = view.obj_id,
@@ -411,11 +490,12 @@ pub async fn think(bot: &Arc<BotSession>, server: &Arc<GameServer>) -> Duration 
     let dist = dist2(px, py, t.x, t.y);
 
     // The rotation first, the data scoring as the fallback.
-    let chosen = rotation::choose_rotation(server, &player, &mut state, &target_obj, dist, now)
-        .map(|(skill, self_target)| Choice::Cast { skill, self_target })
-        .unwrap_or_else(|| {
-            skills::choose_data(server, &player, &mut state, &target_obj, dist, now)
-        });
+    let chosen =
+        rotation::choose_rotation(server, &player, &mut state, &target_obj, dist, now, &scan)
+            .map(|(skill, self_target)| Choice::Cast { skill, self_target })
+            .unwrap_or_else(|| {
+                skills::choose_data(server, &player, &mut state, &target_obj, dist, now, &scan)
+            });
 
     match chosen {
         Choice::Cast { skill, self_target } => {
@@ -424,6 +504,7 @@ pub async fn think(bot: &Arc<BotSession>, server: &Arc<GameServer>) -> Duration 
                 bot.bump_nav_generation();
                 return Duration::from_millis(300);
             }
+            state.waiting_since = None;
             let template = target_obj.with_base_unit(|b| b.template_id());
             let target_id = if self_target { player.obj_id } else { obj_id };
             let outcome = cast::cast(
@@ -441,7 +522,8 @@ pub async fn think(bot: &Arc<BotSession>, server: &Arc<GameServer>) -> Duration 
                 CastOutcome::Started => Duration::from_millis(300),
                 CastOutcome::OutOfRange => {
                     // The target slipped out of range after the precheck: close in instead of
-                    // backing the skill off.
+                    // backing the skill off. A failed walk is picked up at the top of the next
+                    // think (a target the bot cannot reach is left alone then).
                     approach(
                         bot,
                         server,
@@ -451,7 +533,8 @@ pub async fn think(bot: &Arc<BotSession>, server: &Arc<GameServer>) -> Duration 
                         t.x,
                         t.y,
                         MELEE_RANGE_M - 1.0,
-                    );
+                    )
+                    .await;
                     Duration::from_millis(300)
                 }
                 CastOutcome::Cooldown => Duration::from_millis(300),
@@ -459,13 +542,19 @@ pub async fn think(bot: &Arc<BotSession>, server: &Arc<GameServer>) -> Duration 
             }
         }
         Choice::Approach(range) => {
-            if approach(bot, server, &mut state, &player, obj_id, t.x, t.y, range) {
-                Duration::from_millis(300)
-            } else {
-                state.ignored.insert(obj_id, now + IGNORE_MS);
-                state.disengage();
-                Duration::from_millis(300)
+            match approach(bot, server, &mut state, &player, obj_id, t.x, t.y, range).await {
+                Approach::Failed => {
+                    tracing::info!(
+                        character = %bot.name,
+                        target = obj_id,
+                        "Bots: target unreachable, leaving it alone"
+                    );
+                    state.ignored.insert(obj_id, now + IGNORE_MS);
+                    state.disengage();
+                }
+                Approach::InRange | Approach::Walking => {}
             }
+            Duration::from_millis(300)
         }
         Choice::Wait => {
             if dist > MELEE_RANGE_M + 2.0 {
@@ -478,7 +567,18 @@ pub async fn think(bot: &Arc<BotSession>, server: &Arc<GameServer>) -> Duration 
                     t.x,
                     t.y,
                     MELEE_RANGE_M - 1.0,
+                )
+                .await;
+            } else if wait_expired(&mut state, obj_id, now) {
+                // Nothing has been castable at this target for the whole give-up window (an
+                // evading / unattackable monster): leave it instead of waiting forever.
+                tracing::info!(
+                    character = %bot.name,
+                    target = obj_id,
+                    "Bots: nothing castable at the target, leaving it alone"
                 );
+                state.ignored.insert(obj_id, now + IGNORE_MS);
+                state.disengage();
             }
             Duration::from_millis(300)
         }
@@ -491,6 +591,17 @@ pub async fn think(bot: &Arc<BotSession>, server: &Arc<GameServer>) -> Duration 
             state.ignored.insert(obj_id, now + IGNORE_MS);
             state.disengage();
             Duration::from_millis(300)
+        }
+    }
+}
+
+/// Has the bot waited too long for anything castable at `obj_id`? Records the first wait.
+fn wait_expired(state: &mut CombatState, obj_id: u32, now: i64) -> bool {
+    match state.waiting_since {
+        Some((id, since)) if id == obj_id => now - since >= WAIT_GIVE_UP_MS,
+        _ => {
+            state.waiting_since = Some((obj_id, now));
+            false
         }
     }
 }
@@ -520,28 +631,27 @@ async fn target_sent_changed(
     true
 }
 
-/// Recruits the next target: an attacker first (when it is within the gap), then the best pull.
+/// Recruits the next target: an attacker first (always, wherever the bot stands), then the
+/// best pull inside the mode's radius. A grind measures that radius from its centre, so a bot
+/// pulled out of its circle does not pull the world around itself while answering attackers.
+#[allow(clippy::too_many_arguments)]
 fn acquire_target(
     server: &GameServer,
+    scan: &[NpcRef],
     player: &PlayerRef,
+    attacker: Option<NpcView>,
     state: &CombatState,
     mode: &Mode,
     now: i64,
 ) -> Option<NpcView> {
-    let (wanted, radius, allow_tagged) = match mode {
+    let (px, py, _) = me_pos(player);
+    let (wanted, radius, allow_tagged, center) = match mode {
         Mode::Idle => return None,
-        Mode::Fight { wanted, radius } => (wanted.as_slice(), *radius, true),
-        Mode::Grind { radius, center } => {
-            let (px, py, _) = me_pos(player);
-            if dist2(px, py, center.0, center.1) > *radius {
-                // The bot was pulled out of its grind (or respawned): walk back first.
-                return None;
-            }
-            (&[][..], *radius, false)
-        }
+        Mode::Fight { wanted, radius } => (wanted.as_slice(), *radius, true, (px, py)),
+        Mode::Grind { radius, center } => (&[][..], *radius, false, *center),
     };
     let my_level = player.data().unit.level;
-    if let Some(attacker) = target::find_attacker(server, player) {
+    if let Some(attacker) = attacker {
         if attacker.level <= my_level.saturating_add(state.max_target_level_gap) {
             return Some(attacker);
         }
@@ -555,17 +665,32 @@ fn acquire_target(
     target::find_target(
         server,
         player,
+        scan,
         wanted,
         &rules,
+        center,
         radius,
         state.max_target_level_gap,
         now,
     )
 }
 
-/// Walks toward `(x, y)` until `range`; `false` when the walk could not even be started.
+/// What one call of [`approach`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Approach {
+    /// Standing within `range` with no walk running: the action can happen now.
+    InRange,
+    /// A walk is running (or was just started).
+    Walking,
+    /// The last walk to this target failed (unreachable / stuck / timed out).
+    Failed,
+}
+
+/// Walks toward `(x, y)` until `range`. The outcome of the started walk is read back on a later
+/// think, so a failed plan is reported once ([`Approach::Failed`]) instead of being replanned
+/// every tick.
 #[allow(clippy::too_many_arguments)]
-fn approach(
+async fn approach(
     bot: &Arc<BotSession>,
     server: &Arc<GameServer>,
     state: &mut CombatState,
@@ -574,22 +699,29 @@ fn approach(
     x: f32,
     y: f32,
     range: f32,
-) -> bool {
+) -> Approach {
     let (px, py, pz) = me_pos(player);
     if dist2(px, py, x, y) <= range.max(1.0) && !bot.walking() {
-        return true;
+        state.approach_walk = None;
+        return Approach::InRange;
     }
     if bot.walking() {
         // Let the running walk finish (it ends within `range` of where the target stood); the
         // next think re-evaluates the target's new position. Restarting on every small move
         // cancels the walk continuously and the bot never arrives.
-        return true;
+        return Approach::Walking;
+    }
+    if let Some((generation, walked_to)) = state.approach_walk.take() {
+        if walked_to == obj_id && bot.walk_failed(generation).await {
+            return Approach::Failed;
+        }
     }
     let z = aaemu_game::systems::ai::nav::NavView::of_object(server, &WorldObject::from(player))
         .and_then(|v| v.terrain_height(x, y).or_else(|| v.height(x, y)))
         .unwrap_or(pz);
     state.walk_to = Some((x, y));
     let _ = bot.start_goto(server, Vec3::new(x, y, z), range.max(1.0));
+    state.approach_walk = Some((bot.nav_generation(), obj_id));
     tracing::trace!(
         character = %bot.name,
         target = obj_id,
@@ -598,7 +730,7 @@ fn approach(
         range,
         "Bots: approaching"
     );
-    true
+    Approach::Walking
 }
 
 /// Runs from `attacker` and records the danger mark (the nav danger index's mark).
@@ -682,11 +814,19 @@ async fn loot_step(
         return false;
     }
     let (x, y) = loot::corpse_position(server, corpse).expect("checked above");
-    if !approach(bot, server, state, player, corpse, x, y, LOOT_DISTANCE_M) && !bot.walking() {
-        state.loot_target = None;
-        return false;
+    match approach(bot, server, state, player, corpse, x, y, LOOT_DISTANCE_M).await {
+        Approach::InRange | Approach::Walking => true,
+        Approach::Failed => {
+            // The corpse cannot be walked to: give it up instead of replanning the same walk.
+            tracing::info!(
+                character = %bot.name,
+                corpse,
+                "Bots: corpse unreachable, skipping the loot"
+            );
+            state.loot_target = None;
+            false
+        }
     }
-    true
 }
 
 /// Resting with nothing to do: a grind walks to a new spot inside its radius now and then.
@@ -780,21 +920,23 @@ async fn handle_dead(
     Duration::from_secs(1)
 }
 
-/// Uses a heal skill or a healing potion when hurt below `heal_at`. `true` when it cast.
+/// Uses one heal skill or healing potion when hurt below `heal_at`. The same gate and refusal
+/// back-off as every other cast apply, and at most one `CSStartSkill` leaves per think: `Some`
+/// means an attempt was made (whatever its outcome), `None` that no option was tried.
 async fn heal_if_hurt(
     bot: &Arc<BotSession>,
     server: &Arc<GameServer>,
     state: &mut CombatState,
     player: &PlayerRef,
     now: i64,
-) -> bool {
+) -> Option<CastOutcome> {
     let (hp, ..) = survival::vitals(player);
     if hp >= state.heal_at || now - state.last_cast_ms < CAST_SPACING_MS {
-        return false;
+        return None;
     }
     let cs = cast_state(player);
     if cs.casting {
-        return false;
+        return None;
     }
     let me = WorldObject::from(player);
     let sig = state.loadout_signature(player);
@@ -807,11 +949,12 @@ async fn heal_if_hurt(
     for (item_id, template_id, use_skill) in skills::healing_items(server, state, player) {
         options.push((use_skill, Some((item_id, template_id))));
     }
-    if options.is_empty() {
-        return false;
-    }
     for (id, item) in options {
         if state.dropped.get(&id) == Some(&sig) || state.never.contains(&(id, 0)) {
+            continue;
+        }
+        // A heal the server refused on this spot / loadout is backed off like any other cast.
+        if cast::refused(state, player, id, player.obj_id, now) {
             continue;
         }
         let Some(template) = server.game_data.systems.skills.skill(id).cloned() else {
@@ -856,10 +999,11 @@ async fn heal_if_hurt(
         };
         if outcome == CastOutcome::Started {
             tracing::debug!(character = %bot.name, skill = id, "Bots: healed");
-            return true;
         }
+        // One attempt per think, whatever its outcome (a refusal already backed the skill off).
+        return Some(outcome);
     }
-    false
+    None
 }
 
 #[cfg(test)]
@@ -873,6 +1017,25 @@ mod state_tests {
         assert!(state.rest_until() >= REST_UNTIL);
         assert_eq!(state.kills, 0);
         assert_eq!(state.base_tick, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn a_target_waited_at_too_long_is_given_up() {
+        let mut state = CombatState::default();
+        let now = 50_000;
+        assert!(
+            !wait_expired(&mut state, 7, now),
+            "the first wait starts it"
+        );
+        assert!(!wait_expired(&mut state, 7, now + 1_000));
+        assert!(
+            wait_expired(&mut state, 7, now + WAIT_GIVE_UP_MS),
+            "the give-up window is bounded"
+        );
+        assert!(
+            !wait_expired(&mut state, 8, now),
+            "another target starts over"
+        );
     }
 
     #[test]

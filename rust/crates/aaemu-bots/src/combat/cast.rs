@@ -2,12 +2,13 @@
 //! `CSStartSkillPacket` through the bot's socketless connection, and read the server's answer
 //! from its own unit state plus the `SCSkillStarted` / `SCSkillFired` / `SCSkillEnded` frames.
 //!
-//! A cast is *taken* when the server changed one of the marks a use leaves on the unit
-//! (`skill_last_used_ms`, the global cooldown, the skill cooldown, a cast task, the auto-attack
-//! slot). When nothing changed the server refused it (its `start_skill` returns before any cast
-//! state is touched); the skill is then backed off for this target, position and loadout so a
-//! refusal can never become a tight retry loop. The server's quiet `precheck` runs before every
-//! cast, so a refusal normally means a divergence worth a log line.
+//! A cast is *taken* when the server's `SCSkillStarted` answer carries `Success`; the unit
+//! marks a use leaves (`skill_last_used_ms`, the cooldowns, the cast task, the auto-attack
+//! slot) are only the fallback for an instant success, which is answered without a
+//! `SCSkillStarted` frame. A refusal carries its result byte; the skill is then backed off for
+//! this target, position and loadout so a refusal can never become a tight retry loop. The
+//! server's quiet `precheck` runs before every cast, so a refusal normally means a divergence
+//! worth a log line.
 
 use std::sync::Arc;
 
@@ -46,6 +47,17 @@ impl RefusalKey {
     pub fn matches(&self, target: u32, cell: (i32, i32), loadout: u64, now: i64) -> bool {
         now < self.until && self.target == target && self.cell == cell && self.loadout == loadout
     }
+}
+
+/// Is `skill` still backed off for this target from the bot's 2 m cell with its loadout?
+pub fn refused(state: &CombatState, player: &PlayerRef, skill: u32, target: u32, now: i64) -> bool {
+    let t = player.data().unit.transform;
+    let cell = ((t.x / 2.0).floor() as i32, (t.y / 2.0).floor() as i32);
+    let sig = state.loadout_signature(player);
+    state
+        .refused_on
+        .get(&skill)
+        .is_some_and(|r| r.matches(target, cell, sig, now))
 }
 
 /// What a cast attempt did.
@@ -172,14 +184,21 @@ pub async fn cast(
         flag: 0,
         skill_object: SkillObject::None,
     };
-    let _ = bot.dispatch(server, packet).await;
+    if bot.dispatch(server, packet).await.is_ok() {
+        state.casts_this_think += 1;
+    }
     state.last_cast_ms = now;
     let after = cast_marks(&player, skill_id);
     let frames = bot.drain_replies().await;
     let replies = CastReplies::of(&frames);
-    // A refused cast also writes an `SCSkillStarted` (carrying the result), so only the unit
-    // marks say whether the server took it.
-    let took = after != before;
+    let result = cast_result(&frames);
+    // The result byte of the server's answer is authoritative: a refusal carries it, a cast
+    // with a cast time succeeds without one. Only an instant cast answered without any
+    // `SCSkillStarted` frame (`None`) falls back to the marks a use leaves on the unit.
+    let took = match result {
+        Some(result) => result == skill_result::SUCCESS,
+        None => after != before,
+    };
     if took {
         state.casts_started += 1;
         state.last_cast_skill = skill_id;
@@ -198,7 +217,6 @@ pub async fn cast(
         let _ = (x, y);
         CastOutcome::Started
     } else {
-        let result = cast_result(&frames);
         match result {
             Some(result)
                 if result == skill_result::TOO_FAR_RANGE

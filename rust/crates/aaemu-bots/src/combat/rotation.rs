@@ -4,8 +4,9 @@
 //! A rule passes when its condition tree passes against the bot, its target and the world the
 //! server exposes (buff tags, range, cooldown state, enemies around, HP / mana). Among the
 //! passing rules the highest `relevance` band wins, then the rule order; inside a rule the first
-//! action the server would take now is cast. A heal rule (`ally_hp_below`, `self_hp_below` with
-//! a healing skill) casts on the bot; damage and control rules cast on the target. `fillers`
+//! action the server would take now is cast. The skill's own target type decides who it is cast
+//! on: only hostile-target skills go to the monster (a damage+heal skill like Antithesis stays
+//! hostile); self and friendly skills go on the bot, the only ally a solo bot has. `fillers`
 //! are the research's default buttons, tried before the data scoring.
 //!
 //! Rules are draft data: a rule that the server's checks refuse is skipped (and the skill is
@@ -16,9 +17,9 @@ use std::collections::{HashMap, HashSet};
 
 use aaemu_game::server::GameServer;
 use aaemu_game::systems::skills::buffs;
-use aaemu_game::world::{PlayerRef, WorldObject};
+use aaemu_game::world::{NpcRef, PlayerRef, WorldObject};
 
-use super::skills::{cast_state, off_cooldown, skill_gate, SkillBlock, SkillKind, DEFAULT_ATTACKS};
+use super::skills::{cast_state, off_cooldown, skill_gate, SkillBlock, DEFAULT_ATTACKS};
 use super::target::{dist2, enemies_within, me_pos};
 use super::CombatState;
 use crate::rotation::{Action, Condition};
@@ -31,6 +32,8 @@ struct Context<'a> {
     dist: f32,
     now: i64,
     learned: &'a HashSet<u32>,
+    /// The think's one neighbourhood scan (the enemy counts of the rules).
+    all: &'a [NpcRef],
     cs: super::skills::CastState,
     enemies: RefCell<HashMap<u32, usize>>,
 }
@@ -58,9 +61,14 @@ impl Context<'_> {
         if let Some(n) = self.enemies.borrow().get(&radius) {
             return *n;
         }
-        let n = enemies_within(self.server, self.player, radius as f32);
+        let n = enemies_within(self.server, self.all, self.player, radius as f32);
         self.enemies.borrow_mut().insert(radius, n);
         n
+    }
+
+    fn ability_active(&self, ability: u8) -> bool {
+        let c = self.player.data();
+        [c.ability1, c.ability2, c.ability3].contains(&ability)
     }
 
     fn matches(&self, condition: &Condition) -> bool {
@@ -121,55 +129,41 @@ impl Context<'_> {
     }
 }
 
-/// Does the rule's condition tree want a heal on the bot rather than a hostile action?
-fn rule_heals_self(condition: &Condition) -> bool {
-    match condition {
-        Condition::AllyHpBelow { .. } | Condition::SelfHpBelow { .. } => true,
-        Condition::All { all } => all.iter().any(rule_heals_self),
-        Condition::Any { any } => any.iter().any(rule_heals_self),
-        Condition::Not { not } => rule_heals_self(not),
-        _ => false,
-    }
-}
-
 /// The first action of `actions` the server would take now, and whether it targets the bot.
+///
+/// The skill's own `target_type` decides the target: a hostile-target skill (a damage skill,
+/// even one that also heals, like Antithesis) goes to the monster; self and friendly skills go
+/// on the bot. The same loadout signature, refusal back-off and active-skillset filter as the
+/// data scoring apply, so the two paths cannot disagree about a skill being usable.
 fn first_castable(
     context: &mut Context<'_>,
     state: &mut CombatState,
     actions: &[Action],
-    heal_self: bool,
 ) -> Option<(u32, bool)> {
     for action in actions {
-        let Some(info) = state.info(context.server, action.skill) else {
+        if state.info(context.server, action.skill).is_none() {
             continue;
-        };
+        }
         if !context.learned.contains(&action.skill) && !DEFAULT_ATTACKS.contains(&action.skill) {
             continue;
         }
-        let self_target = if info.heals && heal_self {
-            true
-        } else {
-            matches!(info.kind, SkillKind::SelfBuff | SkillKind::Support)
-        };
+        let sig = state.loadout_signature(context.player);
         if state
             .never
             .contains(&(action.skill, target_template(context.target)))
-            || state.dropped.contains_key(&action.skill)
+            || state.dropped.get(&action.skill).is_some_and(|s| *s == sig)
         {
             continue;
         }
-        let (bx, by, _) = me_pos(context.player);
-        let cell = ((bx / 2.0).floor() as i32, (by / 2.0).floor() as i32);
-        let sig = state.loadout_signature(context.player);
-        if state
-            .refused_on
-            .get(&action.skill)
-            .is_some_and(|r| r.matches(context.target.obj_id(), cell, sig, context.now))
-        {
+        if super::cast::refused(
+            state,
+            context.player,
+            action.skill,
+            context.target.obj_id(),
+            context.now,
+        ) {
             continue;
         }
-        let me = WorldObject::from(context.player);
-        let target = if self_target { &me } else { context.target };
         let Some(template) = context
             .server
             .game_data
@@ -180,6 +174,12 @@ fn first_castable(
         else {
             continue;
         };
+        if template.ability_id != 0 && !context.ability_active(template.ability_id) {
+            continue;
+        }
+        let self_target = !matches!(template.target_type, 4 | 5);
+        let me = WorldObject::from(context.player);
+        let target = if self_target { &me } else { context.target };
         match skill_gate(
             context.server,
             context.player,
@@ -203,6 +203,7 @@ fn target_template(target: &WorldObject) -> u32 {
 }
 
 /// The best cast from the rotation, or `None` when no rule or filler yields one.
+#[allow(clippy::too_many_arguments)]
 pub fn choose_rotation(
     server: &GameServer,
     player: &PlayerRef,
@@ -210,6 +211,7 @@ pub fn choose_rotation(
     target: &WorldObject,
     dist: f32,
     now: i64,
+    all: &[NpcRef],
 ) -> Option<(u32, bool)> {
     let rotation = state.rotation.clone()?;
     let learned = super::skills::learned(player);
@@ -220,6 +222,7 @@ pub fn choose_rotation(
         dist,
         now,
         learned: &learned,
+        all,
         cs: cast_state(player),
         enemies: RefCell::new(HashMap::new()),
     };
@@ -229,12 +232,11 @@ pub fn choose_rotation(
         if !context.matches(&rule.when) {
             continue;
         }
-        let heal_self = rule_heals_self(&rule.when);
-        if let Some(cast) = first_castable(&mut context, state, &rule.then, heal_self) {
+        if let Some(cast) = first_castable(&mut context, state, &rule.then) {
             return Some(cast);
         }
     }
-    first_castable(&mut context, state, &rotation.fillers, true)
+    first_castable(&mut context, state, &rotation.fillers)
 }
 
 /// The distance from the bot to `target` (x/y).
@@ -266,15 +268,5 @@ mod tests {
             panic!("all");
         };
         assert_eq!(all.len(), 2);
-    }
-
-    #[test]
-    fn heal_rules_are_detected_through_all_and_not() {
-        let r = rule(
-            r#"{"id":"h","when":{"all":[{"ally_hp_below":[90,30]},{"not":{"out_of_combat":true}}]},"then":[{"skill":10534}]}"#,
-        );
-        assert!(rule_heals_self(&r.when));
-        let d = rule(r#"{"id":"d","when":{"target_has_tag":107},"then":[{"skill":18132}]}"#);
-        assert!(!rule_heals_self(&d.when));
     }
 }

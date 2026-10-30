@@ -11,7 +11,9 @@ use aaemu_game::models::character::Character;
 use aaemu_game::server::GameServer;
 use aaemu_game::world::PlayerRef;
 
-use super::target::{dist2, hostiles_near, me_pos, HOSTILE_NEAR_CORPSE_M};
+use aaemu_game::world::NpcRef;
+
+use super::target::{dist2, hostiles_near, me_pos, scan_npcs, HOSTILE_NEAR_CORPSE_M};
 use super::CombatState;
 
 /// A bot starts resting below this fraction of hit points / mana ...
@@ -60,10 +62,19 @@ pub fn vitals(player: &PlayerRef) -> (f32, f32, bool) {
 }
 
 /// Updates the resting flag: below `rest_below` out of combat the bot rests until
-/// [`CombatState::rest_until`]. Returns `true` while it rests.
-pub fn update_rest(player: &PlayerRef, state: &mut CombatState) -> bool {
+/// [`CombatState::rest_until`]; a monster that attacks it breaks the rest at once (a resting
+/// bot that is hit fights back instead of sitting through the next 2 s tick). Returns `true`
+/// while it rests.
+pub fn update_rest(player: &PlayerRef, state: &mut CombatState, attacked: bool) -> bool {
     let (hp, mp, in_battle) = vitals(player);
     let low = hp.min(mp);
+    if attacked {
+        if state.resting {
+            tracing::debug!(target: "bots", "Bots: rest interrupted by an attacker");
+        }
+        state.resting = false;
+        return false;
+    }
     if state.resting {
         if low >= state.rest_until() {
             state.resting = false;
@@ -168,7 +179,8 @@ pub fn revive_choice(
         (c.skill_char.resurrect_offer, c.unit.level)
     };
     let gap = state.max_target_level_gap;
-    let near = hostiles_near(server, player, HOSTILE_NEAR_CORPSE_M);
+    let scan = scan_npcs(server, player, HOSTILE_NEAR_CORPSE_M);
+    let near = hostiles_near(server, &scan, player, HOSTILE_NEAR_CORPSE_M);
     let killer = state.last_attacker;
     let killer_alive_near = killer.is_some_and(|k| near.iter().any(|v| v.obj_id == k.obj_id));
     choose_revive(
@@ -203,17 +215,18 @@ pub fn note_attacker(state: &mut CombatState, view: super::target::NpcView, now:
 /// A hostile monster within the aggro radius that is above the level gap (or a pack the bot
 /// cannot survive): what it flees from.
 pub fn threat_to_flee(
-    server: &GameServer,
+    all: &[NpcRef],
     player: &PlayerRef,
     state: &mut CombatState,
     now: i64,
+    attacker: Option<super::target::NpcView>,
 ) -> Option<super::target::NpcView> {
     let (hp, _, _) = vitals(player);
-    let attacker = super::target::find_attacker(server, player)?;
+    let attacker = attacker?;
     note_attacker(state, attacker, now);
     let my_level = player.data().unit.level;
     let too_strong = attacker.level > my_level.saturating_add(state.max_target_level_gap);
-    let losing = hp < LOSING_BELOW && super::target::attackers_on_me(server, player) > 1;
+    let losing = hp < LOSING_BELOW && super::target::attackers_on_me(all, player) > 1;
     (too_strong || losing).then_some(attacker)
 }
 
