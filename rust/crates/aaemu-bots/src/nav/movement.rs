@@ -476,7 +476,7 @@ async fn walk(
             return NavOutcome::Failed(NavFailure::Unreachable(reason));
         }
     };
-    let deadline = walk_deadline(&plan, start, run_speed);
+    let deadline = bot.cap_walk_deadline(walk_deadline(&plan, start, run_speed));
     let mut walker = RouteWalker::new(world, plan, final_target, radius);
     walker.set_speeds(run_speed, swim_speed);
     let mut jump: Option<JumpState> = None;

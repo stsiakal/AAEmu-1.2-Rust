@@ -676,3 +676,90 @@ fn a_road_further_than_the_access_limit_is_not_used() {
     let graph = nav::RoadGraph::from_roads([vec![at(0.0, 0.0), at(100.0, 0.0)]]);
     assert!(graph.route(at(0.0, 200.0), at(100.0, 0.0)).is_none());
 }
+
+/// Two roads between the same ends: the straight one (y = 0) crosses a wall at x = 500, the
+/// longer one runs along y = 50 and is clean.
+struct TwoRoads {
+    graph: nav::RoadGraph,
+}
+
+impl TwoRoads {
+    fn new() -> Self {
+        let line = |from: (f32, f32), to: (f32, f32)| -> Vec<Vec3> {
+            let n = (((to.0 - from.0).powi(2) + (to.1 - from.1).powi(2)).sqrt() / 50.0).ceil();
+            (0..=n as usize)
+                .map(|i| {
+                    let t = i as f32 / n;
+                    at(from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t)
+                })
+                .collect()
+        };
+        let straight = line((10.0, 0.0), (990.0, 0.0));
+        let mut detour = line((10.0, 0.0), (10.0, 50.0));
+        detour.extend(line((10.0, 50.0), (990.0, 50.0)).into_iter().skip(1));
+        detour.extend(line((990.0, 50.0), (990.0, 0.0)).into_iter().skip(1));
+        Self {
+            graph: nav::RoadGraph::from_roads([straight, detour]),
+        }
+    }
+}
+
+impl NavWorld for TwoRoads {
+    fn height(&self, _x: f32, _y: f32) -> Option<f32> {
+        Some(100.0)
+    }
+    fn road_route(&self, from: Vec3, to: Vec3) -> Option<Vec<Vec3>> {
+        self.graph.route(from, to)
+    }
+    fn road_route_avoiding(
+        &self,
+        from: Vec3,
+        to: Vec3,
+        banned: &[(Vec3, Vec3)],
+        budget: &mut nav::PlanBudget,
+    ) -> Option<Vec<Vec3>> {
+        self.graph.route_avoiding(from, to, banned, budget)
+    }
+    fn obstacle(&self, from: Vec3, to: Vec3) -> Option<Obstacle> {
+        let crosses = (from.x < 500.0) != (to.x < 500.0);
+        (crosses && from.y.abs() < 25.0 && to.y.abs() < 25.0).then_some(Obstacle::High(3.0))
+    }
+}
+
+#[test]
+fn a_rejected_road_edge_is_dropped_and_the_clean_road_is_used() {
+    let world = TwoRoads::new();
+    let report = nav::plan_explain(&world, at(10.0, 5.0), at(990.0, 5.0));
+    let plan = report
+        .plan
+        .unwrap_or_else(|| panic!("no plan: {:?}", report.notes));
+    assert_eq!(plan.source, "roads", "{:?}", report.notes);
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.contains("roads: segment rejected")),
+        "the walled edge was never tried: {:?}",
+        report.notes
+    );
+    // Nothing on the plan crosses the wall: the walk went by the y = 50 road.
+    assert!(
+        plan.points.iter().any(|p| (p.y - 50.0).abs() < 1.0),
+        "{:?}",
+        plan.points
+    );
+}
+
+#[test]
+fn the_plan_budget_reads_the_clock_after_a_large_charge() {
+    // A grid prefill charges hundreds of thousands of cells in one call: a count that is not
+    // a multiple of the clock batch must still read the clock.
+    let mut budget = nav::PlanBudget::with_limits(usize::MAX, 1);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    assert!(!budget.charge(1_000), "the elapsed deadline was not seen");
+    assert!(budget.stopped());
+    let mut budget = nav::PlanBudget::with_limits(usize::MAX, 60_000);
+    for _ in 0..200 {
+        assert!(budget.charge(37));
+    }
+}

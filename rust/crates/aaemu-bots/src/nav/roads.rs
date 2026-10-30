@@ -261,6 +261,18 @@ impl RoadGraph {
         to: Vec3,
         budget: &mut super::PlanBudget,
     ) -> Option<Vec<Vec3>> {
+        self.route_avoiding(from, to, &[], budget)
+    }
+
+    /// [`RoadGraph::route_budget`] without the `banned` edges (pairs of node positions, either
+    /// direction): the planner drops the edges its terrain check rejected and asks again.
+    pub fn route_avoiding(
+        &self,
+        from: Vec3,
+        to: Vec3,
+        banned: &[(Vec3, Vec3)],
+        budget: &mut super::PlanBudget,
+    ) -> Option<Vec<Vec3>> {
         if self.is_empty() {
             return None;
         }
@@ -310,6 +322,10 @@ impl RoadGraph {
                 if closed[next] {
                     continue;
                 }
+                if !banned.is_empty() && is_banned(banned, self.points[current], self.points[next])
+                {
+                    continue;
+                }
                 let ng = g[current] + len;
                 if ng + 1e-4 < g[next] {
                     g[next] = ng;
@@ -355,6 +371,14 @@ impl RoadGraphCache {
             .get_or_init(|| RoadGraph::from_server(server, template_id).map(Arc::new))
             .clone()
     }
+}
+
+/// Is the edge `a`-`b` one of the `banned` ones (node positions come from this graph, so they
+/// compare exactly)?
+fn is_banned(banned: &[(Vec3, Vec3)], a: Vec3, b: Vec3) -> bool {
+    banned
+        .iter()
+        .any(|&(x, y)| (x == a && y == b) || (x == b && y == a))
 }
 
 /// A road edge between two consecutive polyline points, or why it is rejected.

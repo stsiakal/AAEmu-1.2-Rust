@@ -244,3 +244,26 @@ async fn a_teleported_bot_stops_its_walk() {
         "{outcome:?}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_walk_that_outlasts_its_deadline_times_out() {
+    let server = nav_server();
+    let bot = bot_at(&server, 2, "Walker", 100.0, 100.0).await;
+    // 300 m take about a minute: the capped deadline ends the walk part of the way.
+    bot.set_walk_deadline_cap(Duration::from_millis(900));
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        bot.goto(&server, Vec3::new(400.0, 100.0, SURFACE), 1.0),
+    )
+    .await
+    .expect("the walk ended");
+    assert_eq!(
+        outcome,
+        NavOutcome::Failed(crate::nav::movement::NavFailure::Timeout)
+    );
+    let (x, _, _) = position(&server, 2);
+    assert!(
+        x > 101.0 && x < 390.0,
+        "the bot walked part of the way: {x}"
+    );
+}

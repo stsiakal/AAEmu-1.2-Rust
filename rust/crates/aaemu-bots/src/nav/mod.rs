@@ -75,6 +75,10 @@ pub const PLAN_MAX_MS: u64 = 5_000;
 /// Cells one height grid may allocate (`heights`, water cache, g / parent / closed): about 7 MB
 /// per plan at 400k cells, so four concurrent plans stay small.
 pub const MAX_GRID_CELLS: usize = 400_000;
+/// Work units between two reads of the plan clock (and yields of the planner thread).
+const CLOCK_BATCH: usize = 64;
+/// Times the road planner drops a rejected road edge and asks the road A* again.
+const MAX_ROAD_RETRIES: usize = 3;
 /// Concurrent plans allowed by default (configurable through `Bots.PlanConcurrency`).
 pub const DEFAULT_PLAN_CONCURRENCY: usize = 4;
 
@@ -135,6 +139,8 @@ impl PlanCancel {
 pub struct PlanBudget {
     max_nodes: usize,
     expanded: usize,
+    /// Work units since the clock was last read (the clock is read every [`CLOCK_BATCH`]).
+    since_clock: usize,
     deadline: std::time::Instant,
     max_ms: u64,
     stopped: bool,
@@ -150,6 +156,7 @@ impl PlanBudget {
         Self {
             max_nodes,
             expanded: 0,
+            since_clock: 0,
             deadline: std::time::Instant::now() + std::time::Duration::from_millis(max_ms),
             max_ms,
             stopped: false,
@@ -184,9 +191,13 @@ impl PlanBudget {
             self.stopped = true;
             return false;
         }
-        // The clock is read in batches; the node cap above is exact, and a batch is small
-        // enough that the wall-clock limit is effectively hard.
-        if self.expanded.is_multiple_of(64) {
+        // The clock is read once per `CLOCK_BATCH` units of work however the units arrive (a
+        // single `charge(n)` of a whole grid counts as many batches): the node cap above is
+        // exact and the wall-clock limit is hard to within one batch of queries. The yield
+        // between batches releases the collision lock to the players' and NPCs' own queries.
+        self.since_clock = self.since_clock.saturating_add(units);
+        if self.since_clock >= CLOCK_BATCH {
+            self.since_clock = 0;
             std::thread::yield_now();
             if self.deadline.elapsed().as_millis() as u64 > self.max_ms {
                 self.stopped = true;
@@ -308,6 +319,22 @@ pub trait NavWorld: Send + Sync {
         }
         self.road_route(from, to)
     }
+    /// [`NavWorld::road_route_budget`] without the `banned` road edges (pairs of road node
+    /// positions, either direction): the planner drops the edges its terrain check rejected
+    /// and asks again. Worlds that cannot ban an edge answer the unbanned query only.
+    fn road_route_avoiding(
+        &self,
+        from: Vec3,
+        to: Vec3,
+        banned: &[(Vec3, Vec3)],
+        budget: &mut PlanBudget,
+    ) -> Option<Vec<Vec3>> {
+        if banned.is_empty() {
+            self.road_route_budget(from, to, budget)
+        } else {
+            None
+        }
+    }
     /// The static obstacle crossed by the straight segment, if any.
     fn obstacle(&self, from: Vec3, to: Vec3) -> Option<Obstacle> {
         let _ = (from, to);
@@ -368,6 +395,16 @@ impl NavWorld for Avoid {
         self.world.road_route_budget(from, to, budget)
     }
 
+    fn road_route_avoiding(
+        &self,
+        from: Vec3,
+        to: Vec3,
+        banned: &[(Vec3, Vec3)],
+        budget: &mut PlanBudget,
+    ) -> Option<Vec<Vec3>> {
+        self.world.road_route_avoiding(from, to, banned, budget)
+    }
+
     fn obstacle(&self, from: Vec3, to: Vec3) -> Option<Obstacle> {
         for spot in &self.spots {
             if !segment_near((from.x, from.y), (to.x, to.y), *spot, self.radius) {
@@ -415,6 +452,16 @@ impl NavWorld for Retrace<'_> {
         budget: &mut PlanBudget,
     ) -> Option<Vec<Vec3>> {
         self.0.road_route_budget(from, to, budget)
+    }
+
+    fn road_route_avoiding(
+        &self,
+        from: Vec3,
+        to: Vec3,
+        banned: &[(Vec3, Vec3)],
+        budget: &mut PlanBudget,
+    ) -> Option<Vec<Vec3>> {
+        self.0.road_route_avoiding(from, to, banned, budget)
     }
 
     fn jump_clear(&self, from: Vec3, to: Vec3) -> Option<bool> {
@@ -542,10 +589,25 @@ fn plan_inner(
     }
     // Beyond the navmesh range the transfer-road graph gives the long middle of the route.
     if dist > NAV_DIRECT_MAX_M {
-        if let Some(roads) = world.road_route_budget(from, to, budget) {
+        // A road edge the terrain / obstacle check rejects is dropped and the road A* asked
+        // again (a few times): one bad edge does not cost the rest of the network.
+        let mut banned: Vec<(Vec3, Vec3)> = Vec::new();
+        for _ in 0..=MAX_ROAD_RETRIES {
+            let Some(roads) = world.road_route_avoiding(from, to, &banned, budget) else {
+                break;
+            };
             match plan_road_route(world, from, to, &roads, budget) {
                 Ok(plan) => return Some(plan),
-                Err(why) => notes.push(why),
+                Err((why, bad_edge)) => {
+                    notes.push(why);
+                    match bad_edge {
+                        Some(edge) => banned.push(edge),
+                        None => break,
+                    }
+                }
+            }
+            if budget.stopped() {
+                return None;
             }
         }
     }
@@ -714,41 +776,49 @@ fn plan_road_route(
     to: Vec3,
     roads: &[Vec3],
     budget: &mut PlanBudget,
-) -> Result<Plan, String> {
+) -> Result<Plan, (String, Option<(Vec3, Vec3)>)> {
     let (Some(&first), Some(&last)) = (roads.first(), roads.last()) else {
-        return Err("roads: empty route".into());
+        return Err(("roads: empty route".into(), None));
     };
     // Both ends must be close to the network and the road itself must not be a long detour
     // compared with walking straight (a 1 km snap made "roads" win over every other planner).
     let access = dist2(from, first) + dist2(last, to);
     if dist2(from, first) > roads::MAX_SNAP_M || dist2(last, to) > roads::MAX_SNAP_M {
-        return Err(format!(
-            "roads: access legs too long ({:.0} m / {:.0} m)",
-            dist2(from, first),
-            dist2(last, to)
+        return Err((
+            format!(
+                "roads: access legs too long ({:.0} m / {:.0} m)",
+                dist2(from, first),
+                dist2(last, to)
+            ),
+            None,
         ));
     }
-    let mut road_len = 0.0f32;
-    let mut prev = first;
-    for p in roads.iter().skip(1) {
-        segment_check_coarse(world, prev, *p, budget)
-            .map_err(|why| format!("roads: segment rejected: {why}"))?;
-        road_len += dist3(prev, *p);
-        prev = *p;
-    }
+    // The detour test needs no collision query: it runs before the segment checks.
+    let road_len: f32 = roads.windows(2).map(|pair| dist3(pair[0], pair[1])).sum();
     let straight = dist3(from, to).max(1.0);
     if road_len > 1.5 * straight + access {
-        return Err(format!(
-            "roads: detour {road_len:.0} m for a {straight:.0} m trip"
+        return Err((
+            format!("roads: detour {road_len:.0} m for a {straight:.0} m trip"),
+            None,
         ));
     }
+    let mut prev = first;
+    for p in roads.iter().skip(1) {
+        if let Err(why) = segment_check_coarse(world, prev, *p, budget) {
+            // An edge the budget cut short is not the edge's fault: only a real rejection
+            // drops it from the network.
+            let edge = (!budget.stopped()).then_some((prev, *p));
+            return Err((format!("roads: segment rejected: {why}"), edge));
+        }
+        prev = *p;
+    }
     if budget.stopped() {
-        return Err("roads: plan budget exhausted".into());
+        return Err(("roads: plan budget exhausted".into(), None));
     }
     let head = plan_leg(world, from, first, budget)
-        .ok_or_else(|| "roads: no first leg to the road network".to_string())?;
+        .ok_or_else(|| ("roads: no first leg to the road network".to_string(), None))?;
     let tail = plan_leg(world, last, to, budget)
-        .ok_or_else(|| "roads: no last leg from the road network".to_string())?;
+        .ok_or_else(|| ("roads: no last leg from the road network".to_string(), None))?;
     let mut points = head;
     points.extend(roads.iter().skip(1).copied());
     points.extend(tail);
@@ -1498,10 +1568,20 @@ impl NavWorld for GameNav<'_> {
         to: Vec3,
         budget: &mut PlanBudget,
     ) -> Option<Vec<Vec3>> {
+        self.road_route_avoiding(from, to, &[], budget)
+    }
+
+    fn road_route_avoiding(
+        &self,
+        from: Vec3,
+        to: Vec3,
+        banned: &[(Vec3, Vec3)],
+        budget: &mut PlanBudget,
+    ) -> Option<Vec<Vec3>> {
         let graph = self
             .roads?
             .get(self.view.server(), self.view.template_id())?;
-        graph.route_budget(from, to, budget)
+        graph.route_avoiding(from, to, banned, budget)
     }
 
     fn obstacle(&self, from: Vec3, to: Vec3) -> Option<Obstacle> {
@@ -1618,6 +1698,17 @@ impl NavWorld for OwnedGameNav {
     ) -> Option<Vec<Vec3>> {
         GameNav::of_player(&self.server, &self.player, Some(&self.roads))?
             .road_route_budget(from, to, budget)
+    }
+
+    fn road_route_avoiding(
+        &self,
+        from: Vec3,
+        to: Vec3,
+        banned: &[(Vec3, Vec3)],
+        budget: &mut PlanBudget,
+    ) -> Option<Vec<Vec3>> {
+        GameNav::of_player(&self.server, &self.player, Some(&self.roads))?
+            .road_route_avoiding(from, to, banned, budget)
     }
 
     fn obstacle(&self, from: Vec3, to: Vec3) -> Option<Obstacle> {

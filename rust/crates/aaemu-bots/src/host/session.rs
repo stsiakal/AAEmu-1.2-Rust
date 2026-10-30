@@ -35,6 +35,9 @@ pub struct BotSession {
     move_time_ms: AtomicU32,
     /// Places the walker got stuck at (routed around by later plans).
     stuck_spots: Mutex<Vec<(f32, f32)>>,
+    /// Test hook: an upper bound (ms) for the overall walk deadline (`0` = none).
+    #[cfg(test)]
+    walk_deadline_cap_ms: AtomicU64,
 }
 
 impl BotSession {
@@ -52,6 +55,8 @@ impl BotSession {
             plan_gate: OnceLock::new(),
             move_time_ms: AtomicU32::new(aaemu_game::systems::ai::npc::ms_of_day()),
             stuck_spots: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            walk_deadline_cap_ms: AtomicU64::new(0),
         }
     }
 
@@ -100,6 +105,25 @@ impl BotSession {
     pub(crate) fn next_move_time_ms(&self) -> u32 {
         self.move_time_ms
             .fetch_add(STEP_MS as u32, Ordering::Relaxed)
+    }
+
+    /// The overall walk deadline (tests may cap it with [`BotSession::set_walk_deadline_cap`]).
+    pub(crate) fn cap_walk_deadline(&self, deadline: Instant) -> Instant {
+        #[cfg(test)]
+        {
+            let cap = self.walk_deadline_cap_ms.load(Ordering::Relaxed);
+            if cap > 0 {
+                return deadline.min(Instant::now() + Duration::from_millis(cap));
+            }
+        }
+        deadline
+    }
+
+    /// Test hook: no walk of this bot may run longer than `cap`.
+    #[cfg(test)]
+    pub(crate) fn set_walk_deadline_cap(&self, cap: Duration) {
+        self.walk_deadline_cap_ms
+            .store(cap.as_millis() as u64, Ordering::Relaxed);
     }
 
     /// Places the walker got stuck at (bounded; the oldest fall off).
