@@ -2417,9 +2417,7 @@ pub(super) fn validated_summon_placement(
         }
         // The 1.2 land rule has no static ground: the spot sits on the terrain heightfield,
         // and a deck above it is refused later by the line-of-sight ray, not used as the floor.
-        crate::systems::ai::collision::terrain_height_or(server, world.id, p.x, p.y, || {
-            crate::systems::npcs::heightmap::world_height(server, world, p.x, p.y).unwrap_or(p.z)
-        })
+        summon_terrain(server, world, p.x, p.y)
     };
     // The spawn height already carries the ship's waterline offset, so the 1.2 check runs on
     // exactly the transform `create_spawn_committed` places.
@@ -5020,12 +5018,14 @@ mod summon_hull_overlap_tests {
     use aaemu_physics::math::{Quat, Vec3};
     use aaemu_physics::world::World;
 
+    use crate::data::client_files::ClientFileManager;
     use crate::data::items::{ItemTemplate, TemplateKind};
     use crate::models::container::slot_type;
     use crate::models::item::Item;
     use crate::systems::ai::collision::models::{ModelPart, ModelPhys};
     use crate::systems::ai::collision::terrain::tests::Plane;
     use crate::systems::ai::collision::world::{CellContent, StaticInstance};
+    use crate::systems::npcs::heightmap::{HeightmapConfig, HeightmapWorlds};
     use crate::systems::skills::data::SkillTemplate;
     use crate::systems::vehicles::data::{slave_kind, SlaveTemplate};
     use crate::test_support::{spawn_player, test_character, TestClient};
@@ -5033,8 +5033,8 @@ mod summon_hull_overlap_tests {
     use super::{
         create_for_owner, get_active_slave_by_owner_obj_id, hull_clear_at, model_box_clear_at,
         overhead_clear_at, summon_candidate_1_2, summon_candidate_points, summon_model_box,
-        summon_offset_z, summon_placement_clear_1_2, validated_summon_placement, HullEnvelope,
-        HullFootprint, ShipModel,
+        summon_offset_z, summon_placement_clear_1_2, summon_terrain, validated_summon_placement,
+        HullEnvelope, HullFootprint, ShipModel,
     };
     use crate::systems::skills::ext::SummonPlacement;
     use aaemu_commons::PacketStream;
@@ -5297,6 +5297,28 @@ mod summon_hull_overlap_tests {
         )
         .unwrap();
         assert!(!found.is_empty(), "the post intersects the envelope box");
+        assert!(clear(&s));
+    }
+
+    /// The batched query keeps the client's 1.2 hull box exact in every round: a pier half a
+    /// millimetre outside the envelope is not a contact. (The earlier batching grew its first
+    /// box by a millimetre to defeat the identical-box cache and would report this pier.)
+    #[tokio::test]
+    async fn a_pier_half_a_millimetre_outside_the_hull_is_clear() {
+        let s = world(&[(Vec3::new(507.0005, 500.0, 100.0), Vec3::new(2.0, 2.0, 2.0))]);
+        let found = crate::systems::ai::collision::box_obstacles(
+            &s,
+            0,
+            [500.0, 500.0, 100.5],
+            [5.0, 15.0, 2.5],
+            0.0,
+            crate::systems::ai::collision::query::mask::STATIC_TERRAIN,
+        )
+        .unwrap();
+        assert!(
+            found.is_empty(),
+            "the exact envelope stops short of the pier: {found:?}"
+        );
         assert!(clear(&s));
     }
 
@@ -5646,6 +5668,51 @@ mod summon_hull_overlap_tests {
         ));
     }
 
+    /// Without the collision service the client placement's land surface is the same terrain
+    /// helper as every other land path (`summon_terrain`: heightmap, else 0), not the client's
+    /// `z`: the 1.2 rule has no static ground to fall back to.
+    #[tokio::test]
+    async fn a_client_placement_without_collision_uses_the_terrain_fallback() {
+        let s = crate::test_support::test_server_with(land_data());
+        s.config.update(|c| c.physics.enable = false);
+        let files = Arc::new(ClientFileManager::from_sources(
+            &[],
+            std::path::Path::new("."),
+        ));
+        s.systems
+            .npcs
+            .heightmaps
+            .install(Arc::new(HeightmapWorlds::new(
+                files,
+                &s.game_data.worlds,
+                HeightmapConfig {
+                    heightmaps_enable: true,
+                    ..Default::default()
+                },
+            )));
+        let (_client, p) = search_player(&s);
+        // x = -2 makes the heightmap read fail (`x % 1024 / 2 < 0`), so the terrain helper
+        // falls back to 0; the old placement fallback kept the client's z (200).
+        p.data()
+            .unit
+            .transform
+            .set_position(-2.0, 500.0, 200.0, 0.0, 0.0, 0.0);
+        let world = s.world.world(0).unwrap();
+        let placement = SummonPlacement {
+            x: -2.0,
+            y: 530.0,
+            z: 200.0,
+            yaw: 0.0,
+        };
+        let t = validated_summon_placement(&s, &world, &p, &land_template(), Some(placement), 0.0)
+            .expect("placement");
+        assert!(
+            (t.z - summon_terrain(&s, &world, t.x, t.y)).abs() < 1e-4,
+            "the fallback must be the terrain helper: {t:?}"
+        );
+        assert!((t.z - 0.0).abs() < 1e-4, "no heightmap data: {t:?}");
+    }
+
     /// A wall between the player and the spot still refuses the summon.
     #[tokio::test]
     async fn a_wall_between_the_player_and_a_land_spot_refuses() {
@@ -5696,6 +5763,58 @@ mod summon_hull_overlap_tests {
         assert!(result.is_none(), "the deck blocks every candidate's ray");
         assert!(
             s.items.item_by_id(0x9110).is_some(),
+            "a refused summon keeps the item"
+        );
+        let codes: Vec<i16> = client
+            .drain()
+            .iter()
+            .filter(|f| f.0 == crate::opcodes::sc::SCErrorMsgPacket)
+            .map(|f| i16::from_le_bytes([f.1[0], f.1[1]]))
+            .collect();
+        assert!(codes.contains(&100), "{codes:?}");
+    }
+
+    /// The same deck above the terrain refuses a client-supplied `SummonPos`: the 1.2
+    /// placement check's line-of-sight ray hits it (error 100) and the item is not used.
+    #[tokio::test]
+    async fn a_deck_above_the_candidate_terrain_refuses_a_client_placement() {
+        let s = world_on(
+            land_data(),
+            Plane {
+                a: 110.0,
+                b: 0.0,
+                c: 0.0,
+                n: 1024,
+            },
+            &[(
+                Vec3::new(500.0, 515.0, 114.5),
+                Vec3::new(10.0, 25.0, 0.5),
+                false,
+            )],
+        );
+        install_empty_hull_loader(&s);
+        let (mut client, p) = search_player(&s);
+        client.conn.active_char = Some(p.clone());
+        p.data().unit.transform.set_height(115.0);
+        give_summon_item(&s, &p, 0x9210);
+        let placement = SummonPlacement {
+            x: 500.0,
+            y: 530.0,
+            z: 110.0,
+            yaw: 0.0,
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            create_for_owner(&s, &p, 0x9210, RULE_ITEM, false, None, Some(placement), 0.0),
+        )
+        .await
+        .expect("summon job");
+        assert!(
+            result.is_none(),
+            "the deck blocks the client placement's ray"
+        );
+        assert!(
+            s.items.item_by_id(0x9210).is_some(),
             "a refused summon keeps the item"
         );
         let codes: Vec<i16> = client
@@ -6225,6 +6344,66 @@ mod summon_hull_overlap_tests {
             .unwrap() = Some(super::TestPublicationHook(Arc::new(move |_| {
             p.data().unit.transform.rot_z = yaw;
         })));
+    }
+
+    /// Adds a deck above the player and the chosen spot once the item wait is over: the spot
+    /// the search accepted becomes covered while the summon job waits.
+    fn cover_spot_after_item_validation(s: &crate::GameServer) {
+        *s.systems
+            .vehicles
+            .slave_summons
+            .test_after_item_validation
+            .lock()
+            .unwrap() = Some(super::TestPublicationHook(Arc::new(|server| {
+            let pw = crate::systems::ai::collision::phys_world(server, 0).expect("physics world");
+            let mut st = pw.lock();
+            assert!(st
+                .add_static_instance(
+                    &static_box(
+                        Vec3::new(10.0, 25.0, 0.5),
+                        Vec3::new(500.0, 515.0, 114.5),
+                        false,
+                    ),
+                    crate::systems::ai::collision::world::Owner::Brush { cell: (0, 0) },
+                )
+                .is_some());
+        })));
+    }
+
+    /// A deck that appears above the player's chosen spot during the waits is caught by the
+    /// post-wait recheck: the recheck's line-of-sight ray hits it, the rerun search finds no
+    /// candidate either, and the summon refuses with error 100 without using the item.
+    #[tokio::test]
+    async fn a_deck_appearing_after_the_search_refuses_the_post_wait_recheck() {
+        let s = world_at_with(land_data(), 110.0, &[]);
+        install_empty_hull_loader(&s);
+        let (mut client, p) = search_player(&s);
+        client.conn.active_char = Some(p.clone());
+        p.data().unit.transform.set_height(115.0);
+        give_summon_item(&s, &p, 0x9211);
+        p.data().unit.cooldowns.add_cooldown(RULE_SKILL, 10_000, 0);
+        p.data().unit.global_cooldown_ms = 10_000;
+        cover_spot_after_item_validation(&s);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            create_for_owner(&s, &p, 0x9211, RULE_ITEM, false, None, None, 0.0),
+        )
+        .await
+        .expect("summon job");
+        assert!(
+            result.is_none(),
+            "the deck blocks the recheck and the rerun search"
+        );
+        assert!(s.items.item_by_id(0x9211).is_some(), "the item is not used");
+        let codes: Vec<i16> = client
+            .drain()
+            .iter()
+            .filter(|f| f.0 == crate::opcodes::sc::SCErrorMsgPacket)
+            .map(|f| i16::from_le_bytes([f.1[0], f.1[1]]))
+            .collect();
+        assert!(codes.contains(&100), "{codes:?}");
+        assert!(!p.data().unit.cooldowns.cooldowns.contains_key(&RULE_SKILL));
+        assert_eq!(p.data().unit.global_cooldown_ms, 0);
     }
 
     /// A spot chosen before the waits is rechecked at the player's current pose; when it no

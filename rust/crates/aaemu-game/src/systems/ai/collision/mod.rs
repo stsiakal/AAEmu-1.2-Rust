@@ -572,9 +572,10 @@ pub fn overlaps_sphere(
 ///
 /// The physics contact pool holds 64 records (2040 border points) and the engine drops further
 /// parts silently when it is full, so the query repeats with the entities already seen in its
-/// skip list until it is complete (at most [`BOX_OBSTACLE_QUERY_ROUNDS`] rounds). A spot whose
-/// query never completes is reported as blocked, never accepted: the synthetic
-/// [`Owner::Terrain`] entry blocks in every caller.
+/// skip list until it is complete (at most [`BOX_OBSTACLE_QUERY_ROUNDS`] rounds). Every round
+/// invalidates the `GetEntitiesInBox` identical-box cache, so the skip list takes effect while
+/// the queried box stays the exact 1.2 box. A spot whose query never completes is reported as
+/// blocked, never accepted: the synthetic [`Owner::Terrain`] entry blocks in every caller.
 pub fn box_obstacles(
     server: &GameServer,
     instance_id: u32,
@@ -597,13 +598,12 @@ pub fn box_obstacles(
     let mut seen: Vec<aaemu_physics::world::EntIdx> = Vec::new();
     let mut found: Vec<(Owner, [Vec3; 2])> = Vec::new();
     let mut complete = false;
-    for round in 0..BOX_OBSTACLE_QUERY_ROUNDS {
+    for _round in 0..BOX_OBSTACLE_QUERY_ROUNDS {
         // `GetEntitiesInBox` replays its last identical-box list from the per-caller cache, so
-        // the skip list would have no effect on a repeated query. Grow the batch box by a
-        // millimetre per round: every round is a fresh query, and each box contains the
-        // previous one (a conservative superset of the true box, never a smaller one).
-        let grow = BOX_OBSTACLE_QUERY_EPSILON * (round + 1) as f32;
-        let prim = query::yaw_box(c, half + Vec3::splat(grow), yaw);
+        // the skip list would have no effect on a repeated query. Drop that cache entry before
+        // every round (the same invalidation the ray query does), keeping the box exact.
+        st.world.invalidate_box_query_cache();
+        let prim = query::yaw_box(c, half, yaw);
         let (entities, saturated) = st.overlap_entities(prim, ent_types, 0xFFFF_FFFF, &seen);
         let seen_now = entities.len();
         for (e, bb) in entities {
@@ -631,10 +631,6 @@ pub fn box_obstacles(
 /// How many batched overlap queries [`box_obstacles`] may run before it treats a saturated
 /// contact pool as blocking.
 pub const BOX_OBSTACLE_QUERY_ROUNDS: usize = 8;
-
-/// Per-round growth of the batched box (metres): defeats the `GetEntitiesInBox` identical-box
-/// cache while keeping every batch a superset of the real query box.
-const BOX_OBSTACLE_QUERY_EPSILON: f32 = 1e-3;
 
 /// Overlap of a yaw-oriented box with the collision terrain heightfield
 /// (`overlap_box_heightfield`). PWI does not report heightfield contacts, so the 1.2 model-box
