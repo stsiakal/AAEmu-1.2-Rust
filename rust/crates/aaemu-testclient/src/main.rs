@@ -3,7 +3,7 @@
 //! ```text
 //! aaemu-testclient run    [--config F] [--login H:P] [--user U] [--password P] [--character C]
 //!                         [--scenario login|lobby|full|combat|npc-return|mate-revive|questitem|doodad|plant|cometsboon|stonethrow|ghost|lunafrost|portal|craft|load]
-//!                         [--out capture.jsonl]
+//!                         [--out capture.jsonl] [--outcome-json outcome.json]
 //!                         [--npc-return-distance M] [--npc-return-away-secs S]
 //!                         [--revive-method repair|skill|none]   (mate-revive; GM account needed)
 //! aaemu-testclient parity [--config F] --a H:P --b H:P [--a-label cs] [--b-label rs]
@@ -235,6 +235,11 @@ async fn main() -> anyhow::Result<()> {
             let cfg = bot_config(&args)?;
             let out = args.get("out").map(PathBuf::from);
             let o = run_one(kind, &cfg, out.as_deref(), "run").await?;
+            // Machine-readable result for soak runners, written whenever the scenario ran,
+            // including scenario failures.
+            if let Some(p) = args.get("outcome-json") {
+                std::fs::write(p, serde_json::to_vec_pretty(&o)?)?;
+            }
             if !o.ok() {
                 bail!("scenario failed: {}", o.error.unwrap_or_default());
             }
