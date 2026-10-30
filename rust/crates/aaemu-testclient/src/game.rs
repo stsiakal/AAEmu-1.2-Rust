@@ -378,6 +378,11 @@ pub struct UnitInfo {
     pub pos: (f32, f32, f32),
     /// Transport-layer id of a mate (type 5, `SCUnitStatePacket`); 0 for every other unit.
     pub tl_id: u16,
+    /// Where the unit was when its `SCUnitStatePacket` announced it (`pos` follows its movement).
+    pub announced_pos: (f32, f32, f32),
+    /// [`GameState::observation_seq`] of that announcement, so units announced after an action
+    /// can be told from the known ones whatever their (recycled) object id.
+    pub announced_seq: u64,
 }
 
 /// A doodad seen in `SCDoodadCreatedPacket` / `SCDoodadsCreatedPacket` (`Doodad.Write`).
@@ -678,6 +683,8 @@ impl GameState {
                     id,
                     pos,
                     tl_id,
+                    announced_pos: pos,
+                    announced_seq: st.observation_seq,
                 },
             );
         } else if p.is_sc(sc::SCOneUnitMovementPacket) {

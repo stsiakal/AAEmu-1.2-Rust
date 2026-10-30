@@ -149,26 +149,8 @@ pub(super) async fn leave_world(game: &mut GameClient) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `SCLootBagDataPacket` item count and the item template ids it lists (`LootItem.Write` starts
-/// with slot type, slot, template, fake id, ...).
-pub(super) fn loot_bag_templates(body: &[u8]) -> anyhow::Result<Vec<u32>> {
-    let mut s = PacketStream::from_bytes(body.to_vec());
-    let count = s.read_u8()?;
-    let mut templates = Vec::new();
-    for _ in 0..count {
-        s.read_u8()?; // slot type
-        s.read_u8()?; // slot
-        templates.push(s.read_u32()?);
-    }
-    Ok(templates)
-}
-
-/// `SCLootItemTookPacket` item template id.
-pub(super) fn loot_took_template(p: &Packet) -> anyhow::Result<u32> {
-    Ok(p.stream().read_u32()?)
-}
-
-/// One item entry of an `SCItemTaskSuccessPacket` (the count is what the task added).
+/// One item entry of an `SCItemTaskSuccessPacket` (the count is what the task added; a negative
+/// count is a `ItemCountUpdate` that consumed that many).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ItemStack {
     pub template: u32,
@@ -181,6 +163,15 @@ pub(super) struct ItemStack {
 /// The item entries of `template` in an `SCItemTaskSuccessPacket` among `packets`, including
 /// `AddStack` entries (which `scenario::parse_item_task` does not read).
 pub(super) fn item_stacks(packets: &[Packet], template: u32) -> Vec<ItemStack> {
+    item_stacks_matching(packets, |tpl| tpl == template)
+}
+
+/// Every item entry [`item_stacks`] can read, whatever its template.
+pub(super) fn item_stacks_any(packets: &[Packet]) -> Vec<ItemStack> {
+    item_stacks_matching(packets, |_| true)
+}
+
+fn item_stacks_matching(packets: &[Packet], want: impl Fn(u32) -> bool) -> Vec<ItemStack> {
     let mut out = Vec::new();
     for p in packets
         .iter()
@@ -198,7 +189,7 @@ pub(super) fn item_stacks(packets: &[Packet], template: u32) -> Vec<ItemStack> {
                         let item_id = s.read_u64()?;
                         let count = s.read_i32()?;
                         let tpl = s.read_u32()?;
-                        if tpl == template {
+                        if want(tpl) {
                             out.push(ItemStack {
                                 template: tpl,
                                 item_id,
@@ -227,7 +218,7 @@ pub(super) fn item_stacks(packets: &[Packet], template: u32) -> Vec<ItemStack> {
                         s.read_u8()?; // world id
                         s.read_i64()?; // unsecure time
                         s.read_i64()?; // unpack time
-                        if tpl == template {
+                        if want(tpl) {
                             out.push(ItemStack {
                                 template: tpl,
                                 item_id,
@@ -243,10 +234,32 @@ pub(super) fn item_stacks(packets: &[Packet], template: u32) -> Vec<ItemStack> {
             Ok(())
         })();
         if parsed.is_err() {
-            break;
+            continue;
         }
     }
     out
+}
+
+/// The stack of `template` that the task packets just added. Only when no entry of the template
+/// can be read at all, the slot-only parse of `questitem::stack_location` stands in (its count is
+/// assumed to be 1); entries that took units away never count as an addition.
+pub(super) fn added_stack(packets: &[Packet], template: u32) -> Option<ItemStack> {
+    let stacks = item_stacks(packets, template);
+    if let Some(stack) = stacks.iter().find(|s| s.count > 0) {
+        return Some(*stack);
+    }
+    if !stacks.is_empty() {
+        return None;
+    }
+    super::questitem::stack_location(packets, template).map(|(item_id, slot_type, slot)| {
+        ItemStack {
+            template,
+            item_id,
+            slot_type,
+            slot,
+            count: 1,
+        }
+    })
 }
 
 /// `CSDestroyItemPacket(itemId, slotType, slot, count)`.
@@ -270,6 +283,29 @@ pub(super) fn removed_ids(p: &Packet) -> anyhow::Result<Vec<u32>> {
     }
     Ok(ids)
 }
+
+/// A deterministic per-character offset (metres) that keeps the GM spawns of bots running in
+/// parallel apart (at least 10 m between two spots), so each can tell its own NPC (3 m in
+/// front) from the others'.
+pub(super) fn spawn_offset(character_id: u32) -> (f32, f32) {
+    const SLOTS: [(f32, f32); 9] = [
+        (-10.0, -10.0),
+        (0.0, -10.0),
+        (10.0, -10.0),
+        (-10.0, 0.0),
+        (0.0, 0.0),
+        (10.0, 0.0),
+        (-10.0, 10.0),
+        (0.0, 10.0),
+        (10.0, 10.0),
+    ];
+    SLOTS[(u64::from(character_id) % SLOTS.len() as u64) as usize]
+}
+
+/// How far in front of the bot the GM `/spawn` commands place an NPC, and the leeway accepted
+/// when matching an announcement to the command.
+pub(super) const SPAWN_DISTANCE: f32 = 3.0;
+pub(super) const SPAWN_TOLERANCE: f32 = 0.25;
 
 /// The bot's own server position (`/position`), for checks the movement echo does not expose
 /// (a rider is a child transform while mounted).
@@ -295,4 +331,95 @@ pub(super) async fn self_position(game: &mut GameClient) -> anyhow::Result<(f32,
             .with_context(|| format!("axis {name} in {line:?} is not a number"))
     };
     Ok((axis("X")?, axis("Y")?, axis("Z")?))
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use std::collections::HashSet;
+
+    use aaemu_commons::Marshal;
+    use aaemu_game::models::item::Item;
+    use aaemu_game::models::item_task::ItemTask;
+    use aaemu_game::systems::economy::item_packets::SCItemTaskSuccessPacket;
+
+    use super::*;
+    use crate::game::LEVEL_GAME;
+
+    /// A bag item (`slot type 2`, slot 4) as the server's item tasks describe it.
+    pub(in crate::scenario) fn item(template_id: u32, id: u64, count: i32) -> Item {
+        let mut i = Item::new(1);
+        i.template_id = template_id;
+        i.id = id;
+        i.count = count;
+        i.slot_type = 2;
+        i.slot = 4;
+        i
+    }
+
+    /// An `SCItemTaskSuccessPacket` written by the server's own packet type.
+    pub(in crate::scenario) fn task_packet(tasks: Vec<ItemTask>) -> Packet {
+        let mut body = PacketStream::new();
+        SCItemTaskSuccessPacket {
+            action: 11,
+            tasks,
+            force_remove: Vec::new(),
+        }
+        .write(&mut body);
+        Packet {
+            level: LEVEL_GAME,
+            opcode: sc::SCItemTaskSuccessPacket,
+            body: body.into_bytes(),
+        }
+    }
+
+    #[test]
+    fn item_stacks_keeps_reading_after_a_packet_with_an_unparsed_action() {
+        let meat = item(4058, 7, 1);
+        // `ItemUpdateBits` (action 10) is not an entry `item_stacks` reads.
+        let unparsed = task_packet(vec![ItemTask::update_bits(&meat)]);
+        let added = task_packet(vec![ItemTask::add(&meat)]);
+        let stacks = item_stacks(&[unparsed, added], 4058);
+        assert_eq!(
+            stacks,
+            [ItemStack {
+                template: 4058,
+                item_id: 7,
+                slot_type: 2,
+                slot: 4,
+                count: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn item_stacks_reads_added_and_consumed_counts() {
+        let meat = item(4058, 7, 3);
+        let packets = [
+            task_packet(vec![ItemTask::count_update(&meat, 2)]),
+            task_packet(vec![ItemTask::count_update(&meat, -3)]),
+        ];
+        let counts: Vec<i32> = item_stacks(&packets, 4058)
+            .iter()
+            .map(|s| s.count)
+            .collect();
+        assert_eq!(counts, [2, -3]);
+        // `added_stack` only reports what a task added.
+        assert_eq!(added_stack(&packets[1..], 4058), None);
+        assert_eq!(added_stack(&packets, 4058).map(|s| s.count), Some(2));
+    }
+
+    #[test]
+    fn spawn_slots_of_neighbouring_characters_are_at_least_ten_metres_apart() {
+        let spots: Vec<(f32, f32)> = (40..49).map(spawn_offset).collect();
+        let distinct: HashSet<(i32, i32)> =
+            spots.iter().map(|s| (s.0 as i32, s.1 as i32)).collect();
+        assert_eq!(distinct.len(), 9, "nine consecutive characters, nine spots");
+        let mut closest = f32::MAX;
+        for (i, a) in spots.iter().enumerate() {
+            for b in &spots[i + 1..] {
+                closest = closest.min(((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt());
+            }
+        }
+        assert!(closest >= 10.0, "spots {closest} m apart");
+    }
 }

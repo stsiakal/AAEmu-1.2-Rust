@@ -2,6 +2,8 @@
 //! phase change and the loot (GM account needed for the setup commands).
 //!
 //! Setup: `/labor` tops the bot up, `/spawn doodad 1671` places an iron vein 3 m in front of it.
+//! The GM spawn makes the spawner the doodad's owner, so the bot only accepts the new vein whose
+//! owner is its own object: bots mining side by side each find and mine their own vein.
 //! The action is the client's gathering skill 13986 (the vein's `DoodadFuncUse` skill, 10 labor,
 //! range 4, 4.5 s cast) cast with a doodad target. The server advances the vein phase and grants
 //! loot pack 6359 (iron ore 8022, rare 8081 or stone 8008) directly to the bag. A genuine empty
@@ -16,7 +18,7 @@ use anyhow::{bail, ensure, Context};
 use super::coreloop::{destroy_item, gm_access, item_stacks, labor_change, ItemStack};
 use super::questitem::gm_command;
 use super::{own_skill_response, skill_response_result, Runner};
-use crate::game::GameClient;
+use crate::game::{DoodadInfo, GameClient};
 
 /// Doodad 1671 "Iron Vein" and its start func's gathering skill (10 labor, 4.5 s cast, range 4).
 const VEIN: u32 = 1671;
@@ -30,7 +32,21 @@ const LABOR_COST: i32 = 10;
 #[derive(Default)]
 struct Cleanup {
     vein: Option<u32>,
+    /// Doodads that existed before a spawn whose vein was never announced to this bot.
+    unbound: Option<Vec<u32>>,
     loot: Vec<ItemStack>,
+}
+
+/// The iron vein this bot spawned since `before` (the doodad ids it knew then): the GM spawn
+/// makes the spawner the owner, so another bot's vein never matches.
+fn own_new_vein(game: &GameClient, before: &[u32]) -> Option<DoodadInfo> {
+    let owner = game.state.self_obj;
+    game.state
+        .doodads
+        .values()
+        .filter(|d| d.template_id == VEIN && d.owner_obj_id == owner && !before.contains(&d.obj_id))
+        .min_by_key(|d| d.obj_id)
+        .cloned()
 }
 
 pub(super) async fn run(game: &mut GameClient, r: &mut Runner<'_>) -> anyhow::Result<()> {
@@ -62,22 +78,18 @@ async fn run_inner(
         let s = r.begin(&format!("game.gather.mine{attempt}"));
         let before: Vec<u32> = game.state.doodads.keys().copied().collect();
         gm_command(game, &format!("spawn doodad {VEIN}")).await?;
-        game.drain(Duration::from_millis(500), Duration::from_secs(3))
-            .await?;
-        let me = game.state.self_pos;
-        let Some(vein) = game
-            .state
-            .doodads
-            .values()
-            .filter(|d| d.template_id == VEIN && !before.contains(&d.obj_id))
-            .min_by(|a, b| dist(me, a.pos).total_cmp(&dist(me, b.pos)))
-            .cloned()
-        else {
-            r.fail(s, "the spawned iron vein was not announced");
-            continue;
+        let vein = match wait_new_vein(game, &before).await {
+            Some(vein) => vein,
+            None => {
+                r.fail(s, "the spawned iron vein was not announced");
+                cleanup.unbound = Some(before);
+                continue;
+            }
         };
+        cleanup.unbound = None;
         cleanup.vein = Some(vein.obj_id);
         r.var("vein_obj", vein.obj_id);
+        r.var("vein_owner_obj", vein.owner_obj_id);
         let phase_before = vein.func_group_id;
         let pos = vein.pos;
         game.move_to_facing((pos.0 + 1.2, pos.1, pos.2), pos, 4000)
@@ -121,7 +133,8 @@ async fn run_inner(
                 error = p.stream().read_i16().ok();
                 break;
             }
-            if let Some(change) = labor_change(&p) {
+            // Labor regenerates in positive steps; only the skill's negative cost matters.
+            if let Some(change) = labor_change(&p).filter(|change| *change < 0) {
                 labor = Some(change);
             }
             if p.is_sc(sc::SCDoodadPhaseChangedPacket) {
@@ -140,6 +153,11 @@ async fn run_inner(
                 break;
             }
         }
+        ensure!(
+            error.is_none(),
+            "gathering returned SCErrorMsg {error:?}: packets {}",
+            packet_summary(&packets)
+        );
         // A phase that did not change is a server failure, not an empty loot roll.
         ensure!(
             phase_changed,
@@ -151,14 +169,11 @@ async fn run_inner(
             "gathering spent {labor:?} labor instead of -{LABOR_COST}: packets {}",
             packet_summary(&packets)
         );
-        ensure!(
-            error.is_none(),
-            "gathering returned SCErrorMsg {error:?}: packets {}",
-            packet_summary(&packets)
-        );
         last = format!(
-            "try {attempt}: SkillResult {result}; labor {labor:?}; phase {phase_before} -> \
-             {}; loot {loot:?}",
+            "try {attempt}: vein {} (owner {}); SkillResult {result}; labor {labor:?}; phase \
+             {phase_before} -> {}; loot {loot:?}",
+            vein.obj_id,
+            vein.owner_obj_id,
             game.state
                 .doodads
                 .get(&vein.obj_id)
@@ -179,6 +194,23 @@ async fn run_inner(
     Ok(())
 }
 
+/// Waits until the vein this bot spawned is announced to it.
+async fn wait_new_vein(game: &mut GameClient, before: &[u32]) -> Option<DoodadInfo> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let found = own_new_vein(game, before);
+        if found.is_some() {
+            return found;
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        let _ = game
+            .drain(Duration::from_millis(400), Duration::from_secs(1))
+            .await;
+    }
+}
+
 /// Removes the GM-placed vein and the ore this run put into the bag, also after a failed run.
 async fn cleanup_gather(
     game: &mut GameClient,
@@ -189,6 +221,14 @@ async fn cleanup_gather(
     if let Some(vein) = cleanup.vein.take() {
         if game.state.doodads.contains_key(&vein) {
             let _ = gm_command(game, &format!("spawn remove {vein}")).await?;
+        }
+    }
+    if let Some(before) = cleanup.unbound.take() {
+        // A vein announced late is still this bot's (owner match): remove it.
+        game.drain(Duration::from_millis(500), Duration::from_secs(2))
+            .await?;
+        if let Some(vein) = own_new_vein(game, &before) {
+            let _ = gm_command(game, &format!("spawn remove {}", vein.obj_id)).await?;
         }
     }
     for item in cleanup.loot.drain(..) {
@@ -213,8 +253,4 @@ fn packet_summary(packets: &[crate::game::Packet]) -> String {
         .map(|(n, c)| format!("{n} x{c}"))
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-fn dist(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
-    ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2) + (a.2 - b.2).powi(2)).sqrt()
 }

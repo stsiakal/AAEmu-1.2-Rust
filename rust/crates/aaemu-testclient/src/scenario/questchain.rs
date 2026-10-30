@@ -8,13 +8,16 @@
 //! GM `/damage 99%` setup command, finishes it with `CSStartSkill` 2, loots the corpse with
 //! `CSLootOpenBag(lootAll)`, then reports with `CSCompleteQuestContext` and checks the reward.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use aaemu_game::opcodes::{cs, sc};
+use aaemu_game::systems::skills::types::skill_result;
 use anyhow::{bail, ensure, Context};
 
 use super::coreloop::{
-    destroy_item, gm_access, item_stacks, loot_bag_templates, loot_took_template, ItemStack,
+    destroy_item, gm_access, item_stacks, item_stacks_any, spawn_offset, teleport_to, ItemStack,
+    SPAWN_DISTANCE, SPAWN_TOLERANCE,
 };
 use super::questitem::{chat_text, gm_command, last_quest_state};
 use super::{own_skill_response, packet_obj_id, quest_template_id, skill_response_result, Runner};
@@ -32,11 +35,22 @@ const MEATS: i32 = 3;
 const REWARD: u32 = 18791;
 /// Melee attack skill of the created fighter.
 const ATTACK: u32 = 2;
+/// Results of a hit that mean the boar moved (out of range, not in front, something between):
+/// the bot walks up to it and aims again.
+const RETRY_RESULTS: [u8; 3] = [
+    skill_result::TOO_FAR_RANGE,
+    skill_result::OUTOF_ANGLE,
+    skill_result::OBSTACLE,
+];
 
 #[derive(Default)]
 struct Cleanup {
+    /// Where the bot stood before it moved to its own spot; it goes back there at the end.
+    home: Option<(f32, f32, f32)>,
     giver: Option<u32>,
     boars: Vec<u32>,
+    /// Loot that is still in the bag (what the quest turn-in consumed is taken out).
+    loot: Vec<ItemStack>,
     reward: Option<ItemStack>,
 }
 
@@ -61,6 +75,18 @@ async fn run_inner(
     let _ = gm_command(game, &format!("quest uncomplete {QUEST}")).await?;
     game.drain(Duration::from_millis(300), Duration::from_secs(2))
         .await?;
+
+    // ---- a per-character spot so parallel bots spawn their own NPCs apart (GM-spawned NPCs
+    // carry no owner, so the bot takes the NPC that appears next to it) ----
+    let s = r.begin("game.questchain.position");
+    let base = game.state.self_pos;
+    cleanup.home = Some(base);
+    let (dx, dy) = spawn_offset(game.state.selected_char);
+    teleport_to(game, (base.0 + dx, base.1 + dy, base.2)).await?;
+    r.end(
+        s,
+        format!("at {:?} (spawn slot {dx:.1}, {dy:.1})", game.state.self_pos),
+    );
 
     // ---- the giver in front of the bot ----
     let s = r.begin("game.questchain.giver");
@@ -99,6 +125,12 @@ async fn run_inner(
     ensure!(
         quest.is_some(),
         "no quest state packet carried quest {QUEST}: {}",
+        packet_summary(&answers)
+    );
+    ensure!(
+        quest.is_some_and(|q| q.objectives[0] == 0),
+        "quest {QUEST} starts with objectives {:?} (want 0); a previous run left progress: {}",
+        quest.map(|q| q.objectives),
         packet_summary(&answers)
     );
     r.end(
@@ -157,8 +189,7 @@ async fn run_inner(
                 break;
             }
             ensure!(
-                result
-                    == i32::from(aaemu_game::systems::skills::types::skill_result::TOO_FAR_RANGE),
+                RETRY_RESULTS.iter().any(|r| i32::from(*r) == result),
                 "attack on boar {boar_obj} (attempt {}) answered with SkillResult {result}",
                 attempt + 1
             );
@@ -184,6 +215,11 @@ async fn run_inner(
             .drain(Duration::from_millis(1000), Duration::from_secs(6))
             .await?;
         let meat = meat_received(&looted);
+        cleanup.loot.extend(
+            item_stacks_any(&looted)
+                .into_iter()
+                .filter(|stack| stack.count > 0),
+        );
         let q = last_quest_state(&looted, QUEST);
         if let Some(q) = q {
             quest = Some(q);
@@ -200,7 +236,6 @@ async fn run_inner(
             "no boar meat ({MEAT}) was looted from {boar_obj}: {note}"
         );
         r.end(s, note);
-        let _ = gm_command(game, &format!("despawn npc {boar_obj}")).await?;
     }
 
     let q = quest.context("no quest state carried the objective progress")?;
@@ -213,7 +248,12 @@ async fn run_inner(
 
     // ---- turn in ----
     let s = r.begin("game.questchain.report");
-    move_near(game, giver.pos).await?;
+    let giver_at = game
+        .state
+        .units
+        .get(&giver_obj)
+        .map_or(giver.pos, |u| u.pos);
+    move_near(game, giver_at).await?;
     game.change_target(giver_obj).await?;
     let mut body = aaemu_commons::PacketStream::new();
     body.write_u32(QUEST)
@@ -260,9 +300,22 @@ async fn run_inner(
         reward,
         "quest {QUEST} did not grant reward item {REWARD}: {note}"
     );
+    // The turn-in took the objective's meat out of the bag: only extra loot is left to destroy.
+    consume_loot(&mut cleanup.loot, MEAT, MEATS);
     r.end(s, note);
 
     Ok(())
+}
+
+/// Takes `count` units of `template` out of the tracked `loot` (the quest turn-in consumed
+/// them), so the cleanup only destroys what is still in the bag.
+fn consume_loot(loot: &mut Vec<ItemStack>, template: u32, mut count: i32) {
+    for item in loot.iter_mut().filter(|item| item.template == template) {
+        let used = item.count.min(count);
+        item.count -= used;
+        count -= used;
+    }
+    loot.retain(|item| item.count > 0);
 }
 
 /// Drops/resets the quest, removes the spawned NPCs and destroys the reward, also after a
@@ -273,6 +326,10 @@ async fn cleanup_quest(
     cleanup: &mut Cleanup,
 ) -> anyhow::Result<()> {
     let s = r.begin("game.questchain.cleanup");
+    // The loot first: dropping the quest takes its items out of the bag by itself.
+    for item in cleanup.loot.drain(..) {
+        destroy_item(game, &item).await?;
+    }
     let mut body = aaemu_commons::PacketStream::new();
     body.write_u32(QUEST);
     game.send_cs(cs::CSDropQuestContextPacket, body.as_bytes())
@@ -289,32 +346,61 @@ async fn cleanup_quest(
     }
     game.drain(Duration::from_millis(300), Duration::from_secs(2))
         .await?;
-    r.end(s, "quest dropped/reset, NPCs removed, reward destroyed");
+    // Leave the spot where the run began, so repeated runs do not walk the bot away.
+    if let Some(home) = cleanup.home.take() {
+        teleport_to(game, home).await?;
+    }
+    r.end(
+        s,
+        "quest dropped/reset, NPCs removed, reward and loot destroyed, bot back home",
+    );
     Ok(())
 }
 /// Spawns NPC `template` in front of the bot and returns the new unit once it is announced.
 async fn spawn_npc(game: &mut GameClient, template: u32) -> anyhow::Result<UnitInfo> {
-    let before: Vec<u32> = game.state.units.keys().copied().collect();
+    let me = game.state.self_pos;
+    let seq = game.state.observation_seq;
     let reply = gm_command(game, &format!("spawn npc {template}")).await?;
     let texts: Vec<String> = reply.iter().filter_map(chat_text).collect();
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(40);
     loop {
-        game.drain(Duration::from_millis(400), Duration::from_secs(1))
-            .await?;
-        let found = game
-            .state
-            .units
-            .values()
-            .filter(|u| u.unit_type == 1 && u.id == template && !before.contains(&u.obj_id))
-            .min_by_key(|u| u.obj_id)
-            .cloned();
-        if let Some(unit) = found {
+        if let Some(unit) = own_spawn(&game.state.units, template, me, seq) {
             return Ok(unit);
         }
         if Instant::now() >= deadline {
             bail!("NPC {template} was not announced after /spawn npc: {texts:?}");
         }
+        game.drain(Duration::from_millis(400), Duration::from_secs(1))
+            .await?;
     }
+}
+
+/// The NPC the bot's own `/spawn npc` just announced: a unit of `template` announced after
+/// observation `seq` exactly [`SPAWN_DISTANCE`] away from the bot at `me` (GM-spawned NPCs carry
+/// no owner). It is judged by where the announcement placed it, not by where it is now: hostile
+/// boars run off at once, and another bot's spawn is at least 7 m away from this bot's spot.
+fn own_spawn(
+    units: &HashMap<u32, UnitInfo>,
+    template: u32,
+    me: (f32, f32, f32),
+    seq: u64,
+) -> Option<UnitInfo> {
+    let off = |u: &UnitInfo| (horizontal(me, u.announced_pos) - SPAWN_DISTANCE).abs();
+    units
+        .values()
+        .filter(|u| {
+            u.unit_type == 1
+                && u.id == template
+                && u.announced_seq > seq
+                && off(u) <= SPAWN_TOLERANCE
+        })
+        .min_by(|a, b| {
+            off(a)
+                .total_cmp(&off(b))
+                .then(a.announced_seq.cmp(&b.announced_seq))
+                .then(a.obj_id.cmp(&b.obj_id))
+        })
+        .cloned()
 }
 
 /// Walk right next to `pos`.
@@ -326,28 +412,17 @@ async fn move_near(game: &mut GameClient, pos: (f32, f32, f32)) -> anyhow::Resul
     Ok(())
 }
 
-/// Whether a loot reply gave the quest meat: an `ItemTask` create or an `SCLootItemTook`.
+/// Whether the loot reply put the quest meat into the bag: a positive `SCItemTaskSuccess`
+/// entry for it (a mere bag listing or took notification does not prove it).
 fn meat_received(packets: &[Packet]) -> bool {
-    packets.iter().any(|p| {
-        if p.is_sc(sc::SCLootItemTookPacket) {
-            return loot_took_template(p).ok() == Some(MEAT);
-        }
-        if p.is_sc(sc::SCLootBagDataPacket) {
-            return loot_bag_templates(&p.body).is_ok_and(|t| t.contains(&MEAT));
-        }
-        added_template(p, MEAT)
-    })
+    item_stacks(packets, MEAT)
+        .iter()
+        .any(|stack| stack.count > 0)
 }
 
-/// Whether an `SCItemTaskSuccessPacket` created template `template`.
-fn added_template(p: &Packet, template: u32) -> bool {
-    if !p.is_sc(sc::SCItemTaskSuccessPacket) {
-        return false;
-    }
-    let task = crate::game::parse_item_task(&p.body);
-    task.items
-        .iter()
-        .any(|i| i.task == 5 && i.template == template)
+/// Distance on the ground (the terrain snaps spawned NPCs to a different height).
+fn horizontal(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
+    ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
 }
 
 fn packet_summary(packets: &[Packet]) -> String {
@@ -363,4 +438,86 @@ fn packet_summary(packets: &[Packet]) -> String {
         .map(|(n, c)| format!("{n} x{c}"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::coreloop::ItemStack;
+    use super::*;
+
+    fn stack(template: u32, item_id: u64, count: i32) -> ItemStack {
+        ItemStack {
+            template,
+            item_id,
+            slot_type: 2,
+            slot: 4,
+            count,
+        }
+    }
+
+    fn unit(obj_id: u32, template: u32, announced: (f32, f32, f32), seq: u64) -> UnitInfo {
+        UnitInfo {
+            obj_id,
+            name: String::new(),
+            unit_type: 1,
+            id: template,
+            // Hostile boars run off right after the announcement.
+            pos: (announced.0 + 40.0, announced.1, announced.2),
+            tl_id: 0,
+            announced_pos: announced,
+            announced_seq: seq,
+        }
+    }
+
+    #[test]
+    fn the_own_spawn_is_the_unit_announced_after_the_command_three_metres_in_front() {
+        let me = (100.0, 200.0, 50.0);
+        let units: HashMap<u32, UnitInfo> = [
+            // already known before the command (older announcement), also at the spawn point
+            unit(1, BOAR, (103.0, 200.0, 51.0), 5),
+            // announced after the command: another bot's spawn 7 m away, a respawn 4 m away
+            unit(2, BOAR, (107.0, 200.0, 50.0), 11),
+            unit(3, BOAR, (100.0, 204.0, 50.0), 12),
+            // another template at the spawn point
+            unit(4, GIVER, (103.0, 200.0, 50.0), 13),
+            // the own one: 3 m away on the ground though 4 m higher (terrain snap), and it has
+            // since run 40 m off
+            unit(5, BOAR, (100.0, 203.0, 54.0), 14),
+        ]
+        .into_iter()
+        .map(|u| (u.obj_id, u))
+        .collect();
+        let own = own_spawn(&units, BOAR, me, 10).expect("an own spawn");
+        assert_eq!(own.obj_id, 5);
+        // Nothing qualifies before the announcement or for another template.
+        assert!(own_spawn(&units, BOAR, me, 14).is_none());
+        assert!(own_spawn(&units, 99, me, 10).is_none());
+    }
+
+    #[test]
+    fn of_two_spawns_at_the_same_distance_the_earlier_announcement_wins() {
+        let me = (0.0, 0.0, 0.0);
+        let units: HashMap<u32, UnitInfo> = [
+            unit(8, BOAR, (3.0, 0.0, 0.0), 21),
+            unit(7, BOAR, (0.0, 3.0, 0.0), 20),
+        ]
+        .into_iter()
+        .map(|u| (u.obj_id, u))
+        .collect();
+        assert_eq!(own_spawn(&units, BOAR, me, 10).map(|u| u.obj_id), Some(7));
+    }
+
+    #[test]
+    fn the_turn_in_consumes_the_objective_meat_and_only_the_rest_is_left_to_destroy() {
+        // Three boars, one meat each: the turn-in took all of it.
+        let mut loot = vec![stack(MEAT, 7, 1), stack(MEAT, 7, 1), stack(MEAT, 7, 1)];
+        consume_loot(&mut loot, MEAT, MEATS);
+        assert!(loot.is_empty());
+
+        // A boar that dropped two meat leaves one over, and other loot is never touched.
+        let mut loot = vec![stack(MEAT, 7, 1), stack(MEAT, 7, 2), stack(MEAT, 7, 2)];
+        loot.push(stack(8022, 8, 1));
+        consume_loot(&mut loot, MEAT, MEATS);
+        assert_eq!(loot, [stack(MEAT, 7, 2), stack(8022, 8, 1)]);
+    }
 }

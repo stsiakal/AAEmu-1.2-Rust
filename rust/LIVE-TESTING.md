@@ -275,31 +275,43 @@ or positive (a character with 30 labor runs about 15 crafts, 1 s each). Server l
 `craft 8000001 refused by skill 8000016: skill result 39`.
 
 `housing` (GM account) builds design 172 "cozy Nuian house" on the original client's housing polygon in zone 142
-(13944.868, 14216.393, area 52 / group 1). It adds the design item 21166 and 500 bound tax certificates (31892),
-sends `CSConstructHouseTax` (300000 copper quote) and `CSCreateHouse`, then runs the three build steps with
+(13944.868, 14216.393, area 52 / group 1). It adds the design item 21166 and only the bound tax certificates
+(31892) the `CSConstructHouseTax` quote needs, sends `CSCreateHouse`, then runs the three build steps with
 skills 14575 / 14575 / 14574 and their tradepack materials (17684 / 17684 / 17683, added one at a time because
-the single backpack slot must be free for the next one). It requires `SCMyHouse` + `SCHouseState` with the bot as
-owner, the `SCHouseBuildProgress` steps up to 3/3, `SCHouseTaxInfo`, and finally demolishes the house with the GM
-`/house forcedemo` command and requires `SCHouseDemolished`. Tries nearby offsets if an earlier run's house still
-occupies the plot.
+the single backpack slot must be free for the next one), asserting each material is consumed. It requires
+`SCMyHouse` + `SCHouseState` with the bot as owner, the `SCHouseBuildProgress` steps up to 3/3, `SCHouseTaxInfo`,
+and finally demolishes the house with the GM `/house forcedemo` command and requires
+`SCHouseDemolished`. Tries nearby offsets if an earlier run's house still occupies the plot. Every item the run
+added that the server did not consume (design item and certificates when the creation fails, the material of a
+failed step) is destroyed on the cleanup path, also when the run fails during the re-select (the cleanup waits for
+the pending leave and re-enters the world before it demolishes). A client that is killed mid-build cannot clean up:
+its unfinished house stays on the plot (the next run builds at another offset); the server still finishes the cast.
 
-`mount` (GM account) adds the brown Lilliot horse whistle (item 8159), summons it with use skill 10602, records a
-walking step for a speed baseline, sends `CSMountMate` (driver point 1) and requires `SCUnitAttached`, moves the
-mate with `CSMoveUnit` (20 m at 20 m/s, echoed by `SCOneUnitMovement`), then `CSUnMountMate` (`SCUnitDetached`)
-and `CSRemoveMate`.
+`mount` (GM account) adds the brown Lilliot horse whistle (item 8159), summons it with use skill 10602, sends
+`CSMountMate` (driver point 1) and requires its own `SCUnitAttached`, moves the mate with `CSMoveUnit` (20 m at
+20 m/s, echoed by `SCOneUnitMovement`), reads the server's `/position` for the rider and requires the rider to stand
+at the mount after the move, then `CSUnMountMate` (its own `SCUnitDetached`) and `CSRemoveMate`. The cleanup
+teleports the bot back to where the run began (the ride carried it 20 m away).
 
 `questchain` (GM account) spawns the quest giver 3512 and quest 251 "Angry Boars" in front of the bot, accepts with
 `CSStartQuestContext`, spawns a boar 3475 per objective, weakens it with the GM `/damage 99%` setup command (this skips the server's damage/HP calculation and the boar combat AI), kills it
 with the player's melee `CSStartSkill` 2 and loots the corpse with `CSLootOpenBag(lootAll)`; the quest must count
 3 x boar meat (item 4058). It then reports with `CSCompleteQuestContext` and requires `SCQuestContextCompleted` and
-the reward item 18791. The completion flag and the spawned NPC are reset with GM commands so the next run can
-accept the quest again.
+the reward item 18791. The quest must start at objective 0 (meat left in the bag would pre-fill it), so the
+looted items are destroyed again unless the turn-in consumed them. The completion flag and the spawned NPCs are
+reset with GM commands so the next run can accept the quest again. GM-spawned NPCs carry no owner: bots running in
+parallel first move to their own spot (one of nine, 10 m apart, picked by character id), take the NPC announced
+exactly 3 m in front of them after their own `/spawn npc` (judged by the position of the announcement, hostile boars
+run off at once) and walk back to where they began in the cleanup. Note that the server respawns `/spawn npc` NPCs
+(the runtime spawner stays in the world), so every run leaves a giver and boars behind until the server restarts.
 
 `gather` (GM account) tops labor up, spawns iron vein 1671 with `/spawn doodad` and mines it with the vein's
 `DoodadFuncUse` skill 13986 (doodad target, 10 labor, 4.5 s cast, range 4). It requires `SkillResult` 0, a
 `SCCharacterLaborPowerChanged` of -10, the vein's phase change and a loot item from pack 6359 (iron ore 8022,
 rare 8081 or stone 8008); a genuine empty roll is retried on a fresh vein, while a labor mismatch or error fails at
-once. The ore and the GM-placed vein are removed afterwards.
+once. The GM spawn makes the spawner the doodad's owner and the bot only mines the new vein owned by its own
+object, so bots in parallel at the same spot each mine their own. The ore and the GM-placed vein are removed
+afterwards.
 
 `m*` script commands (`aaemu-testclient/src/scenario/music.rs`, used by `rust/verify/musicrun1.vtest` /
 `musicrun2.vtest`) replay the 1.2 client's music wire sequence and fail on a missing callback:

@@ -14,7 +14,7 @@ use aaemu_game::opcodes::{cs, sc};
 use anyhow::{ensure, Context};
 
 use super::coreloop::{
-    attached, detached, gm_access, item_stacks, removed_ids, self_position, ItemStack,
+    attached, detached, gm_access, item_stacks, removed_ids, self_position, teleport_to, ItemStack,
 };
 use super::questitem::gm_command;
 use super::{summon_mate, BotConfig, Runner};
@@ -28,6 +28,8 @@ const DISMOUNT_REASON: u8 = 4;
 
 #[derive(Default)]
 struct Cleanup {
+    /// Where the bot stood before the mount carried it 20 m away; it goes back there at the end.
+    home: Option<(f32, f32, f32)>,
     mate: Option<(u32, u16)>,
     mounted: bool,
     item: Option<ItemStack>,
@@ -55,6 +57,8 @@ async fn run_inner(
     r: &mut Runner<'_>,
     cleanup: &mut Cleanup,
 ) -> anyhow::Result<()> {
+    cleanup.home = Some(game.state.self_pos);
+
     // ---- the summon item ----
     let s = r.begin("game.mount.item");
     let reply = gm_command(game, &format!("item add self {} 1", cfg.mate_item_template)).await?;
@@ -116,9 +120,11 @@ async fn run_inner(
     let packet = game
         .wait_for("SCUnitAttachedPacket", |p| {
             p.is_sc(sc::SCUnitAttachedPacket)
+                && attached(p)
+                    .is_ok_and(|(child, _, parent, _)| child == self_obj && parent == mate_obj)
         })
         .await
-        .context("CSMountMate got no SCUnitAttachedPacket")?;
+        .context("CSMountMate got no own SCUnitAttachedPacket")?;
     let (child, point, parent, reason) = attached(&packet)?;
     ensure!(
         child == self_obj && point == DRIVER && parent == mate_obj,
@@ -182,9 +188,10 @@ async fn run_inner(
     let packet = game
         .wait_for("SCUnitDetachedPacket", |p| {
             p.is_sc(sc::SCUnitDetachedPacket)
+                && detached(p).is_ok_and(|(child, _)| child == self_obj)
         })
         .await
-        .context("CSUnMountMate got no SCUnitDetachedPacket")?;
+        .context("CSUnMountMate got no own SCUnitDetachedPacket")?;
     let (child, reason) = detached(&packet)?;
     ensure!(
         child == self_obj && reason == DISMOUNT_REASON,
@@ -254,9 +261,11 @@ async fn cleanup_mount(
                 .write_u8(DISMOUNT_REASON);
             game.send_cs(cs::CSUnMountMatePacket, body.as_bytes())
                 .await?;
+            let self_obj = game.state.self_obj;
             let _ = game
                 .wait_for("cleanup SCUnitDetachedPacket", |p| {
                     p.is_sc(sc::SCUnitDetachedPacket)
+                        && detached(p).is_ok_and(|(child, _)| child == self_obj)
                 })
                 .await;
         }
@@ -268,7 +277,11 @@ async fn cleanup_mount(
     }
     game.drain(Duration::from_millis(300), Duration::from_secs(2))
         .await?;
-    r.end(s, "mount dismissed, summon item destroyed");
+    // Leave the spot where the run began, so repeated runs do not carry the bot away.
+    if let Some(home) = cleanup.home.take() {
+        teleport_to(game, home).await?;
+    }
+    r.end(s, "mount dismissed, summon item destroyed, bot back home");
     Ok(())
 }
 
