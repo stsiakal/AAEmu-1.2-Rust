@@ -1566,3 +1566,275 @@ async fn loot_box_traded_during_the_cast_grants_no_effect_and_leaves_the_partner
     );
     let _ = slot_type::INVENTORY;
 }
+
+const CAST_PRODUCT: u32 = 6_012;
+
+/// The cast item's skill with a product: the old pipeline granted it before the source item
+/// was checked again, so a moveless cast was not the only way to get it.
+fn cast_item_with_product_data() -> GameData {
+    use super::data::SkillItemAmount;
+    use crate::data::items::ItemTemplate;
+    let mut data = cast_item_data();
+    data.items
+        .templates
+        .insert(CAST_PRODUCT, ItemTemplate::plain(CAST_PRODUCT, 10));
+    data.systems.skills.skill_products.push(SkillItemAmount {
+        id: 900_010,
+        skill_id: CAST_ITEM_SKILL,
+        item_id: CAST_PRODUCT,
+        amount: 1,
+    });
+    data
+}
+
+fn cast_product_fixture() -> (Arc<crate::GameServer>, TestClient, crate::world::PlayerRef) {
+    let server = Arc::new(test_server_with(cast_item_with_product_data()));
+    server.set_self();
+    super::bind(&server);
+    crate::systems::economy::bridges::install(&server);
+    let mut client = TestClient::new(&server, 1, 1);
+    let a = spawn_player(
+        &server,
+        &client,
+        test_character(1, "Caster", 100.0, 100.0),
+        0x100,
+    );
+    client.conn.active_char = Some(a.clone());
+    a.data().unit.hp = 500;
+    a.data().unit.max_hp = 1000;
+    (server, client, a)
+}
+
+/// Move `item_id` out of the bag into another of the caster's containers, as a mail send or an
+/// auction listing does mid-cast.
+fn move_item_to_container(
+    server: &crate::GameServer,
+    player: &crate::world::PlayerRef,
+    item_id: u64,
+    st: u8,
+    slot: i32,
+) {
+    use crate::systems::economy::inventory::Inv;
+    let inv = Inv::of(player);
+    let bag = inv.bag();
+    let mut item = {
+        let mut bag = bag.lock().unwrap();
+        let index = bag
+            .items
+            .iter()
+            .position(|i| i.id == item_id)
+            .expect("item");
+        bag.items.remove(index)
+    };
+    item.slot_type = st;
+    item.slot = slot;
+    let container = inv.get(st).expect("container");
+    container.lock().unwrap().items.push(item);
+    server.items.add_container(container);
+}
+
+#[tokio::test]
+async fn cast_item_with_products_destroyed_mid_cast_grants_nothing() {
+    use crate::net::registry::ClientPacket;
+    use crate::systems::economy::inventory::Inv;
+    use crate::systems::economy::item_handlers::CSDestroyItemPacket;
+
+    let (server, mut client, a) = cast_product_fixture();
+    give_test_item(&server, &a, 0x7020, CAST_ITEM, 1);
+    super::handlers::start_skill(&server, &mut client.conn, cast_item_packet(&a, 0x7020));
+    CSDestroyItemPacket {
+        item_id: 0x7020,
+        slot_type: crate::models::container::slot_type::INVENTORY,
+        slot: 0,
+        count: 1,
+    }
+    .handle(&server, &mut client.conn)
+    .await
+    .expect("destroy");
+    assert_eq!(Inv::of(&a).items_count(CAST_ITEM, -1), 0);
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(a.data().unit.hp, 500, "the effect must not be granted");
+    assert_eq!(
+        Inv::of(&a).items_count(CAST_PRODUCT, -1),
+        0,
+        "no product may be granted"
+    );
+}
+
+#[tokio::test]
+async fn cast_item_with_products_mailed_or_auctioned_mid_cast_grants_nothing() {
+    use crate::models::container::slot_type;
+    use crate::systems::economy::inventory::Inv;
+
+    for (case, st) in [("mail", slot_type::MAIL), ("auction", slot_type::AUCTION)] {
+        let (server, mut client, a) = cast_product_fixture();
+        give_test_item(&server, &a, 0x7021, CAST_ITEM, 1);
+        super::handlers::start_skill(&server, &mut client.conn, cast_item_packet(&a, 0x7021));
+        move_item_to_container(&server, &a, 0x7021, st, 0);
+        assert_eq!(Inv::of(&a).items_count_in(st, CAST_ITEM, -1), 1);
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(a.data().unit.hp, 500, "{case}: no effect");
+        assert_eq!(
+            Inv::of(&a).items_count(CAST_PRODUCT, -1),
+            0,
+            "{case}: no product"
+        );
+        assert_eq!(
+            Inv::of(&a).items_count_in(st, CAST_ITEM, -1),
+            1,
+            "{case}: the item is not taken from {case}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cast_item_with_products_traded_mid_cast_grants_nothing() {
+    use crate::systems::economy::inventory::Inv;
+
+    let server = Arc::new(test_server_with(cast_item_with_product_data()));
+    server.set_self();
+    super::bind(&server);
+    crate::systems::economy::bridges::install(&server);
+    let mut client = TestClient::new(&server, 1, 1);
+    let mut other = TestClient::new(&server, 2, 2);
+    let a = spawn_player(
+        &server,
+        &client,
+        test_character(1, "Caster", 100.0, 100.0),
+        0x100,
+    );
+    let b = spawn_player(
+        &server,
+        &other,
+        test_character(2, "Trader", 101.0, 100.0),
+        0x101,
+    );
+    client.conn.active_char = Some(a.clone());
+    other.conn.active_char = Some(b.clone());
+    a.data().unit.hp = 500;
+    a.data().unit.max_hp = 1000;
+    give_test_item(&server, &a, 0x7022, CAST_ITEM, 1);
+    super::handlers::start_skill(&server, &mut client.conn, cast_item_packet(&a, 0x7022));
+    // The completed trade moves the same item id to the partner's bag.
+    let mut item = {
+        let bag = Inv::of(&a).bag();
+        let mut bag = bag.lock().unwrap();
+        let index = bag.items.iter().position(|i| i.id == 0x7022).expect("item");
+        bag.items.remove(index)
+    };
+    item.owner_id = u64::from(b.character_id);
+    let bag = Inv::of(&b).bag();
+    bag.lock().unwrap().items.push(item);
+    server.items.add_container(bag);
+    assert_eq!(Inv::of(&b).items_count(CAST_ITEM, -1), 1);
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(a.data().unit.hp, 500, "the effect must not be granted");
+    assert_eq!(
+        Inv::of(&a).items_count(CAST_PRODUCT, -1),
+        0,
+        "no product may be granted"
+    );
+    assert_eq!(
+        Inv::of(&b).items_count(CAST_ITEM, -1),
+        1,
+        "the partner's item is untouched"
+    );
+}
+
+#[tokio::test]
+async fn kept_cast_item_grants_its_product_and_effect_and_is_consumed_once() {
+    use crate::systems::economy::inventory::Inv;
+
+    let (server, mut client, a) = cast_product_fixture();
+    give_test_item(&server, &a, 0x7023, CAST_ITEM, 2);
+    super::handlers::start_skill(&server, &mut client.conn, cast_item_packet(&a, 0x7023));
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(a.data().unit.hp, 650, "the effect is granted once");
+    assert_eq!(
+        Inv::of(&a).items_count(CAST_PRODUCT, -1),
+        1,
+        "the product is granted once"
+    );
+    assert_eq!(
+        Inv::of(&a).items_count(CAST_ITEM, -1),
+        1,
+        "exactly one of the two source units is consumed"
+    );
+    assert_eq!(
+        crate::systems::economy::inventory::Inv::of(&a)
+            .bag()
+            .lock()
+            .unwrap()
+            .get_item_by_id(0x7023)
+            .expect("the stack keeps its id")
+            .slot,
+        0,
+        "the remainder is restored to its slot"
+    );
+}
+
+#[tokio::test]
+async fn channeled_cast_cancelled_after_a_tick_consumes_the_item_once() {
+    use crate::systems::economy::inventory::Inv;
+
+    // The same source-consuming effect on a channel that ticks every 50 ms.
+    let mut data = cast_item_data();
+    let mut channel_skill = (**data
+        .systems
+        .skills
+        .skill(CAST_ITEM_SKILL)
+        .expect("cast item skill"))
+    .clone();
+    channel_skill.casting_time = 0;
+    channel_skill.channeling_time = 400;
+    channel_skill.channeling_tick = 50;
+    data.systems.skills.add_skill(channel_skill);
+    let server = Arc::new(test_server_with(data));
+    server.set_self();
+    super::bind(&server);
+    crate::systems::economy::bridges::install(&server);
+    let mut client = TestClient::new(&server, 1, 1);
+    let a = spawn_player(
+        &server,
+        &client,
+        test_character(1, "Caster", 100.0, 100.0),
+        0x100,
+    );
+    client.conn.active_char = Some(a.clone());
+    a.data().unit.hp = 500;
+    a.data().unit.max_hp = 1000;
+    give_test_item(&server, &a, 0x7030, CAST_ITEM, 2);
+    super::handlers::start_skill(&server, &mut client.conn, cast_item_packet(&a, 0x7030));
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    let skill = a
+        .data()
+        .unit
+        .skill_state
+        .skill_task
+        .as_ref()
+        .expect("channel task")
+        .skill
+        .clone();
+    super::skill::stop(&server, &skill, &crate::world::WorldObject::from(&a), 0);
+    assert_eq!(
+        a.data().unit.hp,
+        650,
+        "one tick was applied before the cancel"
+    );
+    assert_eq!(
+        Inv::of(&a).items_count(CAST_ITEM, -1),
+        1,
+        "one of the two source units is consumed"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        a.data().unit.hp,
+        650,
+        "the cancelled channel applies no more ticks"
+    );
+    assert_eq!(
+        Inv::of(&a).items_count(CAST_ITEM, -1),
+        1,
+        "the cancelled channel consumes no more units"
+    );
+}

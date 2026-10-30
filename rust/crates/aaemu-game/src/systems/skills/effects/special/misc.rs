@@ -67,7 +67,10 @@ pub fn add_exp(server: &GameServer, args: &EffectArgs<'_>, v: [i32; 4]) {
             if npcs.mate_is_max_level(server, mate) {
                 // Cancel the skill and don't consume the item/reagent (e.g. Companion Crust)
                 match args.source.skill() {
-                    Some(s) => s.state().cancelled = true,
+                    Some(s) => {
+                        s.state().cancelled = true;
+                        s.state().effect_cancelled = true;
+                    }
                     None => {
                         tracing::error!(
                             "Special effects: AddExp without a skill (NullReferenceException)"
@@ -318,11 +321,11 @@ fn save_portal_targets_its_doodad(server: &GameServer, args: &EffectArgs<'_>) ->
     let Some(doodad) = target.as_doodad() else {
         return false;
     };
-    let (group, owner_db_id) = {
+    let (group, owner_type, owner_db_id) = {
         let d = doodad.data();
-        (d.func_group_id, d.owner_db_id)
+        (d.func_group_id, d.owner_type, d.owner_db_id)
     };
-    if owner_db_id > 0 {
+    if owner_type == crate::models::doodad::doodad_owner_type::HOUSING && owner_db_id > 0 {
         let Some(player) = args.caster.as_ref().and_then(WorldObject::as_player) else {
             return false;
         };
@@ -393,72 +396,98 @@ pub fn save_portal(server: &GameServer, args: &EffectArgs<'_>, v: [i32; 4]) {
             );
             return;
         }
-        // Take the book id before the ink: a full book must refuse without spending it.
+        // A book entry is only recorded when the cast actually pays its Memory Ink. Check every
+        // reagent first, so a missing one does not consume a book id; the id is also only
+        // allocated once the book is known not to be full. Take `skill_reagents` (11215) and
+        // effect-level items (16387) atomically here; `skill.rs` skips its own reagent /
+        // effect-item debit for SavePortal.
+        let Some(skill) = args.source.skill() else {
+            return;
+        };
+        let items = server.systems.skills.ext.items();
+        let reagents = server
+            .game_data
+            .systems
+            .skills
+            .reagents_for(skill.template.id);
+        if !reagents.is_empty() {
+            let mut paid = false;
+            for reagent in &reagents {
+                let available =
+                    items.item_count(server, p, reagent.item_id) >= i32::from(reagent.amount);
+                if available && skill.template.first_reagent_only {
+                    paid = true;
+                    break;
+                }
+                if !available && !skill.template.first_reagent_only {
+                    paid = false;
+                    break;
+                }
+                paid |= available;
+            }
+            if !paid {
+                tracing::warn!(
+                    skill = skill.template.id,
+                    "SavePortal refused: the location reagent is missing"
+                );
+                return;
+            }
+        }
+        for effect in &skill.template.effects {
+            if effect.consume_item_id != 0
+                && effect.consume_item_count > 0
+                && items.item_count(server, p, effect.consume_item_id) < effect.consume_item_count
+            {
+                tracing::warn!(
+                    skill = skill.template.id,
+                    item_id = effect.consume_item_id,
+                    "SavePortal refused: the location reagent is missing"
+                );
+                return;
+            }
+        }
         let Some(portal_id) = crate::systems::npcs::portal::next_private_portal_id(server) else {
             tracing::warn!("SavePortal refused: the portal book has no free id");
             return;
         };
-        // A book entry is only recorded when the cast actually pays its Memory Ink. Take
-        // `skill_reagents` (11215) and effect-level items (16387) atomically here; `skill.rs`
-        // skips its own reagent/effect-item debit for SavePortal.
-        if let Some(skill) = args.source.skill() {
-            let items = server.systems.skills.ext.items();
-            let Some(p) = caster.as_player() else {
-                return;
-            };
-            let reagents = server
-                .game_data
-                .systems
-                .skills
-                .reagents_for(skill.template.id);
-            if !reagents.is_empty() {
-                let mut paid = false;
-                for reagent in &reagents {
-                    let taken = items.take_item_template(
-                        server,
-                        p,
-                        reagent.item_id,
-                        i32::from(reagent.amount),
-                    ) != Some(false);
-                    if taken && skill.template.first_reagent_only {
-                        paid = true;
-                        break;
-                    }
-                    if !taken && !skill.template.first_reagent_only {
-                        paid = false;
-                        break;
-                    }
-                    paid |= taken;
-                }
-                if !paid {
-                    tracing::warn!(
-                        skill = skill.template.id,
-                        "SavePortal refused: the location reagent is missing"
-                    );
-                    return;
-                }
+        let mut paid = reagents.is_empty();
+        for reagent in &reagents {
+            let taken =
+                items.take_item_template(server, p, reagent.item_id, i32::from(reagent.amount))
+                    != Some(false);
+            if taken && skill.template.first_reagent_only {
+                paid = true;
+                break;
             }
-            for effect in &skill.template.effects {
-                if effect.consume_item_id != 0 && effect.consume_item_count > 0 {
-                    let Some(p) = caster.as_player() else {
-                        return;
-                    };
-                    if items.take_item_template(
-                        server,
-                        p,
-                        effect.consume_item_id,
-                        effect.consume_item_count,
-                    ) == Some(false)
-                    {
-                        tracing::warn!(
-                            skill = skill.template.id,
-                            item_id = effect.consume_item_id,
-                            "SavePortal refused: the location reagent is missing"
-                        );
-                        return;
-                    }
-                }
+            if !taken && !skill.template.first_reagent_only {
+                paid = false;
+                break;
             }
+            paid |= taken;
+        }
+        for effect in &skill.template.effects {
+            if effect.consume_item_id != 0
+                && effect.consume_item_count > 0
+                && items.take_item_template(
+                    server,
+                    p,
+                    effect.consume_item_id,
+                    effect.consume_item_count,
+                ) == Some(false)
+            {
+                paid = false;
+                break;
+            }
+        }
+        if !paid {
+            // The pre-checks passed but another operation moved the item first: give the
+            // unreserved book id back instead of leaking it.
+            server.ids.private_book.release_id(portal_id);
+            tracing::warn!(
+                skill = skill.template.id,
+                "SavePortal refused: the location reagent is missing"
+            );
+            return;
         }
         let pos = world_pos(server, &Target::Obj(caster.clone()));
         let zone_id = p.data().unit.transform.zone_id;

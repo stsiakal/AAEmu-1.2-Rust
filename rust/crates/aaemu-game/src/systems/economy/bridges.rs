@@ -19,12 +19,12 @@ use crate::models::container::{equip_slot, slot_type, ContainerRef, ItemContaine
 use crate::models::item::{
     EquipStat, Item, ItemClass, BIND_ON_UNPACK, ITEM_FLAG_SKINIZED, ITEM_FLAG_UNPACKED,
 };
-use crate::models::item_task::{task_type, ItemFxList, ItemTask};
+use crate::models::item_task::{task_type, ItemFx, ItemFxList, ItemTask};
 use crate::server::GameServer;
 use crate::systems::skills::data::{EffectKind, EffectTemplate};
 use crate::systems::skills::effects::EffectArgs;
 use crate::systems::skills::ext::{
-    GearStats, GradeEnchantRequest, HoldableInfo, ItemActionResult, ItemSkillHooks,
+    GearStats, GradeEnchantRequest, HoldableInfo, ItemActionResult, ItemSkillHooks, TakenCastItem,
 };
 use crate::systems::skills::types::{SkillCastTarget, SkillCaster, SkillObject};
 use crate::systems::social::achievement::char_record_kind;
@@ -88,6 +88,7 @@ fn player_target<'a>(args: &'a EffectArgs<'_>) -> Option<&'a PlayerRef> {
 fn cancel_skill(args: &EffectArgs<'_>) {
     if let Some(s) = args.source.skill() {
         s.state().cancelled = true;
+        s.state().effect_cancelled = true;
     }
 }
 
@@ -539,6 +540,7 @@ impl EconomyForSkills {
                     server,
                     player_target(args),
                     caster_item,
+                    args.source.source_item.as_deref(),
                     v,
                 );
             }
@@ -573,6 +575,7 @@ impl EconomyForSkills {
                         server,
                         p,
                         caster_item,
+                        args.source.source_item.as_deref(),
                         target_item,
                         support,
                         v,
@@ -601,9 +604,15 @@ impl EconomyForSkills {
             }
             special::CLEANUP_LOOK_CONVERT => {
                 let out = match player_caster(args) {
-                    Some(p) => {
-                        item_effects::cleanup_look_convert(server, p, caster_item, target_item, v)
-                    }
+                    Some(p) => item_effects::cleanup_look_convert(
+                        server,
+                        p,
+                        caster_item,
+                        args.source.source_item.as_deref(),
+                        args.source.source_item_debited,
+                        target_item,
+                        v,
+                    ),
                     None => Outcome::Cancelled,
                 };
                 if out == Outcome::Cancelled {
@@ -616,6 +625,7 @@ impl EconomyForSkills {
                         server,
                         p,
                         caster_item,
+                        args.source.source_item.as_deref(),
                         target_item,
                         v,
                         tl,
@@ -979,77 +989,137 @@ impl ItemSkillHooks for EconomyForSkills {
         Some(true)
     }
 
-    fn reserve_owned_item(
+    fn take_cast_source_item(
         &self,
         server: &GameServer,
         player: &PlayerRef,
         item_id: u64,
         expected_template_id: u32,
         amount: i32,
-        token: u64,
-    ) -> Option<bool> {
-        if !server.items.reserve_item(item_id, token) {
-            return Some(false);
-        }
-        let ok = server
-            .items
-            .holding_container(item_id)
-            .is_some_and(|container| {
-                let guard = lock(&container);
-                guard.get_item_by_id(item_id).is_some_and(|item| {
-                    item.template_id == expected_template_id
-                        && item.owner_id == u64::from(player.character_id)
-                        && (amount <= 0 || item.count >= amount)
-                })
-            });
-        if !ok {
-            server.items.release_item(item_id, token);
-        }
-        Some(ok)
-    }
-
-    fn release_owned_item(&self, server: &GameServer, item_id: u64, token: u64) {
-        server.items.release_item(item_id, token);
-    }
-
-    fn consume_reserved_item(
-        &self,
-        server: &GameServer,
-        player: &PlayerRef,
-        item_id: u64,
-        expected_template_id: u32,
-        amount: i32,
-        token: u64,
-    ) -> Option<bool> {
-        if server.items.reserved_by(item_id) != Some(token) {
-            return Some(false);
-        }
-        let ok = if let Some(container) = server.items.holding_container(item_id) {
-            let mut txn = ItemTxn::begin(server);
+    ) -> Option<Result<TakenCastItem, ()>> {
+        let amount = amount.max(0);
+        let inv = Inv::of(player);
+        let txn = ItemTxn::begin(server);
+        // Only the caster's bag or equipment may hold the cast item: a trade, mail, auction,
+        // bank or coffer copy is not a usable cast source.
+        for st in [slot_type::INVENTORY, slot_type::EQUIPMENT] {
+            let Some(container) = inv.get(st) else {
+                continue;
+            };
             let mut guard = lock(&container);
-            let matches = guard.get_item_by_id(item_id).is_some_and(|item| {
-                item.template_id == expected_template_id
-                    && item.owner_id == u64::from(player.character_id)
-                    && (amount <= 0 || item.count >= amount)
-            });
-            if !matches {
-                false
-            } else if amount > 0 {
-                guard.consume_item(
-                    task_type::SKILL_REAGENTS,
-                    expected_template_id,
-                    amount,
-                    Some(item_id),
-                    &mut txn.env,
-                ) == amount
-            } else {
-                true
+            let Some(item) = guard.get_item_by_id(item_id).cloned() else {
+                continue;
+            };
+            if item.template_id != expected_template_id
+                || item.owner_id != u64::from(player.character_id)
+                || item.count < amount
+            {
+                return Some(Err(()));
             }
+            if amount == 0 {
+                let slot = item.slot;
+                drop(guard);
+                return Some(Ok(TakenCastItem {
+                    item,
+                    container,
+                    slot,
+                    amount,
+                    removed: false,
+                }));
+            }
+            if !txn.env.rules.can_destroy(&item) {
+                return Some(Err(()));
+            }
+            let Some(removed) = guard.remove_item(item_id) else {
+                return Some(Err(()));
+            };
+            let slot = removed.slot;
+            drop(guard);
+            return Some(Ok(TakenCastItem {
+                item: removed,
+                container,
+                slot,
+                amount,
+                removed: true,
+            }));
+        }
+        Some(Err(()))
+    }
+
+    fn commit_cast_source_item(&self, server: &GameServer, taken: TakenCastItem) {
+        if !taken.removed {
+            return;
+        }
+        let owner = taken.item.owner_id as u32;
+        let mut txn = ItemTxn::begin(server);
+        if taken.amount >= taken.item.count {
+            txn.env.fx.tasks(
+                owner,
+                task_type::SKILL_REAGENTS,
+                vec![ItemTask::remove_slot(&taken.item)],
+            );
+            txn.env.fx.push(ItemFx::Consumed {
+                owner,
+                template_id: taken.item.template_id,
+                count: taken.item.count,
+            });
+            txn.env.fx.push(ItemFx::ReleaseId(taken.item.id));
+            return;
+        }
+        // A partial debit keeps the stack (same id, grade, flags and details); put the
+        // unconsumed units back before the operation ends.
+        let container = taken.container.clone();
+        let mut rest = taken.item.clone();
+        rest.count -= taken.amount;
+        rest.dirty = true;
+        let mut guard = lock(&container);
+        let slot = guard.get_unused_slot(taken.slot);
+        if slot < 0 {
+            drop(guard);
+            tracing::error!(
+                item_id = rest.id,
+                "cast source remainder could not be placed back into its container"
+            );
+            server.items.add_loose(rest);
+            return;
+        }
+        rest.slot = slot;
+        rest.slot_type = guard.slot_type;
+        guard.items.insert(0, rest.clone());
+        guard.update_free_slot_count();
+        drop(guard);
+        let tasks = if rest.slot == taken.slot {
+            vec![ItemTask::count_update(&rest, -taken.amount)]
         } else {
-            false
+            vec![ItemTask::remove_slot(&taken.item), ItemTask::add(&rest)]
         };
-        server.items.release_item(item_id, token);
-        Some(ok)
+        txn.env.fx.tasks(owner, task_type::SKILL_REAGENTS, tasks);
+    }
+
+    fn refund_cast_source_item(&self, server: &GameServer, taken: TakenCastItem) {
+        if !taken.removed {
+            return;
+        }
+        // Serialise with every other item operation, even though the refund itself sends no
+        // packets (the client never saw the failed cast touch the item).
+        let _txn = ItemTxn::begin(server);
+        let container = taken.container.clone();
+        let mut item = taken.item;
+        let mut guard = lock(&container);
+        let slot = guard.get_unused_slot(item.slot);
+        if slot < 0 {
+            drop(guard);
+            tracing::error!(
+                item_id = item.id,
+                "cancelled cast could not restore its source item to the bag"
+            );
+            server.items.add_loose(item);
+            return;
+        }
+        item.slot = slot;
+        item.slot_type = guard.slot_type;
+        guard.items.insert(0, item);
+        guard.update_free_slot_count();
     }
 
     fn take_item_template(
@@ -1269,6 +1339,8 @@ impl ItemSkillHooks for EconomyForSkills {
                         p,
                         &effect,
                         skill_item(&args.caster_caster),
+                        args.source.source_item.as_deref(),
+                        args.source.source_item_debited,
                         &mut SharedRandom,
                     );
                 }
@@ -1283,6 +1355,7 @@ impl ItemSkillHooks for EconomyForSkills {
                         server,
                         Some(player),
                         skill_item(&args.caster_caster),
+                        args.source.source_item.as_deref(),
                         item_target(&args.target_caster).map(|(id, _)| id),
                     ),
                     None => Outcome::Cancelled,
@@ -1301,6 +1374,7 @@ impl ItemSkillHooks for EconomyForSkills {
                         server,
                         Some(player),
                         skill_item(&args.caster_caster),
+                        args.source.source_item.as_deref(),
                         item_target(&args.target_caster).map(|(id, _)| id),
                     ),
                     None => Outcome::Cancelled,
@@ -1434,8 +1508,17 @@ impl ItemSkillHooks for EconomyForSkills {
         result
     }
 
-    fn ucc_create_stamp(&self, server: &GameServer, player: &PlayerRef, source_item_id: u64) {
-        if let Some(source) = server.items.item_by_id(source_item_id) {
+    fn ucc_create_stamp(
+        &self,
+        server: &GameServer,
+        player: &PlayerRef,
+        source_item_id: u64,
+        source_item: Option<&Item>,
+    ) {
+        let source = source_item
+            .cloned()
+            .or_else(|| server.items.item_by_id(source_item_id));
+        if let Some(source) = source {
             item_effects::create_stamp(server, player, &source);
         }
     }
@@ -1452,17 +1535,19 @@ impl ItemSkillHooks for EconomyForSkills {
         dye_item_id: u64,
         dye_template_id: u32,
         target_item_id: u64,
+        source_item: Option<&Item>,
     ) {
         let mut txn = ItemTxn::begin(server);
         let inv = Inv::of(player);
-        // Skill.Apply consumes its source item after effects, unless this flag cancels it.
-        // Reject before editing equipment so an invalid target also keeps its dye.
+        // Skill.Apply refunds its pre-debited source item unless this flag cancels it. Reject
+        // before editing equipment so an invalid target also keeps its dye.
         let reject = || player.data().skill_char.skill_cancelled = true;
-        let Some(dye_holder) = inv.holder_of(dye_item_id) else {
-            reject();
-            return;
+        let dye = match source_item {
+            Some(item) => Some(item.clone()),
+            None => inv
+                .holder_of(dye_item_id)
+                .and_then(|holder| lock(&holder).get_item_by_id(dye_item_id).cloned()),
         };
-        let dye = lock(&dye_holder).get_item_by_id(dye_item_id).cloned();
         if !dye.is_some_and(|i| i.template_id == dye_template_id && i.count > 0) {
             reject();
             return;
@@ -1534,17 +1619,27 @@ impl ItemSkillHooks for EconomyForSkills {
         player: &PlayerRef,
         target_item_id: u64,
         powder_item_id: Option<u64>,
+        powder_item: Option<&Item>,
+        powder_debited: bool,
     ) -> ItemActionResult {
-        let powder = powder_item_id.and_then(|id| {
-            server.items.item_by_id(id).map(|i| SkillItem {
-                item_id: id,
-                item_template_id: i.template_id,
-            })
-        });
+        let powder = match powder_item {
+            Some(p) => Some(SkillItem {
+                item_id: p.id,
+                item_template_id: p.template_id,
+            }),
+            None => powder_item_id.and_then(|id| {
+                server.items.item_by_id(id).map(|i| SkillItem {
+                    item_id: id,
+                    item_template_id: i.template_id,
+                })
+            }),
+        };
         match item_effects::cleanup_look_convert(
             server,
             player,
             powder,
+            powder_item,
+            powder_debited,
             Some(target_item_id),
             [0; 4],
         ) {
@@ -1559,6 +1654,8 @@ impl ItemSkillHooks for EconomyForSkills {
         player: &PlayerRef,
         target_item_id: u64,
         powder_item_id: Option<u64>,
+        powder_item: Option<&Item>,
+        powder_debited: bool,
     ) -> ItemActionResult {
         let mut txn = ItemTxn::begin(server);
         let inv = Inv::of(player);
@@ -1575,11 +1672,17 @@ impl ItemSkillHooks for EconomyForSkills {
                 error_message::ITEM_LOOK_CONVERT_AS_NOT_USE_AS_SKIN,
             );
         }
-        let Some(powder_id) = powder_item_id else {
-            return ItemActionResult::Cancel;
-        };
-        let Some(powder) = inv.item_by_id(powder_id) else {
-            return ItemActionResult::Cancel;
+        let powder = match powder_item {
+            Some(p) => p.clone(),
+            None => {
+                let Some(powder_id) = powder_item_id else {
+                    return ItemActionResult::Cancel;
+                };
+                let Some(powder) = inv.item_by_id(powder_id) else {
+                    return ItemActionResult::Cancel;
+                };
+                powder
+            }
         };
         if powder.count < 1 {
             return ItemActionResult::Cancel;
@@ -1597,14 +1700,17 @@ impl ItemSkillHooks for EconomyForSkills {
             player,
             task_packet(task_type::SKINIZE, vec![ItemTask::update_bits(&after)]),
         );
-        if let Some(c) = inv.holder_of_any(powder.id) {
-            lock(&c).consume_item(
-                task_type::SKINIZE,
-                powder.template_id,
-                1,
-                Some(powder.id),
-                &mut txn.env,
-            );
+        // The cast's debit already consumed the powder; only the fallback pays for it here.
+        if !powder_debited {
+            if let Some(c) = inv.holder_of_any(powder.id) {
+                lock(&c).consume_item(
+                    task_type::SKINIZE,
+                    powder.template_id,
+                    1,
+                    Some(powder.id),
+                    &mut txn.env,
+                );
+            }
         }
         ItemActionResult::Done
     }
@@ -1615,17 +1721,25 @@ impl ItemSkillHooks for EconomyForSkills {
         player: &PlayerRef,
         gem_item_id: u64,
         target_item_id: u64,
+        gem_item: Option<&Item>,
     ) -> bool {
         // Handled whole by `apply_special_effect` (which sends the skill end); this path only
         // runs without the special-effect routing.
-        let gem = server.items.item_by_id(gem_item_id).map(|i| SkillItem {
-            item_id: gem_item_id,
-            item_template_id: i.template_id,
-        });
+        let gem = match gem_item {
+            Some(i) => Some(SkillItem {
+                item_id: i.id,
+                item_template_id: i.template_id,
+            }),
+            None => server.items.item_by_id(gem_item_id).map(|i| SkillItem {
+                item_id: gem_item_id,
+                item_template_id: i.template_id,
+            }),
+        };
         item_effects::item_socketing(
             server,
             player,
             gem,
+            gem_item,
             Some(target_item_id),
             [0; 4],
             0,
@@ -1639,6 +1753,7 @@ impl ItemSkillHooks for EconomyForSkills {
         server: &GameServer,
         player: &PlayerRef,
         request: &GradeEnchantRequest,
+        scroll_item: Option<&Item>,
     ) -> bool {
         item_effects::grade_enchant(
             server,
@@ -1647,6 +1762,7 @@ impl ItemSkillHooks for EconomyForSkills {
                 item_id: request.scroll_item_id,
                 item_template_id: request.scroll_template_id,
             }),
+            scroll_item,
             Some(request.target_item_id),
             (request.support_item_id != 0).then_some(request.support_item_id),
             [i32::from(request.is_lucky), 0, request.item_type, 0],

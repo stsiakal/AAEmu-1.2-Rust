@@ -309,6 +309,7 @@ fn enchant(w: &World, id: u64, support: Option<u64>, lucky: bool, rolls: &[i32])
         &w.server,
         &w.pa,
         scroll(),
+        None,
         Some(id),
         support,
         [i32::from(lucky), 0, 2, 0],
@@ -568,7 +569,16 @@ async fn socketing_success_failure_and_dawnstone() {
     // 1st socket: chance 10000
     mark_clean(&w, id);
     let mut rng = ScriptedRng::new(&[9999], &[]);
-    item_socketing(&w.server, &w.pa, gem_caster, Some(id), [0; 4], TL, &mut rng);
+    item_socketing(
+        &w.server,
+        &w.pa,
+        gem_caster,
+        None,
+        Some(id),
+        [0; 4],
+        TL,
+        &mut rng,
+    );
     let after = item(&w, id).unwrap();
     assert_eq!(after.details.gem_ids, [GEM, 0, 0, 0, 0, 0, 0]);
     assert!(after.dirty, "socketing must dirty the item");
@@ -600,7 +610,16 @@ async fn socketing_success_failure_and_dawnstone() {
     // 2nd socket: chance 0 -> every gem is lost
     mark_clean(&w, id);
     let mut rng = ScriptedRng::new(&[0], &[]);
-    item_socketing(&w.server, &w.pa, gem_caster, Some(id), [0; 4], TL, &mut rng);
+    item_socketing(
+        &w.server,
+        &w.pa,
+        gem_caster,
+        None,
+        Some(id),
+        [0; 4],
+        TL,
+        &mut rng,
+    );
     let after = item(&w, id).unwrap();
     assert_eq!(after.details.gem_ids, [0; 7]);
     assert!(
@@ -639,6 +658,7 @@ async fn socketing_success_failure_and_dawnstone() {
         &w.server,
         &w.pa,
         dawn_caster,
+        None,
         Some(id),
         [0; 4],
         TL,
@@ -847,7 +867,7 @@ async fn cleanup_look_convert_flow() {
     });
     // No image yet
     assert_eq!(
-        cleanup_look_convert(&w.server, &w.pa, caster, Some(id), [0; 4]),
+        cleanup_look_convert(&w.server, &w.pa, caster, None, false, Some(id), [0; 4]),
         Outcome::Cancelled
     );
     assert_eq!(
@@ -865,7 +885,7 @@ async fn cleanup_look_convert_flow() {
         .details
         .image_item_template_id = 999;
     assert_eq!(
-        cleanup_look_convert(&w.server, &w.pa, caster, Some(id), [0; 4]),
+        cleanup_look_convert(&w.server, &w.pa, caster, None, false, Some(id), [0; 4]),
         Outcome::Done
     );
     let after = item(&w, id).unwrap();
@@ -1459,7 +1479,7 @@ async fn ucc_imprint_cleanup_and_stamp() {
         item_id: stamp,
         item_template_id: STACK,
     });
-    imprint_ucc(&w.server, Some(&w.pa), caster, Some(target));
+    imprint_ucc(&w.server, Some(&w.pa), caster, None, Some(target));
     let after = item(&w, target).unwrap();
     assert_eq!(after.ucc_id, 0xABCD);
     assert_ne!(after.flags & crate::models::item::ITEM_FLAG_HAS_UCC, 0);
@@ -1486,7 +1506,7 @@ async fn ucc_imprint_cleanup_and_stamp() {
     // The stamp is not consumed by the effect.
     assert!(item(&w, stamp).is_some());
 
-    cleanup_ucc(&w.server, Some(&w.pa), caster, Some(target));
+    cleanup_ucc(&w.server, Some(&w.pa), caster, None, Some(target));
     let after = item(&w, target).unwrap();
     assert_eq!(
         (
@@ -1517,7 +1537,7 @@ async fn ucc_imprint_cleanup_and_stamp() {
     );
 
     // Emblem imprint: a new crest stamp carrying the ink's UCC in the target's bag
-    gain_item_with_emblem_imprint(&w.server, Some(&w.pb), caster, [0; 4]);
+    gain_item_with_emblem_imprint(&w.server, Some(&w.pb), caster, None, [0; 4]);
     let crest = item_at(&w.pb, slot_type::INVENTORY, 0).unwrap();
     assert_eq!(
         (crest.template_id, crest.ucc_id),

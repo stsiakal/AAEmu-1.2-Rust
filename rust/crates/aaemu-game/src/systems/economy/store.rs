@@ -653,14 +653,6 @@ impl CSSellItemsPacket {
                 _ => None,
             };
             if let Some(item) = item.filter(|i| i.id == e.item_id) {
-                if server.items.reserved_by(item.id).is_some() {
-                    tracing::warn!(
-                        "{}: item {} is reserved by a running cast, sale refused",
-                        p.data().unit.name,
-                        item.id
-                    );
-                    continue;
-                }
                 // The same item listed twice would be paid twice.
                 if items.iter().any(|i| i.id == item.id) {
                     tracing::warn!(

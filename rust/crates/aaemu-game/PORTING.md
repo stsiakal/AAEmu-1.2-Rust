@@ -2986,11 +2986,10 @@ two bots before the fix (a foreign `Mount` caster, an NPC-only skill and a far d
   skills require `skill_id ==` the owned template's `UseSkillId`. The C# bind-on-pickup
   exception (`bfdc3268`, PR #615) is kept only for its evidence-backed case: the house
   fireplace's `DoodadFuncUse`, where the packet targets that doodad in range and its current
-  func group has a `Use` func for the skill. Consumption goes through
-  `ItemSkillHooks::consume_owned_item`, which checks the item id and template and consumes it
-  under one container lock. An item that leaves the bag during a cast time is refused by the
-  cast-time item check; a cancelled effect consumes nothing. Plot-only item skills verify the
-  same owned item before the plot runs.
+  func group has a `Use` func for the skill. Consumption is debit-first through
+  `ItemSkillHooks::take_cast_source_item` (see the 2026-10-30 section below): the item is
+  checked and taken under one container lock before the result, and a cancelled effect refunds
+  it. Plot-only item skills verify the same owned item before the plot runs.
 - **SavePortal creation.** `SpecialEffect` 30 `SavePortal` only records a new book entry when the
   casting skill pays a reagent (`skill_reagents` or an effect-level `consume_item_id` /
   `consume_source_item`). Skill 16841 "Editing Location in Teleport Book..." has no reagent and
@@ -3006,6 +3005,31 @@ two bots before the fix (a foreign `Mount` caster, an NPC-only skill and a far d
   `slave_mount_skills`, or a `buff_mount_skills` entry of an active vehicle buff, each mapped
   through `mount_skills.skill_id`. This closes the NPC / boss / GM skill bypass; the rider /
   operator skill still runs as the player through `mount_attached_skills`.
+
+### Skill source item debit before the result (2026-10-30)
+
+**Deviation:** C# `Skill.ApplyEffects` (`AAEmu.Game/Models/Game/Skills/Skill.cs` at
+`a2ab80abd^`, the `if (!Cancelled)` block after the effect loop) collected `consumedItems` /
+`consumedItemTemplates` while the effects ran and consumed them only after every effect, so a
+cast-time item that left the bag during the cast still granted the products (granted before the
+effects) and effects, and the final `ConsumeItem` either missed it or took it from another
+container (mail, auction, a trade partner's bag). The Rust port now debits first: right before
+the reagents, products and effects, `ItemSkillHooks::take_cast_source_item` verifies the owner,
+template and count and removes the whole item from the caster's bag or equipment only (never a
+trade, mail, auction, bank or coffer copy) under the economy operation lock. If the item is not
+there the whole result is refused (no reagents, products or effects). The item is held out of
+its container until `commit_cast_source_item` (release id + `Consumed`, or put the unconsumed
+remainder back) or `refund_cast_source_item` (restore the same id, template, count, grade and
+details after an effect cancelled — invalid UCC/dye target, missing build material). Effects that
+read the casting item (UCC imprint/cleanup, dyeing, loot-pack grade, socketing, grading scroll,
+look-convert powder, emblem stamp) use the pre-debit snapshot passed in
+`EffectSource::source_item`. The item reservation map (and its trade / sale / destroy checks) is
+removed: the item is physically absent while the result is decided, so those movers cannot reach
+it. `consume_owned_item` remains only for the plot-only cast's pre-plot ownership check.
+Regression tests: `cast_item_with_products_{destroyed,mailed_or_auctioned,traded}_mid_cast_*`,
+`kept_cast_item_grants_its_product_and_effect_and_is_consumed_once`,
+`cancelled_ucc_cast_refunds_the_debited_source_item_exactly`,
+`channeled_cast_cancelled_after_a_tick_consumes_the_item_once`.
 
 ## Lost-experience prayer cast (2026-10-30)
 

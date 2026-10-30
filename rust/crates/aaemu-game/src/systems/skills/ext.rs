@@ -13,6 +13,7 @@
 //! handled it; if none does, the skills subsystem logs it (or runs its own fallback).
 
 use crate::data::world_data::Portal;
+use crate::models::container::ContainerRef;
 use crate::models::item::Item;
 use crate::models::item_task::ItemFxList;
 use crate::models::movement::{GameStanceType, MoveTypeAlertness};
@@ -49,6 +50,23 @@ pub struct SummonPlacement {
     pub z: f32,
     /// `SkillCastPositionTarget.PosRot`.
     pub yaw: f32,
+}
+
+/// The source item of an `Item` cast, debited before the cast result (reagents, products,
+/// effects) is produced. The item is held out of its container until the cast commits or
+/// refunds it, so no other item operation can move or consume it in between.
+#[derive(Debug, Clone)]
+pub struct TakenCastItem {
+    /// The item as it was before the debit (template, count, grade, flags, details).
+    pub item: Item,
+    /// The bag or equipment container it was taken from.
+    pub container: ContainerRef,
+    /// Its slot in `container` (the preferred slot when it is put back).
+    pub slot: i32,
+    /// Units to consume; `0` when the cast only verified the item.
+    pub amount: i32,
+    /// The whole item was removed from `container` and is held by this value.
+    pub removed: bool,
 }
 
 /// Outcome of an item action that can cancel the skill and show an error (`skill.Cancelled =
@@ -469,36 +487,31 @@ pub trait ItemSkillHooks: Send + Sync {
         None
     }
 
-    /// Reserve the owned item `item_id` for cast `token` (owner, template and count checked).
-    /// Trading, selling or destroying it is refused while reserved; `None` when the
-    /// implementation does not track items.
-    fn reserve_owned_item(
+    /// Take the source item of an `Item` cast before its reagents, products and effects run.
+    /// The item must still be the caster's, with `expected_template_id`, in the caster's bag or
+    /// equipment (never a trade, mail, auction, bank or coffer container), and hold at least
+    /// `amount` units. The whole item is held out of its container until
+    /// [`Self::commit_cast_source_item`] or [`Self::refund_cast_source_item`].
+    /// `None` when the implementation does not track items (tests / hooks); `Some(Err(()))`
+    /// refuses the whole cast result.
+    fn take_cast_source_item(
         &self,
         _server: &GameServer,
         _player: &PlayerRef,
         _item_id: u64,
         _expected_template_id: u32,
         _amount: i32,
-        _token: u64,
-    ) -> Option<bool> {
+    ) -> Option<Result<TakenCastItem, ()>> {
         None
     }
 
-    /// Release a reservation held by `token`; a different owner's reservation is untouched.
-    fn release_owned_item(&self, _server: &GameServer, _item_id: u64, _token: u64) {}
+    /// Consume the taken source item: release its id and report the consumption, or put the
+    /// unconsumed remainder back.
+    fn commit_cast_source_item(&self, _server: &GameServer, _taken: TakenCastItem) {}
 
-    /// Consume a reserved item under one container lock and release the reservation.
-    fn consume_reserved_item(
-        &self,
-        _server: &GameServer,
-        _player: &PlayerRef,
-        _item_id: u64,
-        _expected_template_id: u32,
-        _amount: i32,
-        _token: u64,
-    ) -> Option<bool> {
-        None
-    }
+    /// Give a taken source item back unchanged (same template, count, properties and id) after
+    /// an effect cancelled the cast.
+    fn refund_cast_source_item(&self, _server: &GameServer, _taken: TakenCastItem) {}
 
     /// Take `amount` of `template_id` from the player's inventory (bag / equipment / bank).
     /// The full amount is checked under the economy operation lock before the debit, so
@@ -659,7 +672,14 @@ pub trait ItemSkillHooks: Send + Sync {
 
     /// `ItemManager.GetItemByItemId(sourceItemId)` and, when it exists,
     /// `UccManager.CreateStamp(player, sourceItem)` (`GainItemWithEmblemImprint`).
-    fn ucc_create_stamp(&self, _server: &GameServer, _player: &PlayerRef, _source_item_id: u64) {
+    /// `source_item` is the cast's pre-debit snapshot (the live item is already gone).
+    fn ucc_create_stamp(
+        &self,
+        _server: &GameServer,
+        _player: &PlayerRef,
+        _source_item_id: u64,
+        _source_item: Option<&Item>,
+    ) {
         not_ported("UccManager.CreateStamp");
     }
 
@@ -680,6 +700,7 @@ pub trait ItemSkillHooks: Send + Sync {
         _dye_item_id: u64,
         _dye_template_id: u32,
         _target_item_id: u64,
+        _source_item: Option<&Item>,
     ) {
         not_ported("Dyeing");
     }
@@ -733,6 +754,8 @@ pub trait ItemSkillHooks: Send + Sync {
         _player: &PlayerRef,
         _target_item_id: u64,
         _powder_item_id: Option<u64>,
+        _powder: Option<&Item>,
+        _powder_debited: bool,
     ) -> ItemActionResult {
         not_ported("CleanupLookConvert");
         ItemActionResult::Cancel
@@ -747,6 +770,8 @@ pub trait ItemSkillHooks: Send + Sync {
         _player: &PlayerRef,
         _target_item_id: u64,
         _powder_item_id: Option<u64>,
+        _powder: Option<&Item>,
+        _powder_debited: bool,
     ) -> ItemActionResult {
         not_ported("Skinize");
         ItemActionResult::Cancel
@@ -761,6 +786,7 @@ pub trait ItemSkillHooks: Send + Sync {
         _player: &PlayerRef,
         _gem_item_id: u64,
         _target_item_id: u64,
+        _gem_item: Option<&Item>,
     ) -> bool {
         not_ported("ItemSocketing");
         false
@@ -775,6 +801,7 @@ pub trait ItemSkillHooks: Send + Sync {
         _server: &GameServer,
         _player: &PlayerRef,
         _request: &GradeEnchantRequest,
+        _scroll_item: Option<&Item>,
     ) -> bool {
         not_ported("GradeEnchant");
         false

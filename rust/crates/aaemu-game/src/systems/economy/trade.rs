@@ -314,14 +314,6 @@ pub fn add_item(server: &GameServer, character: &PlayerRef, st: u8, slot: u8, am
     }
     // C#: `item.Count` throws on an empty slot.
     let Some(item) = item else { return };
-    if server.items.reserved_by(item.id).is_some() {
-        tracing::warn!(
-            "Trade Id:{trade_id} {} put up an item reserved by a running cast, refused.",
-            name_of(character)
-        );
-        cancel_locked(server, &mut trades, character.obj_id, 0, trade_id);
-        return;
-    }
     if amount <= 0 || item.count < amount {
         cancel_locked(server, &mut trades, character.obj_id, 0, trade_id); // TODO (C#) - Reason
         return;
@@ -882,7 +874,7 @@ fn move_amount_to_bag(
     item_id: u64,
     amount: i32,
 ) -> Option<(ItemTask, ItemTask)> {
-    if amount <= 0 || txn.server.items.reserved_by(item_id).is_some() {
+    if amount <= 0 {
         return None;
     }
     let src = Inv::of(from).holder_of_any(item_id)?;

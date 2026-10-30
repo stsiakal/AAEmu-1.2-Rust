@@ -225,3 +225,38 @@ async fn bind_on_pickup_item_cannot_authorize_a_non_ucc_client_skill() {
     assert!(w.a.drain().is_empty());
     assert!(w.b.drain().is_empty());
 }
+
+#[tokio::test]
+async fn cancelled_ucc_cast_refunds_the_debited_source_item_exactly() {
+    // A stackable reagent ink is taken before the effect runs; the effect then rejects a target
+    // that belongs to another player and the skill cancels. The item must come back unchanged:
+    // same id, slot, count, grade and UCC data.
+    let mut w = fixture();
+    let (source, _own_target) = operands(&w, 17662);
+    let foreign = give(&w, &w.pb, slot_type::INVENTORY, ARMOR, 1, 1);
+    let before = item_at(&w.pa, slot_type::INVENTORY, 0).unwrap();
+    let before_state = (
+        before.id,
+        before.slot,
+        before.slot_type,
+        before.count,
+        before.grade,
+        before.ucc_id,
+        before.dirty,
+    );
+    cast(&mut w, 14433, source, 17662, foreign).await;
+    let after = item_at(&w.pa, slot_type::INVENTORY, 0).expect("the ink is back");
+    assert_eq!(
+        (
+            after.id,
+            after.slot,
+            after.slot_type,
+            after.count,
+            after.grade,
+            after.ucc_id,
+            after.dirty,
+        ),
+        before_state
+    );
+    assert!(!w.a.drain_ops().contains(&sc::SCItemUccDataChangedPacket));
+}

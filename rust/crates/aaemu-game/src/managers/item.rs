@@ -2,7 +2,6 @@
 //! container and item is held in memory), `GetItemContainerForCharacter`, `Create`, `ReleaseId`
 //! and `Save` (dirty containers / items, deleted items).
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use sqlx::mysql::{MySqlPool, MySqlRow};
@@ -29,9 +28,6 @@ pub struct ItemManager {
     loose: Mutex<Vec<Item>>,
     /// `_removedItems`.
     removed: Mutex<Vec<u64>>,
-    /// Items held by a running skill cast (`item id -> cast timeline id`). Trading, selling or
-    /// destroying a reserved item is refused until the cast consumes or releases it.
-    reserved: Mutex<HashMap<u64, u64>>,
     /// Item/container snapshots written by the current world transaction, awaiting commit.
     pending_save: Mutex<Option<ItemSaveBatch>>,
     /// Serialises `GetItemContainerForCharacter`'s find-or-create.
@@ -399,29 +395,6 @@ impl ItemManager {
     }
 
     /// `GetItemByItemId`.
-    /// Reserve `item_id` for the cast `token`; false when another cast holds it.
-    pub fn reserve_item(&self, item_id: u64, token: u64) -> bool {
-        let mut reserved = lock(&self.reserved);
-        if reserved.contains_key(&item_id) {
-            return false;
-        }
-        reserved.insert(item_id, token);
-        true
-    }
-
-    /// Release `item_id` if it is still reserved by `token`.
-    pub fn release_item(&self, item_id: u64, token: u64) {
-        let mut reserved = lock(&self.reserved);
-        if reserved.get(&item_id) == Some(&token) {
-            reserved.remove(&item_id);
-        }
-    }
-
-    /// The cast token that reserved `item_id`, if any.
-    pub fn reserved_by(&self, item_id: u64) -> Option<u64> {
-        lock(&self.reserved).get(&item_id).copied()
-    }
-
     pub fn item_by_id(&self, item_id: u64) -> Option<Item> {
         for c in self.all_containers() {
             if let Some(i) = c

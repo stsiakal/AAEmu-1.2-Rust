@@ -19,6 +19,7 @@ use super::buffs;
 use super::combat as unit_combat;
 use super::data::{EffectKind, EffectTemplate, SkillEffect, SkillTemplate};
 use super::effects::{self, EffectArgs, EffectSource};
+use super::ext::TakenCastItem;
 use super::geometry::{distance_to, is_front, world_of, world_pos, PosUnit, Target};
 use super::packets::{
     CompressedGamePackets, SCCastingStoppedPacket, SCCooldownsPacket, SCSkillCooldownResetPacket,
@@ -639,6 +640,7 @@ pub fn use_skill(
         let mut state = skill.state();
         state.generation = state.generation.wrapping_add(1);
         state.cancelled = false;
+        state.effect_cancelled = false;
         state.music_started_pending = false;
         state.gcd_started = false;
         state.hit_types.clear();
@@ -1640,22 +1642,36 @@ fn append_hostile_ships_hit_by_siege_hull_aoe(
     }
 }
 
-/// Releases an item reservation if the effect pipeline returns without consuming it.
-struct ItemCastReservation<'a> {
+/// Refunds the cast's taken source item unless the cast result was committed. Dropping the
+/// guard refunds: an early refusal (missing reagent, failed build) or an effect that cancels
+/// while nothing could be charged.
+struct CastSourceDebit<'a> {
     server: &'a GameServer,
-    item_id: u64,
-    token: u64,
-    active: bool,
+    taken: Option<TakenCastItem>,
 }
 
-impl Drop for ItemCastReservation<'_> {
+impl Drop for CastSourceDebit<'_> {
     fn drop(&mut self) {
-        if self.active {
-            self.server.systems.skills.ext.items().release_owned_item(
-                self.server,
-                self.item_id,
-                self.token,
-            );
+        if let Some(taken) = self.taken.take() {
+            self.server
+                .systems
+                .skills
+                .ext
+                .items()
+                .refund_cast_source_item(self.server, taken);
+        }
+    }
+}
+
+impl CastSourceDebit<'_> {
+    fn commit(&mut self) {
+        if let Some(taken) = self.taken.take() {
+            self.server
+                .systems
+                .skills
+                .ext
+                .items()
+                .commit_cast_source_item(self.server, taken);
         }
     }
 }
@@ -1913,34 +1929,37 @@ pub fn apply_effects(server: &GameServer, skill: &SkillRef, ctx: &CastCtx) {
                 )
             })
     });
+    // The cast item is the source of the skill: consume it (or only re-verify it when the skill
+    // consumes nothing) before the reagents, products and effects run, so an item that left the
+    // bag during a cast time refuses the cast instead of firing for free.
     let mut owned_item_use: Option<(u64, u32, i32)> = None;
-    if let Some(last) = last_applied {
-        // Deviation: C# looked at the last applied effect only. Skills with mixed flags (a
-        // consuming GainItem followed by an Interaction effect) never consumed the item, so the
-        // last applied effect that carries `consume_source_item` / `consume_item_id` wins.
-        let applied = || to_apply.iter().map(|(_, e)| *e);
-        let source_effect = applied().rev().find(|e| e.consume_source_item);
-        let template_effect = applied()
-            .rev()
-            .find(|e| e.consume_item_id != 0 && e.consume_item_count > 0);
-        if let SkillCaster::Item {
-            item_id,
-            item_template_id,
-            ..
-        } = ctx.caster_caster
-        {
-            // The cast item is the source of the skill: consume it (or only re-verify it when
-            // the skill consumes nothing) right before the effects run, so an item that left the
-            // bag during a cast time refuses the cast instead of firing for free.
-            let amount = if let Some(e) = source_effect {
+    if let SkillCaster::Item {
+        item_id,
+        item_template_id,
+        ..
+    } = ctx.caster_caster
+    {
+        let amount = last_applied.map_or(0, |last| {
+            // Deviation: C# looked at the last applied effect only. Skills with mixed flags (a
+            // consuming GainItem followed by an Interaction effect) never consumed the item, so
+            // the last applied effect that carries `consume_source_item` / `consume_item_id`
+            // wins.
+            let applied = || to_apply.iter().map(|(_, e)| *e);
+            if let Some(e) = applied().rev().find(|e| e.consume_source_item) {
                 e.consume_item_count
             } else if items.use_skill_as_reagent(server, item_template_id) {
                 last.consume_item_count
             } else {
                 0
-            };
-            owned_item_use = Some((item_id, item_template_id, amount));
-        }
+            }
+        });
+        owned_item_use = Some((item_id, item_template_id, amount));
+    }
+    if last_applied.is_some() {
+        let applied = || to_apply.iter().map(|(_, e)| *e);
+        let template_effect = applied()
+            .rev()
+            .find(|e| e.consume_item_id != 0 && e.consume_item_count > 0);
         if let Some(p) = &player {
             if let Some(e) = template_effect.filter(|e| {
                 // SavePortal pays its effect items in its own atomic step; house construction
@@ -1957,6 +1976,43 @@ pub fn apply_effects(server: &GameServer, skill: &SkillRef, ctx: &CastCtx) {
                 {
                     consumed_templates.push((e.consume_item_id, e.consume_item_count));
                 }
+            }
+        }
+    }
+    // Debit the cast item before anything else can be granted: the owner, template and count
+    // must still match and it must sit in the caster's bag or equipment. The item stays out of
+    // its container until the result is committed, so no mover can reach it mid-cast; a missing
+    // item refuses the whole result (no reagents, products or effects).
+    let mut source_debit: Option<CastSourceDebit<'_>> = None;
+    let mut source_item = None;
+    let mut source_item_debited = false;
+    if let (Some((item_id, template_id, amount)), Some(p)) = (owned_item_use, &player) {
+        match items.take_cast_source_item(server, p, item_id, template_id, amount) {
+            Some(Ok(taken)) => {
+                source_item = Some(std::sync::Arc::new(taken.item.clone()));
+                source_item_debited = taken.removed;
+                source_debit = Some(CastSourceDebit {
+                    server,
+                    taken: Some(taken),
+                });
+            }
+            Some(Err(())) => {
+                skill.state().cancelled = true;
+                stop(server, skill, caster, 0);
+                return;
+            }
+            None => {
+                // Hooks that do not track items: keep the owner-check semantics with the read
+                // API they provide.
+                let ok = items
+                    .owned_item(server, p, item_id)
+                    .is_some_and(|(tid, count)| tid == template_id && count >= amount.max(0));
+                if !ok {
+                    skill.state().cancelled = true;
+                    stop(server, skill, caster, 0);
+                    return;
+                }
+                source_item = server.items.item_by_id(item_id).map(std::sync::Arc::new);
             }
         }
     }
@@ -1989,41 +2045,6 @@ pub fn apply_effects(server: &GameServer, skill: &SkillRef, ctx: &CastCtx) {
         }
     }
 
-    // Reserve the cast item under one lock before any effect runs: the owner, template and
-    // count must still match, and trading / selling / destroying it is refused until this cast
-    // either consumes it or releases the reservation (on a cancelled effect).
-    let mut reservation = None;
-    if let (Some((item_id, template_id, amount)), Some(p)) = (owned_item_use, &player) {
-        let token = u64::from(skill.tl_id());
-        match items.reserve_owned_item(server, p, item_id, template_id, amount, token) {
-            Some(true) => {
-                reservation = Some(ItemCastReservation {
-                    server,
-                    item_id,
-                    token,
-                    active: true,
-                });
-            }
-            Some(false) => {
-                skill.state().cancelled = true;
-                stop(server, skill, caster, 0);
-                return;
-            }
-            None => {
-                // Hooks that do not track items: keep the owner-check semantics with the read
-                // API they provide.
-                let ok = items
-                    .owned_item(server, p, item_id)
-                    .is_some_and(|(tid, count)| tid == template_id && count >= amount.max(0));
-                if !ok {
-                    skill.state().cancelled = true;
-                    stop(server, skill, caster, 0);
-                    return;
-                }
-            }
-        }
-    }
-
     // Weighted selection
     let weighted_total: i32 = to_apply.iter().map(|(_, e)| e.weight).sum();
     let mut selected = -1i32;
@@ -2032,6 +2053,9 @@ pub fn apply_effects(server: &GameServer, skill: &SkillRef, ctx: &CastCtx) {
     }
     let mut current_weight = 0;
     let mut packets = CompressedGamePackets::new();
+    let mut effect_source = EffectSource::from_skill(skill.clone());
+    effect_source.source_item = source_item.clone();
+    effect_source.source_item_debited = source_item_debited;
     let tl = skill.tl_id();
     for (target, effect) in &to_apply {
         if effect.weight > 0 {
@@ -2077,7 +2101,7 @@ pub fn apply_effects(server: &GameServer, skill: &SkillRef, ctx: &CastCtx) {
                 skill_id: t.id,
                 tl_id: tl,
             },
-            source: EffectSource::from_skill(skill.clone()),
+            source: effect_source.clone(),
             skill_object: &ctx.skill_object,
         };
         args.source.always_hit = effect.always_hit;
@@ -2107,6 +2131,8 @@ pub fn apply_effects(server: &GameServer, skill: &SkillRef, ctx: &CastCtx) {
                     );
                 }
                 Err(error) => {
+                    // The cast's own effect refused its payment: refund the source item.
+                    skill.state().effect_cancelled = true;
                     if error == crate::systems::housing::ops::BuildActionError::MissingMaterial {
                         let mut packet = SCSkillStartedPacket::new(
                             skill.id,
@@ -2144,6 +2170,7 @@ pub fn apply_effects(server: &GameServer, skill: &SkillRef, ctx: &CastCtx) {
                 .is_some_and(|p| p.data().skill_char.skill_cancelled)
             {
                 skill.state().cancelled = true;
+                skill.state().effect_cancelled = true;
             }
         }
         if effect.item_set_id > 0 {
@@ -2197,36 +2224,16 @@ pub fn apply_effects(server: &GameServer, skill: &SkillRef, ctx: &CastCtx) {
             }
         }
     }
-    if let Some(mut reserved) = reservation {
-        if skill.cancelled() {
-            // Dropping the guard releases the reservation; a cancelled effect keeps the item.
-        } else if let (Some((item_id, template_id, amount)), Some(p)) = (owned_item_use, &player) {
-            match items.consume_reserved_item(
-                server,
-                p,
-                item_id,
-                template_id,
-                amount,
-                reserved.token,
-            ) {
-                Some(true) => reserved.active = false,
-                Some(false) => {
-                    // The reservation should make this unreachable; never grant the effect
-                    // without taking the item.
-                    tracing::error!(
-                        item_id,
-                        template_id,
-                        "reserved SkillItem could not be consumed after the effect"
-                    );
-                    skill.state().cancelled = true;
-                }
-                None => {
-                    reserved.active = false;
-                    if amount > 0 {
-                        consumed_items.push((item_id, amount));
-                    }
-                }
-            }
+    // An effect that cancels itself (invalid UCC/dye target, missing build material) refunds
+    // the source item it could not charge for. A client / channel stop that lands while the
+    // effects run (no effect cancelled) still pays for the effects that went out.
+    let effect_cancelled = skill.state().effect_cancelled
+        || player
+            .as_ref()
+            .is_some_and(|p| p.data().skill_char.skill_cancelled);
+    if let Some(mut debit) = source_debit {
+        if !effect_cancelled {
+            debit.commit();
         }
     }
     if !skill.cancelled() {
