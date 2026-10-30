@@ -181,7 +181,14 @@ class Lane:
         self.password = os.environ.get("AAEMU_VERIFY_PASSWORD") or "testpass"
         self.bash = find_bash()
 
-    def stack(self, action: str, log_path: Path) -> int:
+    def mysql_reachable(self) -> bool:
+        try:
+            with socket.create_connection(("127.0.0.1", int(self.mysql_port)), timeout=3):
+                return True
+        except (OSError, ValueError):
+            return False
+
+    def stack(self, action: str, log_path: Path, abort: threading.Event | None = None) -> int:
         env = os.environ.copy()
         env.update(
             {
@@ -194,14 +201,16 @@ class Lane:
         for key in ("AAEMU_MYSQL_BIN", "AAEMU_MYSQL_PORT", "AAEMU_DB_USER"):
             if key not in env and self.machine.get(key):
                 env[key] = self.machine[key]
+        timeout = float(os.environ.get("AAEMU_SOAK_STACK_TIMEOUT", "3600"))
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("ab") as out:
             out.write(f"\n== {datetime.now().isoformat(timespec='seconds')} live-stack.sh {action}\n".encode())
             out.flush()
             kwargs = {}
             if os.name == "nt":
-                # A Ctrl+Break aimed at the runner must not kill the servers behind its back;
-                # the finally block stops this lane's stack explicitly.
+                # Keep the stack (and any mysqld) out of the runner's console group: a
+                # Ctrl+C/Ctrl+Break aimed at the runner must not signal the processes it
+                # started. The finally block stops this lane's stack explicitly.
                 kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
             proc = subprocess.Popen(
                 [self.bash, str(REPO / "Scripts/live-stack.sh"), action],
@@ -212,14 +221,34 @@ class Lane:
                 **kwargs,
             )
             try:
-                return proc.wait(timeout=1800)
-            except subprocess.TimeoutExpired:
-                kill_tree(proc.pid)
-                proc.wait(timeout=30)
-                log(f"[setup] live-stack.sh {action} timed out after 1800s; see {log_path}")
-                return 124
+                deadline = time.monotonic() + timeout
+                while True:
+                    try:
+                        return proc.wait(timeout=0.5)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    if abort is not None and abort.is_set():
+                        kill_tree(proc.pid)
+                        try:
+                            proc.wait(timeout=30)
+                        except subprocess.TimeoutExpired:
+                            pass
+                        log(f"[setup] live-stack.sh {action} aborted")
+                        return 124
+                    if time.monotonic() >= deadline:
+                        kill_tree(proc.pid)
+                        try:
+                            proc.wait(timeout=30)
+                        except subprocess.TimeoutExpired:
+                            pass
+                        log(f"[setup] live-stack.sh {action} timed out after {timeout:.0f}s; see {log_path}")
+                        return 124
             except BaseException:
                 kill_tree(proc.pid)
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    pass
                 raise
 
     def mysql_cmd(self, sql: str, database: str | None = None) -> str:
@@ -234,7 +263,17 @@ class Lane:
         if database:
             cmd.append(database)
         cmd.extend(["-e", sql])
-        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"mysql timed out after 60s: {sql.splitlines()[0][:120]}")
         if proc.returncode != 0:
             raise RuntimeError(f"mysql failed: {proc.stderr.strip() or proc.stdout.strip()}")
         return proc.stdout.strip()
@@ -315,10 +354,45 @@ def run_account_prefix(prefix: str, stamp: datetime) -> str:
     return f"{prefix}{stamp.strftime('%m%d%H%M')}"
 
 
-def npc_character_name(account: str, seq: int, retries: int) -> str:
-    """Unique disposable npc-return character per attempt and per transient retry."""
-    suffix = "abcdefghijklmnopqrstuvwxyz"[retries % 26]
-    return f"{account}n{seq:02d}{suffix}"
+NAME_DIGITS = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+def encode_seq(seq: int) -> str:
+    """Two base-36 characters; wraps at 1296 and stays within the 18-char name limit."""
+    seq %= 1296
+    return f"{NAME_DIGITS[seq // 36]}{NAME_DIGITS[seq % 36]}"
+
+
+def npc_character_name(
+    account: str, seq: int, retries: int, used: set[str] | None = None
+) -> str:
+    """Unique disposable npc-return character per attempt and per transient retry.
+
+    `account` already ends within the 18-character limit of the base character, so the
+    two-character sequence code plus the one retry letter keep every name bounded. When
+    `used` is given, names created in this run are reserved against sequence wrapping.
+    """
+    retry = "abcdefghijklmnopqrstuvwxyz"[retries % 26]
+    for offset in range(1296):
+        name = f"{account}n{encode_seq(seq + offset)}{retry}"
+        if used is None or name not in used:
+            if used is not None:
+                used.add(name)
+            return name
+    raise RuntimeError(f"no free npc-return character name for {account} after 1296 slots")
+
+
+def npc_name_too_long(bot_accounts: list[str]) -> str | None:
+    """The first over-long character name implied by the bot accounts, if any."""
+    longest = max(bot_accounts, key=len, default="")
+    if not longest:
+        return None
+    name = npc_character_name(longest, 0, 0)
+    return name if len(name) > 18 else None
+
+
+class SoakAborted(Exception):
+    """The runner is stopping; do not start another child process."""
 
 
 def remaining_scenarios(scenarios: list[str], skipped: set[str]) -> list[str]:
@@ -419,6 +493,7 @@ class Runner:
         self.interrupted = False
         self.next_seq_map: dict[str, int] = {}
         self.home: dict[str, dict] = {}
+        self.npc_names: set[str] = set()
         self.abort = threading.Event()
         self.abort_reason = ""
         self.stats: dict[str, ScenarioStats] = {name: ScenarioStats() for name in args.scenarios}
@@ -434,6 +509,7 @@ class Runner:
         self.bug_run_dir: Path | None = None
         self.server_down_reason = ""
         self.stack_started = False
+        self.stack_attempted = False
 
     # ---- child processes ---------------------------------------------------------------------
     def spawn(self, cmd, **kwargs) -> subprocess.Popen:
@@ -441,8 +517,10 @@ class Runner:
         # bots' fate; the runner kills its children by pid in the finally block.
         if os.name == "nt":
             kwargs.setdefault("creationflags", subprocess.CREATE_NEW_PROCESS_GROUP)
-        proc = subprocess.Popen(cmd, **kwargs)
         with self.children_lock:
+            if self.abort.is_set():
+                raise SoakAborted("soak aborted; not starting a child process")
+            proc = subprocess.Popen(cmd, **kwargs)
             self.children[proc.pid] = proc
         return proc
 
@@ -502,7 +580,7 @@ class Runner:
     def build(self) -> None:
         build_log = self.run_dir / "build.log"
         log(f"[setup] building the lane stack ({self.lane.profile} profile) -> {build_log}")
-        rc = self.lane.stack("build", build_log)
+        rc = self.lane.stack("build", build_log, abort=self.abort)
         if rc != 0:
             tail = last_meaningful_line(build_log.read_text(encoding="utf-8", errors="replace")[-4000:])
             fail(f"live-stack.sh build failed (rc {rc}): {tail}")
@@ -513,7 +591,7 @@ class Runner:
     def sync_and_configure(self) -> None:
         sync_log = self.run_dir / "sync.log"
         log("[setup] syncing app config/data into the lane runtime dir")
-        if self.lane.stack("sync", sync_log) != 0:
+        if self.lane.stack("sync", sync_log, abort=self.abort) != 0:
             fail(f"live-stack.sh sync failed ({sync_log})")
         self.configure_runtime()
 
@@ -535,11 +613,21 @@ class Runner:
             cfg_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
         log(f"[setup] BugReports enabled in {self.lane.live / 'rs-game' / 'Config.Local.json'} -> {self.bug_root}")
 
+    def require_mysql(self) -> None:
+        if not self.lane.mysql_reachable():
+            fail(
+                f"shared MySQL {self.lane.mysql_port} is down; start it outside the soak runner"
+            )
+
     def restart_stack(self) -> None:
+        # Never let live-stack.sh start (and Ctrl+Break kill) the shared MySQL: if it is
+        # down this run must refuse before it touches any stack process.
+        self.require_mysql()
         log("[setup] stopping this lane's stack (MySQL stays up)")
-        self.lane.stack("stop", self.run_dir / "stack-stop.log")
+        self.lane.stack("stop", self.run_dir / "stack-stop.log", abort=self.abort)
         log("[setup] starting the stack with bug reports enabled")
-        rc = self.lane.stack("start", self.run_dir / "stack-start.log")
+        self.stack_attempted = True
+        rc = self.lane.stack("start", self.run_dir / "stack-start.log", abort=self.abort)
         if rc != 0:
             tail = last_meaningful_line((self.run_dir / "stack-start.log").read_text(encoding="utf-8", errors="replace")[-4000:])
             fail(f"live-stack.sh start failed (rc {rc}): {tail}")
@@ -621,11 +709,13 @@ class Runner:
         self.bot_accounts = [f"{self.account_prefix}b{i}" for i in range(self.args.bots)]
         load_count = 0 if "load" not in self.args.scenarios else self.args.load_bots
         self.load_accounts = [f"{self.account_prefix}l{i}" for i in range(load_count)]
-        longest = max(self.bot_accounts + self.load_accounts, key=len, default="")
-        if longest and len(npc_character_name(longest, 99, 0)) > 18:
+        # Only bots create npc-return characters; load accounts create plain characters whose
+        # names are the (shorter) account names.
+        too_long = npc_name_too_long(self.bot_accounts)
+        if too_long:
             fail(
                 "--prefix is too long: character names must stay within 18 characters "
-                f"({npc_character_name(longest, 99, 0)})"
+                f"({too_long})"
             )
         log(f"[setup] account prefix {self.account_prefix}; provisioning {len(self.bot_accounts) + len(self.load_accounts)} account(s)")
         alive = self.provision(self.bot_accounts + self.load_accounts)
@@ -689,7 +779,8 @@ class Runner:
             # The scenario needs a character with no quest 330 history; the server keeps a
             # logged-out character cached, so deleting quest rows from the DB is not enough.
             # A retry must not reuse the name the failed try may already have created.
-            character = npc_character_name(account, seq, retries)
+            with self.lock:
+                character = npc_character_name(account, seq, retries, self.npc_names)
             config = self.run_dir / "configs" / f"{account}-{seq:04d}-npc-return-r{retries}.json"
             config.parent.mkdir(parents=True, exist_ok=True)
             config.write_text(
@@ -707,9 +798,13 @@ class Runner:
     )
 
     def run_attempt(self, name: str, account: str) -> dict:
+        if self.abort.is_set():
+            raise SoakAborted("soak aborted before the scenario")
         seq = self.next_seq(account)
         retries = 0
         while True:
+            if self.abort.is_set():
+                raise SoakAborted("soak aborted before the scenario")
             config = self.prepare_attempt(name, account, seq, retries)
             record = self.run_attempt_once(name, account, seq, retries, config)
             record["retries"] = retries
@@ -920,6 +1015,8 @@ class Runner:
                 try:
                     self.run_attempt(name, account)
                     ran_any = True
+                except SoakAborted:
+                    return
                 except Exception as exc:  # never let one bot kill the soak
                     log(f"[{account}] {name} runner error: {exc}")
                     with self.lock:
@@ -941,6 +1038,8 @@ class Runner:
         def worker(account: str) -> None:
             try:
                 self.run_attempt("full", account)
+            except SoakAborted:
+                return
             except Exception as exc:
                 log(f"[{account}] home run error: {exc}")
             time.sleep(self.args.between_seconds)
@@ -1291,6 +1390,40 @@ def parse_scenarios(value: str) -> list[str]:
     return ordered
 
 
+def run_soak(runner: Runner, args: argparse.Namespace) -> bool:
+    """Setup + run + cleanup; returns True when interrupted (partial dashboard next)."""
+    interrupted = False
+    try:
+        if not args.no_build:
+            runner.build()
+        if not args.no_sync:
+            runner.sync_and_configure()
+        else:
+            runner.configure_runtime()
+        runner.restart_stack()
+        runner.provision_all()
+        runner.prepare_homes()
+        runner.run_load_phase()
+        runner.soak()
+        log("[report] waiting 12 s for the bug reporter's summary refresh")
+        time.sleep(12)
+    except (KeyboardInterrupt, SoakAborted):
+        interrupted = True
+        runner.interrupted = True
+        runner.abort.set()
+        if runner.started:
+            runner.finished = time.monotonic()
+        log("[runner] interrupted: killing bot clients and writing a partial dashboard")
+    finally:
+        runner.kill_children()
+        runner.stop_workers()
+        runner.kill_children()
+        if not args.keep_stack and runner.stack_attempted:
+            log("[setup] stopping this lane's stack (MySQL stays up)")
+            runner.lane.stack("stop", runner.run_dir / "stack-stop.log")
+    return interrupted
+
+
 def main(argv: list[str]) -> int:
     install_break_handler()
     parser = argparse.ArgumentParser(
@@ -1313,8 +1446,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--seed", type=int, default=1, help="seed for the per-bot scenario order (default 1)")
     parser.add_argument(
         "--prefix",
-        default="soak",
-        help="account/character prefix (default soak; a per-run time suffix is appended)",
+        default="sk",
+        help="account/character prefix (default sk; a per-run month/day/time suffix is appended)",
     )
     parser.add_argument(
         "--load-bots",
@@ -1374,35 +1507,9 @@ def main(argv: list[str]) -> int:
 
     runner.run_dir.mkdir(parents=True, exist_ok=True)
     runner.attempts_path.touch()
-    interrupted = False
-    try:
-        if not args.no_build:
-            runner.build()
-        if not args.no_sync:
-            runner.sync_and_configure()
-        else:
-            runner.configure_runtime()
-        runner.restart_stack()
-        runner.provision_all()
-        runner.prepare_homes()
-        runner.run_load_phase()
-        runner.soak()
-        log("[report] waiting 12 s for the bug reporter's summary refresh")
-        time.sleep(12)
-    except KeyboardInterrupt:
-        interrupted = True
-        runner.interrupted = True
-        runner.abort.set()
-        if runner.started:
-            runner.finished = time.monotonic()
-        log("[runner] interrupted: killing bot clients and writing a partial dashboard")
-    finally:
-        runner.kill_children()
-        runner.stop_workers()
-        runner.kill_children()
-        if not args.keep_stack:
-            log("[setup] stopping this lane's stack (MySQL stays up)")
-            runner.lane.stack("stop", runner.run_dir / "stack-stop.log")
+    # Fail before a cold build if the shared MySQL is down; restart_stack checks again.
+    runner.require_mysql()
+    interrupted = run_soak(runner, args)
     md, data = runner.write_dashboard()
     totals = data["totals"]
     log(

@@ -4,6 +4,12 @@ No servers, MySQL or lane registry are touched.
 """
 
 from datetime import datetime
+import contextlib
+import io
+from pathlib import Path
+import sys
+import threading
+import types
 import unittest
 
 import bots_soak
@@ -67,18 +73,134 @@ class NamingTests(unittest.TestCase):
         self.assertTrue(first.startswith("soak1030"))
         self.assertTrue(second.startswith("soak1130"))
 
-    def test_npc_character_names_are_unique_per_retry_and_fit_the_limit(self):
-        account = bots_soak.run_account_prefix("soak", datetime(2026, 10, 30, 12, 34)) + "b0"
+    def test_npc_character_name_length_is_bounded_for_every_seq(self):
+        account = bots_soak.run_account_prefix("sk", datetime(2026, 10, 30, 12, 34)) + "b0"
+        lengths = set()
+        for seq in (0, 99, 100, 5000, 1296 * 3 + 7):
+            name = bots_soak.npc_character_name(account, seq, 0)
+            self.assertLessEqual(len(name), 18, name)
+            lengths.add(len(name))
+        self.assertEqual(len(lengths), 1, f"sequence encoding changed the name length: {lengths}")
+
+    def test_seq_encoding_wraps_without_reusing_a_name(self):
+        account = bots_soak.run_account_prefix("sk", datetime(2026, 10, 30, 12, 34)) + "b0"
+        used: set[str] = set()
+        first = bots_soak.npc_character_name(account, 0, 0, used)
+        wrapped = bots_soak.npc_character_name(account, 1296, 0, used)
+        self.assertNotEqual(first, wrapped)
+        self.assertEqual(len(wrapped), len(first))
+
+    def test_npc_character_names_are_unique_per_retry(self):
+        account = bots_soak.run_account_prefix("sk", datetime(2026, 10, 30, 12, 34)) + "b0"
         names = {bots_soak.npc_character_name(account, 7, retry) for retry in range(3)}
         self.assertEqual(len(names), 3)
         for name in names:
             self.assertLessEqual(len(name), 18, name)
 
-    def test_default_prefix_fits_with_retry_suffix(self):
+    def test_default_prefix_fits_64_bots(self):
         stamp = datetime(2026, 10, 30, 12, 34)
-        account = bots_soak.run_account_prefix("soak", stamp) + "b7"
-        name = bots_soak.npc_character_name(account, 99, 2)
-        self.assertLessEqual(len(name), 18, name)
+        accounts = [f"{bots_soak.run_account_prefix('sk', stamp)}b{i}" for i in range(64)]
+        self.assertIsNone(bots_soak.npc_name_too_long(accounts))
+        self.assertLessEqual(len(bots_soak.npc_character_name(accounts[-1], 5000, 2)), 18)
+
+    def test_old_long_prefix_no_longer_fits_64_bots(self):
+        stamp = datetime(2026, 10, 30, 12, 34)
+        accounts = [f"{bots_soak.run_account_prefix('soak', stamp)}b{i}" for i in range(64)]
+        self.assertIsNotNone(bots_soak.npc_name_too_long(accounts))
+
+
+class FakeLane:
+    def __init__(self, reachable: bool = True):
+        self.mysql_port = "3317"
+        self.reachable = reachable
+        self.calls: list[tuple[str, str]] = []
+
+    def mysql_reachable(self) -> bool:
+        return self.reachable
+
+    def stack(self, action: str, log_path: Path, abort=None) -> int:
+        self.calls.append((action, str(log_path)))
+        return 0
+
+
+def fake_runner() -> bots_soak.Runner:
+    runner = bots_soak.Runner.__new__(bots_soak.Runner)
+    runner.abort = threading.Event()
+    runner.children = {}
+    runner.children_lock = threading.Lock()
+    runner.worker_threads = []
+    runner.interrupted = False
+    runner.started = 0.0
+    runner.finished = 0.0
+    runner.stack_attempted = False
+    runner.run_dir = Path(".")
+    return runner
+
+
+class SetupSafetyTests(unittest.TestCase):
+    def test_mysql_down_refuses_before_any_stack_command(self):
+        runner = fake_runner()
+        runner.lane = FakeLane(reachable=False)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit):
+                runner.restart_stack()
+        self.assertEqual(runner.lane.calls, [])
+        self.assertIn(
+            "shared MySQL 3317 is down; start it outside the soak runner",
+            stderr.getvalue(),
+        )
+
+    def test_mysql_down_refuses_before_any_stack_command_in_run_soak(self):
+        runner = fake_runner()
+        runner.lane = FakeLane(reachable=False)
+        runner.sync_and_configure = lambda: None
+        args = types.SimpleNamespace(no_build=True, no_sync=False, keep_stack=False)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                bots_soak.run_soak(runner, args)
+        self.assertEqual(runner.lane.calls, [])
+        self.assertFalse(runner.stack_attempted)
+
+    def test_spawn_after_abort_is_refused(self):
+        runner = fake_runner()
+        runner.abort.set()
+        with self.assertRaises(bots_soak.SoakAborted):
+            runner.spawn([sys.executable, "-c", "pass"])
+        self.assertEqual(runner.children, {})
+
+    def test_interrupt_during_provisioning_stops_once_and_refuses_children(self):
+        runner = fake_runner()
+        runner.lane = FakeLane()
+        runner.stack_attempted = True
+        for name in (
+            "build",
+            "sync_and_configure",
+            "configure_runtime",
+            "restart_stack",
+            "prepare_homes",
+            "run_load_phase",
+            "soak",
+        ):
+            setattr(runner, name, lambda: None)
+
+        def interrupt():
+            raise KeyboardInterrupt
+
+        runner.provision_all = interrupt
+        args = types.SimpleNamespace(no_build=True, no_sync=True, keep_stack=False)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            interrupted = bots_soak.run_soak(runner, args)
+
+        self.assertTrue(interrupted)
+        self.assertTrue(runner.interrupted)
+        self.assertTrue(runner.abort.is_set())
+        self.assertEqual([call[0] for call in runner.lane.calls], ["stop"])
+        for call in runner.lane.calls:
+            self.assertNotIn("--mysql", " ".join(call))
+        with self.assertRaises(bots_soak.SoakAborted):
+            runner.spawn([sys.executable, "-c", "pass"])
+        self.assertEqual(runner.children, {})
 
 
 class RemainingScenariosTests(unittest.TestCase):
