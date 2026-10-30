@@ -460,13 +460,26 @@ pub struct MateSpawn {
 /// One item of an `SCItemTaskSuccessPacket` task.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskItem {
-    /// `ItemAction` of the task (5 create, 9 update detail, ...).
+    /// `ItemAction` of the task (4 add stack, 5 create, 9 update detail, ...).
     pub task: u8,
     /// Template id (0 for tasks that do not carry it, e.g. `UpdateDetail`).
     pub template: u32,
     pub id: u64,
+    pub slot_type: u8,
+    pub slot: u8,
+    /// Stack count for `Create`-style tasks, the delta for `AddStack`, 0 when the task has none.
+    pub count: i32,
     /// `SummonMate` detail block: `(exp, dead flag, level)`; a non-zero dead flag marks a corpse.
     pub mate: Option<(i32, u8, u8)>,
+}
+
+/// A bag stack the client knows about: an `SCItemTaskSuccessPacket` created or changed it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BagStack {
+    pub template: u32,
+    pub slot_type: u8,
+    pub slot: u8,
+    pub count: i32,
 }
 
 /// The readable part of an `SCItemTaskSuccessPacket`.
@@ -491,9 +504,14 @@ pub enum GameEvent {
 mod item_action {
     pub const CHANGE_MONEY_AMOUNT: u8 = 1;
     pub const CHANGE_BANK_MONEY_AMOUNT: u8 = 2;
+    pub const ADD_STACK: u8 = 4;
     pub const CREATE: u8 = 5;
     pub const TAKE: u8 = 6;
+    pub const REMOVE: u8 = 7;
+    pub const SWAP_SLOT: u8 = 8;
     pub const UPDATE_DETAIL: u8 = 9;
+    pub const REMOVE_CRAFTING: u8 = 12;
+    pub const SEIZE: u8 = 13;
     pub const CHANGE_OWNER: u8 = 15;
 }
 
@@ -529,21 +547,25 @@ pub fn parse_item_task(body: &[u8]) -> ItemTaskInfo {
                     info.money += i64::from(s.read_i32()?);
                 }
                 item_action::CREATE | item_action::CHANGE_OWNER | item_action::TAKE => {
-                    s.read_u8()?; // slot type
-                    s.read_u8()?; // slot
+                    let slot_type = s.read_u8()?;
+                    let slot = s.read_u8()?;
                     let template = s.read_u32()?;
                     let id = s.read_u64()?;
                     info.items.push(TaskItem {
                         task,
                         template,
                         id,
+                        slot_type,
+                        slot,
+                        count: 0,
                         mate: None,
                     });
                     s.read_u8()?; // grade
                     s.read_u8()?; // flags
-                    s.read_i32()?; // count
+                    let count = s.read_i32()?;
                     let mate = details(s)?;
                     if let Some(item) = info.items.last_mut() {
+                        item.count = count;
                         item.mate = mate;
                     }
                     s.read_i64()?; // create time
@@ -553,15 +575,93 @@ pub fn parse_item_task(body: &[u8]) -> ItemTaskInfo {
                     s.read_i64()?; // unsecure time
                     s.read_i64()?; // unpack time
                 }
+                item_action::ADD_STACK => {
+                    let slot_type = s.read_u8()?;
+                    let slot = s.read_u8()?;
+                    let id = s.read_u64()?;
+                    let count = s.read_i32()?;
+                    let template = s.read_u32()?;
+                    info.items.push(TaskItem {
+                        task,
+                        template,
+                        id,
+                        slot_type,
+                        slot,
+                        count,
+                        mate: None,
+                    });
+                }
+                item_action::REMOVE => {
+                    let slot_type = s.read_u8()?;
+                    let slot = s.read_u8()?;
+                    let id = s.read_u64()?;
+                    let template = s.read_u32()?;
+                    info.items.push(TaskItem {
+                        task,
+                        template,
+                        id,
+                        slot_type,
+                        slot,
+                        count: 0,
+                        mate: None,
+                    });
+                }
+                item_action::REMOVE_CRAFTING => {
+                    let id = s.read_u64()?;
+                    info.items.push(TaskItem {
+                        task,
+                        template: 0,
+                        id,
+                        slot_type: 0,
+                        slot: 0,
+                        count: 0,
+                        mate: None,
+                    });
+                }
+                item_action::SEIZE => {
+                    let slot_type = s.read_u8()?;
+                    let slot = s.read_u8()?;
+                    let id = s.read_u64()?;
+                    info.items.push(TaskItem {
+                        task,
+                        template: 0,
+                        id,
+                        slot_type,
+                        slot,
+                        count: 0,
+                        mate: None,
+                    });
+                }
+                item_action::SWAP_SLOT => {
+                    let slot_type = s.read_u8()?;
+                    let slot = s.read_u8()?;
+                    s.read_u8()?; // to slot type
+                    s.read_u8()?; // to slot
+                    let id = s.read_u64()?;
+                    s.read_u64()?; // to item id
+                    s.read_i32()?; // flags
+                    info.items.push(TaskItem {
+                        task,
+                        template: 0,
+                        id,
+                        slot_type,
+                        slot,
+                        count: 0,
+                        mate: None,
+                    });
+                }
                 item_action::UPDATE_DETAIL => {
-                    s.read_u8()?; // slot type
-                    s.read_u8()?; // slot
+                    let slot_type = s.read_u8()?;
+                    let slot = s.read_u8()?;
                     let id = s.read_u64()?;
                     let mate = details(s)?;
                     info.items.push(TaskItem {
                         task,
                         template: 0,
                         id,
+                        slot_type,
+                        slot,
+                        count: 0,
                         mate,
                     });
                 }
@@ -599,6 +699,9 @@ pub struct GameState {
     pub my_houses: Vec<MyHouse>,
     /// First item of the bag (`SCCharacterInvenContentsPacket`, slot type 2): `(item id, slot)`.
     pub bag_items: Vec<(u64, u8, u32)>,
+    /// Bag stacks created or changed by `SCItemTaskSuccessPacket`s since connecting, by item id.
+    /// The character's starting inventory is not in here (its chunks only expose their first item).
+    pub bag: HashMap<u64, BagStack>,
     pub bag_slots: u8,
     /// Active quests from `SCQuestsPacket`: template id -> status.
     pub active_quests: HashMap<u32, u8>,
@@ -627,6 +730,58 @@ pub struct GameState {
 }
 
 impl GameState {
+    /// Applies one `SCItemTaskSuccessPacket` item task to [`GameState::bag`].
+    fn apply_item_task(&mut self, t: &TaskItem) {
+        if t.id == 0 {
+            return;
+        }
+        match t.task {
+            item_action::CREATE | item_action::CHANGE_OWNER | item_action::TAKE => {
+                self.bag.insert(
+                    t.id,
+                    BagStack {
+                        template: t.template,
+                        slot_type: t.slot_type,
+                        slot: t.slot,
+                        count: t.count,
+                    },
+                );
+            }
+            item_action::ADD_STACK => {
+                let e = self.bag.entry(t.id).or_insert(BagStack {
+                    template: t.template,
+                    slot_type: t.slot_type,
+                    slot: t.slot,
+                    count: 0,
+                });
+                e.count = (e.count + t.count).max(0);
+                if t.template != 0 {
+                    e.template = t.template;
+                }
+                if t.slot_type != 0 {
+                    e.slot_type = t.slot_type;
+                }
+                e.slot = t.slot;
+            }
+            item_action::REMOVE | item_action::REMOVE_CRAFTING | item_action::SEIZE => {
+                self.bag.remove(&t.id);
+            }
+            item_action::SWAP_SLOT => {
+                if let Some(e) = self.bag.get_mut(&t.id) {
+                    e.slot_type = t.slot_type;
+                    e.slot = t.slot;
+                }
+            }
+            item_action::UPDATE_DETAIL => {
+                if let Some(e) = self.bag.get_mut(&t.id) {
+                    e.slot_type = t.slot_type;
+                    e.slot = t.slot;
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Updates the state from a packet.
     pub fn observe(&mut self, p: &Packet) -> anyhow::Result<()> {
         self.observation_seq += 1;
@@ -812,8 +967,11 @@ impl GameState {
         } else if p.is_sc(sc::SCErrorMsgPacket) {
             st.events.push(GameEvent::ErrorMsg(s.read_i16()?));
         } else if p.is_sc(sc::SCItemTaskSuccessPacket) {
-            st.events
-                .push(GameEvent::ItemTask(parse_item_task(&p.body)));
+            let info = parse_item_task(&p.body);
+            for item in &info.items {
+                st.apply_item_task(item);
+            }
+            st.events.push(GameEvent::ItemTask(info));
         } else if p.is_sc(sc::SCMateSpawnedPacket) {
             st.mate_spawned = Some(MateSpawn {
                 tl_id: s.read_u16()?,
@@ -837,6 +995,9 @@ impl GameState {
             let quest = s.read_u32()?;
             st.completed_quests.insert(quest);
             st.quest_states.insert(quest, (5, [0; 5]));
+        } else if p.is_sc(sc::SCQuestContextFailedPacket) {
+            let quest = s.read_u32()?;
+            st.quest_states.entry(quest).or_default().0 = 2;
         } else if p.is_sc(sc::SCQuestsPacket) {
             let count = s.read_i32()?;
             if count > 0 {
@@ -2554,5 +2715,90 @@ mod compressed_batch_tests {
             split_game_batch(Dir::S2C, 0, &vec![0; MAX_BATCH_BYTES + 1]).unwrap_err(),
             BatchError::Limit
         );
+    }
+}
+
+#[cfg(test)]
+mod bag_state_tests {
+    use super::test_packets::packet;
+    use super::*;
+
+    fn item_task(tasks: &[u8]) -> Packet {
+        let mut body = PacketStream::new();
+        body.write_u8(11) // ItemTaskType.GM
+            .write_u8(1)
+            .write_raw(tasks);
+        packet(sc::SCItemTaskSuccessPacket, body.into_bytes())
+    }
+
+    fn create(item_id: u64, template: u32, count: i32) -> Vec<u8> {
+        let mut s = PacketStream::new();
+        s.write_u8(5) // ItemAction.Create
+            .write_u8(2) // bag
+            .write_u8(3) // slot
+            .write_u32(template)
+            .write_u64(item_id)
+            .write_u8(0) // grade
+            .write_u8(0) // flags
+            .write_i32(count)
+            .write_i16(128)
+            .write_raw(&[0u8; 128])
+            .write_i64(0)
+            .write_i32(0)
+            .write_u32(0)
+            .write_u8(0)
+            .write_i64(0)
+            .write_i64(0);
+        s.into_bytes()
+    }
+
+    fn add_stack(item_id: u64, template: u32, delta: i32) -> Vec<u8> {
+        let mut s = PacketStream::new();
+        s.write_u8(4)
+            .write_u8(2)
+            .write_u8(3)
+            .write_u64(item_id)
+            .write_i32(delta)
+            .write_u32(template);
+        s.into_bytes()
+    }
+
+    fn remove(item_id: u64, template: u32) -> Vec<u8> {
+        let mut s = PacketStream::new();
+        s.write_u8(7)
+            .write_u8(2)
+            .write_u8(3)
+            .write_u64(item_id)
+            .write_u32(template);
+        s.into_bytes()
+    }
+
+    #[test]
+    fn item_tasks_track_bag_counts() {
+        let mut st = GameState::default();
+        st.observe(&item_task(&create(100, 500, 2))).unwrap();
+        assert_eq!(
+            st.bag.get(&100),
+            Some(&BagStack {
+                template: 500,
+                slot_type: 2,
+                slot: 3,
+                count: 2
+            })
+        );
+        st.observe(&item_task(&add_stack(100, 500, 5))).unwrap();
+        assert_eq!(st.bag[&100].count, 7);
+        st.observe(&item_task(&remove(100, 500))).unwrap();
+        assert!(!st.bag.contains_key(&100));
+    }
+
+    #[test]
+    fn quest_context_failed_is_recorded() {
+        let mut st = GameState::default();
+        let mut body = PacketStream::new();
+        body.write_u32(77).write_u32(0);
+        st.observe(&packet(sc::SCQuestContextFailedPacket, body.into_bytes()))
+            .unwrap();
+        assert_eq!(st.quest_states.get(&77).map(|s| s.0), Some(2));
     }
 }

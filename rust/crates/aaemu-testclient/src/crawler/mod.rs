@@ -101,6 +101,9 @@ pub struct CrawlConfig {
     /// Game server config, used to grant the crawler account GM access (optional).
     pub game_config: Option<PathBuf>,
     pub mysql_bin: Option<PathBuf>,
+    /// Overrides the game config's `Connections.MySQLProvider.Port` for the GM grant (required
+    /// when the merged config has no port; the crawler never assumes 3306).
+    pub mysql_port: Option<u16>,
     pub server_log: Option<PathBuf>,
     pub bugreports: Option<PathBuf>,
     pub quest_timeout: Duration,
@@ -129,6 +132,7 @@ impl CrawlConfig {
             data_dir: PathBuf::from("rust/crates/aaemu-game/app/Data"),
             game_config: None,
             mysql_bin: None,
+            mysql_port: None,
             server_log: None,
             bugreports: None,
             quest_timeout: Duration::from_secs(180),

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use super::catalog::{Catalog, GateVerdict, Objective, Quest};
 use super::CrawlConfig;
-use crate::game::{DoodadInfo, GameClient, GameState, Packet, UnitInfo, LEVEL_PROXY};
+use crate::game::{BagStack, DoodadInfo, GameClient, GameState, Packet, UnitInfo, LEVEL_PROXY};
 use crate::login::LoginClient;
 use crate::record::Recorder;
 use crate::stream::StreamClient;
@@ -32,11 +32,18 @@ pub struct QuestResult {
     pub level: u8,
     pub zone: String,
     pub race: String,
-    /// `passed`, `failed`, `unsupported` or `skipped`.
+    /// `passed`, `completed-before`, `failed`, `unsupported` or `skipped`.
     pub status: String,
     /// `accept`, `objective 2`, `turn-in`, ...
     pub step: String,
     pub reason: String,
+    /// The quest passed because a GM command completed one of its objectives (item hand-over or
+    /// level), so its objective was not really exercised.
+    #[serde(default)]
+    pub gm_assisted: bool,
+    /// The objectives completed with a GM command (`objective 1 QuestActObjItemGather`, ...).
+    #[serde(default)]
+    pub gm_assisted_steps: Vec<String>,
     pub act_kinds: Vec<String>,
     pub objectives: Vec<ObjectiveResult>,
     pub duration_ms: u64,
@@ -137,6 +144,14 @@ impl QuestTracker {
     fn status(&self, quest: u32) -> u8 {
         self.state(quest).map_or(0, |s| s.status)
     }
+}
+
+/// The quest id of an `SCQuestContextCompletedPacket` (its first field).
+fn completed_quest_id(p: &Packet) -> Option<u32> {
+    if !p.is_sc(sc::SCQuestContextCompletedPacket) {
+        return None;
+    }
+    p.stream().read_u32().ok()
 }
 
 fn quest_state(p: &Packet) -> Option<(u32, QuestState)> {
@@ -252,7 +267,9 @@ pub async fn run(cfg: &CrawlConfig, catalog: &Catalog) -> Result<()> {
             visited,
             budget.map_or_else(|| "all".to_string(), |b| b.to_string()),
             match result.status.as_str() {
+                "passed" if result.gm_assisted => "okGM",
                 "passed" => "ok  ",
+                "completed-before" => "done",
                 "skipped" => "skip",
                 "unsupported" => "UNSP",
                 _ => "FAIL",
@@ -265,9 +282,7 @@ pub async fn run(cfg: &CrawlConfig, catalog: &Catalog) -> Result<()> {
         );
         // A quest that passed (or was already completed on the character) unlocks the quests
         // gated on it, so later quests in the same run can be attempted without a second pass.
-        if result.status == "passed"
-            || (result.step == "accept" && result.reason.contains("already completed"))
-        {
+        if result.status == "passed" || result.status == "completed-before" {
             passed.insert(result.quest);
         }
         results.append(&result)?;
@@ -316,6 +331,7 @@ struct QuestOutcome {
     warnings: Vec<String>,
     reports: Vec<String>,
     objectives: Vec<ObjectiveResult>,
+    gm_assisted_steps: Vec<String>,
     duration_ms: u64,
 }
 
@@ -339,8 +355,11 @@ fn finish_result(
         duration_ms: out.duration_ms,
         warnings: out.warnings,
         reports: out.reports,
+        gm_assisted: false,
+        gm_assisted_steps: out.gm_assisted_steps,
         account_id,
     };
+    r.gm_assisted = !r.gm_assisted_steps.is_empty();
     match out.outcome {
         Ok(()) => {
             r.status = "passed".into();
@@ -350,9 +369,11 @@ fn finish_result(
         Err(f) => {
             if f.step == "unsupported" {
                 r.status = "unsupported".into();
-            } else if f.step == "gate"
-                || (f.step == "accept" && f.reason.contains("already completed"))
-            {
+            } else if f.step == "accept" && f.reason.contains("already completed") {
+                // Error 621: the character completed it in an earlier run. Record it so the
+                // quests gated on it unlock in this and later runs.
+                r.status = "completed-before".into();
+            } else if f.step == "gate" {
                 r.status = "skipped".into();
             }
             r.step = f.step;
@@ -363,7 +384,11 @@ fn finish_result(
 }
 
 fn load_passed(path: &Path) -> HashSet<u32> {
-    load_with_status(path, "passed")
+    // A quest the server reported as already completed (error 621) is as good as passed for the
+    // gate checks: its dependants must unlock in later runs.
+    let mut passed = load_with_status(path, "passed");
+    passed.extend(load_with_status(path, "completed-before"));
+    passed
 }
 
 fn load_failed(path: &Path) -> HashSet<u32> {
@@ -559,6 +584,7 @@ async fn crawl_quest(
         warnings: Vec::new(),
         reports: Vec::new(),
         objectives: Vec::new(),
+        gm_assisted_steps: Vec::new(),
         duration_ms: 0,
     };
     if let Some(reason) = &quest.unsupported {
@@ -595,8 +621,14 @@ async fn crawl_quest(
     let log = LogWindow::new(cfg.server_log.as_deref());
     let reports = ReportWindow::new(cfg.bugreports.as_deref());
 
-    evidence.outcome =
-        run_quest_body(session, cfg, catalog, quest, anchor, &gate_items, deadline).await;
+    // Everything the crawler adds (setup items, GM hand-overs) or the quest leaves behind is
+    // destroyed after the quest; `before` is the bag state to restore.
+    let bag_before = session.game.state.bag.clone();
+    let body = run_quest_body(session, cfg, catalog, quest, anchor, &gate_items, deadline).await;
+    if let Ok(steps) = &body {
+        evidence.gm_assisted_steps = steps.clone();
+    }
+    evidence.outcome = body.map(|_| ());
     evidence.objectives = quest
         .objectives
         .iter()
@@ -630,7 +662,53 @@ async fn crawl_quest(
     if evidence.outcome.is_err() {
         let _ = drop_quest(&mut session.game, quest.id).await;
     }
+    // Rewards and turn-in item tasks can trail the completed packet.
+    let _ = session.sleep_pump(800).await;
+    cleanup_items(session, &bag_before).await;
     evidence
+}
+
+/// The destroys that restore `now` to the `before` bag snapshot: every stack the crawler added
+/// or the quest left (a new id), and only the units a quest or GM add put on a pre-existing
+/// stack. `(item id, slot type, slot, count)`.
+fn items_to_destroy(
+    before: &HashMap<u64, BagStack>,
+    now: &HashMap<u64, BagStack>,
+) -> Vec<(u64, u8, u8, i32)> {
+    let mut out = Vec::new();
+    for (id, stack) in now {
+        if stack.slot_type != 2 {
+            continue;
+        }
+        let count = match before.get(id) {
+            None => stack.count,
+            Some(old) if stack.count > old.count => stack.count - old.count,
+            _ => continue,
+        };
+        out.push((*id, stack.slot_type, stack.slot, count.max(1)));
+    }
+    out.sort_unstable();
+    out
+}
+
+/// Destroys the bag stacks the crawler added during a quest (GM items) and the ones the quest
+/// left (rewards, leftover objective items), so the bag does not fill up over a run.
+async fn cleanup_items(session: &mut Session, before: &HashMap<u64, BagStack>) {
+    let doomed = items_to_destroy(before, &session.game.state.bag);
+    for (id, slot_type, slot, count) in &doomed {
+        let mut s = PacketStream::new();
+        s.write_u64(*id)
+            .write_u8(*slot_type)
+            .write_u8(*slot)
+            .write_i32(*count);
+        let _ = session
+            .game
+            .send_cs(cs::CSDestroyItemPacket, s.as_bytes())
+            .await;
+    }
+    if !doomed.is_empty() {
+        let _ = session.sleep_pump(600).await;
+    }
 }
 
 async fn run_quest_body(
@@ -641,7 +719,8 @@ async fn run_quest_body(
     anchor: (f32, f32, f32),
     gate_items: &[u32],
     deadline: Instant,
-) -> std::result::Result<(), QuestFailure> {
+) -> std::result::Result<Vec<String>, QuestFailure> {
+    let mut gm_assisted = Vec::new();
     // ---- setup: level and gate items -----------------------------------------
     let target_level = quest.level.max(cfg.min_level).max(2);
     if session.level < target_level {
@@ -675,6 +754,15 @@ async fn run_quest_body(
                 .await
                 .map_err(|e| QuestFailure::new(&step, format!("pump: {e:#}")))?;
             let state = session.tracker.state(quest.id).unwrap_or_default();
+            if state.status == 2 {
+                return Err(QuestFailure::new(
+                    &step,
+                    format!(
+                        "quest failed on this objective: {}",
+                        last_events(&session.game)
+                    ),
+                ));
+            }
             if state.status == 3 || state.status == 5 {
                 break;
             }
@@ -704,9 +792,12 @@ async fn run_quest_body(
                 ));
             }
             attempts += 1;
-            play_objective(session, cfg, catalog, quest, obj, anchor, deadline)
+            let assisted = play_objective(session, cfg, catalog, quest, obj, anchor, deadline)
                 .await
                 .map_err(|e| QuestFailure::new(&step, e))?;
+            if assisted && !gm_assisted.contains(&step) {
+                gm_assisted.push(step.clone());
+            }
             let _ = session.sleep_pump(700).await;
         }
     }
@@ -717,14 +808,14 @@ async fn run_quest_body(
         .await
         .map_err(|e| QuestFailure::new("turn-in", format!("pump: {e:#}")))?;
     if session.tracker.status(quest.id) == 5 {
-        return Ok(());
+        return Ok(gm_assisted);
     }
 
     // ---- turn-in --------------------------------------------------------------
     turn_in(session, catalog, quest, anchor, deadline)
         .await
         .map_err(|e| QuestFailure::new("turn-in", e))?;
-    Ok(())
+    Ok(gm_assisted)
 }
 
 async fn accept_quest(
@@ -754,9 +845,13 @@ async fn accept_quest(
         }
         "item" | "item_gain" => {
             let count = starter.count.max(1) as u32;
-            let item = ensure_item(session, starter.item, count, anchor)
-                .await
-                .map_err(|e| format!("starter item {}: {e}", starter.item))?;
+            // An item-gain starter needs a new acquisition, so always add its count; a used
+            // starter only needs the item present.
+            let item = match starter.kind.as_str() {
+                "item_gain" => gain_item(session, starter.item, count).await,
+                _ => ensure_item(session, starter.item, count, anchor).await,
+            }
+            .map_err(|e| format!("starter item {}: {e}", starter.item))?;
             let _ = session.sleep_pump(800).await;
             if session.tracker.status(quest.id) != 0 {
                 return Ok(());
@@ -838,7 +933,7 @@ async fn turn_in(
         }
         other => return Err(format!("turn-in '{other}' is not supported")),
     }
-    let until = Instant::now().min(deadline) + Duration::from_secs(12);
+    let until = deadline.min(Instant::now() + Duration::from_secs(12));
     while Instant::now() < until {
         let packets = session
             .pump()
@@ -846,7 +941,7 @@ async fn turn_in(
             .map_err(|e| format!("turn-in pump: {e:#}"))?;
         if packets
             .iter()
-            .any(|p| p.is_sc(sc::SCQuestContextCompletedPacket))
+            .any(|p| completed_quest_id(p) == Some(quest.id))
         {
             return Ok(());
         }
@@ -876,7 +971,9 @@ async fn play_objective(
     obj: &Objective,
     anchor: (f32, f32, f32),
     deadline: Instant,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<bool, String> {
+    // `true` when a GM command completed the objective instead of the client packets.
+    let mut gm_assisted = false;
     let current = session.tracker.progress(quest.id, obj.objective_index);
     match obj.class.as_str() {
         "QuestActObjTalk" => {
@@ -935,11 +1032,12 @@ async fn play_objective(
                         .ok_or_else(|| "item group has no members".to_string())?
                 };
                 let need = (obj.required - current).max(1) as u32;
-                // Always hand over a fresh stack: an existing stack raises no acquisition event.
+                // GM hand-over: the loot path is not exercised, so the quest is GM-assisted.
                 gm_command(&mut session.game, &format!("item add self {item} {need}"))
                     .await
                     .map_err(|e| format!("gather item {item}: {e:#}"))?;
                 let _ = session.sleep_pump(800).await;
+                gm_assisted = true;
             }
         }
         "QuestActObjItemUse" | "QuestActObjItemGroupUse" => {
@@ -1025,6 +1123,9 @@ async fn play_objective(
                     .await
                     .map_err(|e| format!("{e:#}"))?;
             }
+            // The level (and the setup level before every quest) always comes from `/level`,
+            // so a level objective is never exercised by gameplay.
+            gm_assisted = true;
             let _ = session.sleep_pump(1000).await;
         }
         "QuestActObjCinema" => {
@@ -1034,7 +1135,7 @@ async fn play_objective(
         }
         other => return Err(format!("unsupported objective act {other}")),
     }
-    Ok(())
+    Ok(gm_assisted)
 }
 
 /// One kill attempt: find the target in sight, else teleport to its authored spawn, else GM
@@ -1192,41 +1293,89 @@ async fn interact_doodad(
     Ok(())
 }
 
-/// Login `item` and return the stack id, using the GM command only for setup.
+/// Bag stacks of `template` the client knows about: `(item id, count)`.
+fn stacks_of(session: &Session, item: u32) -> Vec<(u64, i32)> {
+    session
+        .game
+        .state
+        .bag
+        .iter()
+        .filter(|(_, s)| s.template == item && s.slot_type == 2)
+        .map(|(id, s)| (*id, s.count))
+        .collect()
+}
+
+/// Ensures `count` units of `item` are in the bag, adding only the missing units, and returns
+/// the id of a stack that holds them.
 async fn ensure_item(
     session: &mut Session,
     item: u32,
     count: u32,
     _anchor: (f32, f32, f32),
 ) -> std::result::Result<u64, String> {
-    if let Some((id, _, _)) = session
-        .game
-        .state
-        .bag_items
+    let count = count.max(1) as i32;
+    let mut stacks = stacks_of(session, item);
+    let mut total: i32 = stacks.iter().map(|(_, c)| c).sum();
+    if total >= count {
+        return stacks
+            .iter()
+            .max_by_key(|(_, c)| *c)
+            .map(|(id, _)| *id)
+            .ok_or_else(|| format!("item {item} disappeared"));
+    }
+    while total < count {
+        let add = (count - total).min(1000) as u32;
+        let packets = gm_command(&mut session.game, &format!("item add self {item} {add}"))
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        let _ = session.pump().await;
+        let after = stacks_of(session, item);
+        let now: i32 = after.iter().map(|(_, c)| c).sum();
+        if now < total + add as i32 {
+            // The GM reply may arrive split from the item task; accept its stack id as proof.
+            if let Some(id) = stack_id(&packets, item) {
+                return Ok(id);
+            }
+            return Err(format!(
+                "item {item} was not added (have {total}, asked {add}, now {now})"
+            ));
+        }
+        total = now;
+        stacks = after;
+    }
+    stacks
         .iter()
-        .find(|(_, _, template)| *template == item)
-    {
-        return Ok(*id);
+        .max_by_key(|(_, c)| *c)
+        .map(|(id, _)| *id)
+        .ok_or_else(|| format!("item {item} was not added"))
+}
+
+/// Adds exactly `count` units of `item` (an acquisition event for item-gain starters) and
+/// returns the id of the new or grown stack.
+async fn gain_item(
+    session: &mut Session,
+    item: u32,
+    count: u32,
+) -> std::result::Result<u64, String> {
+    let count = count.max(1);
+    let before: i32 = stacks_of(session, item).iter().map(|(_, c)| c).sum();
+    let packets = gm_command(&mut session.game, &format!("item add self {item} {count}"))
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    let _ = session.pump().await;
+    let after = stacks_of(session, item);
+    let gained: i32 = after.iter().map(|(_, c)| c).sum::<i32>() - before;
+    if gained < count as i32 {
+        if let Some(id) = stack_id(&packets, item) {
+            return Ok(id);
+        }
+        return Err(format!("item {item} gain {gained} < {count} (bag full?)"));
     }
-    let packets = gm_command(
-        &mut session.game,
-        &format!("item add self {item} {}", count.max(1)),
-    )
-    .await
-    .map_err(|e| format!("{e:#}"))?;
-    if let Some(id) = stack_id(&packets, item) {
-        return Ok(id);
-    }
-    if let Some((id, _, _)) = session
-        .game
-        .state
-        .bag_items
+    after
         .iter()
-        .find(|(_, _, template)| *template == item)
-    {
-        return Ok(*id);
-    }
-    Err(format!("item {item} was not added"))
+        .max_by_key(|(_, c)| *c)
+        .map(|(id, _)| *id)
+        .ok_or_else(|| format!("item {item} was not added"))
 }
 
 async fn goto_npc(
@@ -1249,7 +1398,7 @@ async fn goto_npc(
     teleport(session, pos)
         .await
         .map_err(|e| format!("teleport: {e}"))?;
-    let until = Instant::now().min(deadline) + Duration::from_secs(6);
+    let until = deadline.min(Instant::now() + Duration::from_secs(6));
     while Instant::now() < until {
         let _ = session.sleep_pump(500).await;
         if let Some(npc) = find_npc(session, &[template]) {
@@ -1292,7 +1441,7 @@ async fn goto_doodad(
     teleport(session, pos)
         .await
         .map_err(|e| format!("teleport: {e}"))?;
-    let until = Instant::now().min(deadline) + Duration::from_secs(6);
+    let until = deadline.min(Instant::now() + Duration::from_secs(6));
     while Instant::now() < until {
         let _ = session.sleep_pump(500).await;
         if let Some(d) = find_doodad(session, template) {
@@ -1869,26 +2018,53 @@ fn list_reports(dir: &Path) -> HashSet<PathBuf> {
 
 // ----- GM access -------------------------------------------------------------
 
-/// Grants the crawler account access level 100 in the lane's game database, using the
-/// `Connections.MySQLProvider` of the game server config. Setup only; never touches MySQL 3306.
-fn grant_gm(cfg: &CrawlConfig, account_id: u32) -> anyhow::Result<()> {
-    let config_path = cfg
-        .game_config
-        .as_ref()
-        .context("no --game-config (game server Config.Local.json)")?;
-    let text = std::fs::read_to_string(config_path)
-        .with_context(|| format!("reading {}", config_path.display()))?;
-    let value: serde_json::Value = serde_json::from_str(&text)?;
-    let mysql = get_ci(&value, "Connections")
+/// The game server config as the server itself loads it: `Config.json` next to `path`, then
+/// `path` over it, then `Section__Key` environment variables.
+fn load_game_config(
+    path: &Path,
+    env: impl IntoIterator<Item = (String, String)>,
+) -> anyhow::Result<serde_json::Value> {
+    let mut merged = serde_json::Value::Object(Default::default());
+    if let Some(base) = path.parent().map(|d| d.join("Config.json")) {
+        if base != path && base.exists() {
+            let text = std::fs::read_to_string(&base)
+                .with_context(|| format!("reading {}", base.display()))?;
+            aaemu_game::config::merge(&mut merged, serde_json::from_str(&text)?);
+        }
+    }
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    aaemu_game::config::merge(&mut merged, serde_json::from_str(&text)?);
+    aaemu_game::config::apply_env(&mut merged, env);
+    Ok(merged)
+}
+
+/// `(host, port, user, password, database)` of `Connections.MySQLProvider`. The port never
+/// falls back to 3306: a missing port would point the crawler at the developer's own MySQL.
+fn mysql_provider(
+    value: &serde_json::Value,
+    port_override: Option<u16>,
+) -> anyhow::Result<(String, u16, String, String, String)> {
+    let mysql = get_ci(value, "Connections")
         .and_then(|c| get_ci(c, "MySQLProvider"))
         .context("Connections.MySQLProvider missing")?;
     let host = get_ci(mysql, "Host")
         .and_then(|v| v.as_str())
         .unwrap_or("127.0.0.1")
         .to_string();
-    let port = get_ci(mysql, "Port")
-        .map(scalar_string)
-        .unwrap_or_else(|| "3306".into());
+    let port = match port_override {
+        Some(port) => port,
+        None => {
+            let text = get_ci(mysql, "Port")
+                .map(scalar_string)
+                .filter(|p| !p.is_empty())
+                .context(
+                    "MySQLProvider.Port missing; refusing to default to 3306 (pass --mysql-port)",
+                )?;
+            text.parse()
+                .with_context(|| format!("invalid MySQLProvider.Port {text:?}"))?
+        }
+    };
     let user = get_ci(mysql, "User")
         .and_then(|v| v.as_str())
         .context("MySQLProvider.User missing")?
@@ -1901,6 +2077,18 @@ fn grant_gm(cfg: &CrawlConfig, account_id: u32) -> anyhow::Result<()> {
         .and_then(|v| v.as_str())
         .context("MySQLProvider.Database missing")?
         .to_string();
+    Ok((host, port, user, password, database))
+}
+
+/// Grants the crawler account access level 100 in the lane's game database, using the
+/// `Connections.MySQLProvider` of the game server config. Setup only; never touches MySQL 3306.
+fn grant_gm(cfg: &CrawlConfig, account_id: u32) -> anyhow::Result<()> {
+    let config_path = cfg
+        .game_config
+        .as_ref()
+        .context("no --game-config (game server Config.Local.json)")?;
+    let value = load_game_config(config_path, std::env::vars())?;
+    let (host, port, user, password, database) = mysql_provider(&value, cfg.mysql_port)?;
     let mysql_bin = mysql_binary(cfg)?;
     let sql = format!(
         "INSERT INTO accounts (account_id, access_level) VALUES ({account_id}, 100) \
@@ -1956,5 +2144,175 @@ fn scalar_string(value: &serde_json::Value) -> String {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Number(n) => n.to_string(),
         _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "aaemu-testclient-{tag}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    fn result(quest: u32, status: &str) -> QuestResult {
+        QuestResult {
+            quest,
+            name: format!("quest {quest}"),
+            level: 1,
+            zone: "zone".into(),
+            race: "nuian".into(),
+            status: status.into(),
+            step: "accept".into(),
+            reason: String::new(),
+            gm_assisted: false,
+            gm_assisted_steps: Vec::new(),
+            act_kinds: Vec::new(),
+            objectives: Vec::new(),
+            duration_ms: 0,
+            warnings: Vec::new(),
+            reports: Vec::new(),
+            account_id: 1,
+        }
+    }
+
+    fn stack(template: u32, slot: u8, count: i32) -> BagStack {
+        BagStack {
+            template,
+            slot_type: 2,
+            slot,
+            count,
+        }
+    }
+
+    #[test]
+    fn two_quests_needing_the_same_item_each_get_a_fresh_stack() {
+        let before = HashMap::new();
+        let mut bag = HashMap::new();
+        bag.insert(1, stack(500, 3, 2));
+        let doomed = items_to_destroy(&before, &bag);
+        assert_eq!(doomed, [(1, 2, 3, 2)]);
+        // Applying the cleanup empties the bag again, so the next quest's gain is a new stack.
+        for (id, _, _, _) in &doomed {
+            bag.remove(id);
+        }
+        assert!(bag.is_empty());
+        bag.insert(2, stack(500, 4, 2));
+        assert_eq!(items_to_destroy(&before, &bag), [(2, 2, 4, 2)]);
+    }
+
+    #[test]
+    fn cleanup_removes_only_what_the_quest_added() {
+        let mut before = HashMap::new();
+        before.insert(9, stack(417, 3, 3));
+        let mut now = before.clone();
+        now.insert(9, stack(417, 3, 5));
+        now.insert(10, stack(500, 4, 1));
+        now.insert(
+            11,
+            BagStack {
+                slot_type: 1,
+                ..stack(600, 0, 1)
+            },
+        );
+        assert_eq!(
+            items_to_destroy(&before, &now),
+            [(9, 2, 3, 2), (10, 2, 4, 1)]
+        );
+    }
+
+    #[test]
+    fn completed_before_counts_as_passed_for_gates() {
+        let dir = temp_dir("completed-before");
+        let path = dir.join("nuian.jsonl");
+        let mut text = String::new();
+        for (quest, status) in [
+            (1, "passed"),
+            (2, "completed-before"),
+            (3, "skipped"),
+            (4, "failed"),
+        ] {
+            text.push_str(&serde_json::to_string(&result(quest, status)).unwrap());
+            text.push('\n');
+        }
+        std::fs::write(&path, text).unwrap();
+        let passed = load_passed(&path);
+        assert_eq!(passed, HashSet::from([1, 2]));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn completed_packet_is_matched_by_quest_id() {
+        let mut body = PacketStream::new();
+        body.write_u32(4242).write_raw(&[0; 8]).write_u32(0);
+        let packet = Packet {
+            level: crate::game::LEVEL_GAME,
+            opcode: sc::SCQuestContextCompletedPacket,
+            body: body.into_bytes(),
+        };
+        assert_eq!(completed_quest_id(&packet), Some(4242));
+        assert_eq!(
+            completed_quest_id(&Packet {
+                body: Vec::new(),
+                ..packet
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn game_config_merges_local_over_base_and_env() {
+        let dir = temp_dir("game-config");
+        std::fs::write(
+            dir.join("Config.json"),
+            r#"{"Connections":{"MySQLProvider":{"Host":"10.0.0.2","Port":"%db_port%","User":"u","Password":"p","Database":"base"}}}"#,
+        )
+        .unwrap();
+        let local = dir.join("Config.Local.json");
+        std::fs::write(
+            &local,
+            r#"{"Connections":{"MySQLProvider":{"Port":"3317","Database":"lane"}}}"#,
+        )
+        .unwrap();
+
+        let value = load_game_config(&local, Vec::new()).unwrap();
+        assert_eq!(
+            mysql_provider(&value, None).unwrap(),
+            (
+                "10.0.0.2".into(),
+                3317,
+                "u".into(),
+                "p".into(),
+                "lane".into()
+            )
+        );
+        // The environment overlays the files, as it does for the game server.
+        let value = load_game_config(
+            &local,
+            vec![("Connections__MySQLProvider__Port".into(), "4406".into())],
+        )
+        .unwrap();
+        assert_eq!(mysql_provider(&value, None).unwrap().1, 4406);
+        // The command line override wins.
+        assert_eq!(mysql_provider(&value, Some(5506)).unwrap().1, 5506);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_mysql_port_is_refused_instead_of_3306() {
+        let value = serde_json::json!({
+            "Connections": {"MySQLProvider": {"User": "u", "Database": "d"}}
+        });
+        let err = mysql_provider(&value, None).unwrap_err().to_string();
+        assert!(err.contains("refusing to default to 3306"), "{err}");
+        assert_eq!(mysql_provider(&value, Some(3317)).unwrap().1, 3317);
     }
 }

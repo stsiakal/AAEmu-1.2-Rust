@@ -11,23 +11,44 @@ use super::runner::QuestResult;
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 struct Counts {
     passed: u64,
+    /// Quests whose objective a GM command completed: shown apart from the plain passes.
+    passed_gm: u64,
     failed: u64,
     unsupported: u64,
     skipped: u64,
+    /// Quests the server reported as completed before this run (error 621).
+    completed_before: u64,
 }
 
 impl Counts {
-    fn add(&mut self, status: &str) {
-        match status {
+    fn add(&mut self, r: &QuestResult) {
+        match r.status.as_str() {
+            "passed" if r.gm_assisted => self.passed_gm += 1,
             "passed" => self.passed += 1,
             "failed" => self.failed += 1,
             "unsupported" => self.unsupported += 1,
             "skipped" => self.skipped += 1,
+            "completed-before" => self.completed_before += 1,
             _ => self.failed += 1,
         }
     }
     fn total(&self) -> u64 {
-        self.passed + self.failed + self.unsupported + self.skipped
+        self.passed
+            + self.passed_gm
+            + self.failed
+            + self.unsupported
+            + self.skipped
+            + self.completed_before
+    }
+    fn values(&self) -> [u64; 6] {
+        [
+            self.passed,
+            self.passed_gm,
+            self.failed,
+            self.unsupported,
+            self.skipped,
+            self.completed_before,
+        ]
     }
 }
 
@@ -35,7 +56,8 @@ impl Counts {
 struct RaceTotals {
     counts: Counts,
     by_zone: BTreeMap<String, Counts>,
-    by_band: BTreeMap<String, Counts>,
+    /// Keyed by the first level of the band, so the map (and the JSON) sorts numerically.
+    by_band: BTreeMap<u16, Counts>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -77,7 +99,14 @@ struct Dashboard {
     bug_fingerprints: Vec<Fingerprint>,
 }
 
-const STATUSES: [&str; 4] = ["passed", "failed", "unsupported", "skipped"];
+const COLUMNS: [&str; 6] = [
+    "passed",
+    "passed (GM-assisted)",
+    "failed",
+    "unsupported",
+    "skipped",
+    "completed-before",
+];
 
 pub fn write(out: &Path) -> Result<()> {
     std::fs::create_dir_all(out)?;
@@ -107,9 +136,9 @@ pub fn write(out: &Path) -> Result<()> {
 
     for r in latest.values() {
         d.results += 1;
-        d.totals.add(&r.status);
+        d.totals.add(r);
         let race = d.races.entry(r.race.clone()).or_default();
-        race.counts.add(&r.status);
+        race.counts.add(r);
         race.by_zone
             .entry(if r.zone.is_empty() {
                 "unknown".into()
@@ -117,22 +146,15 @@ pub fn write(out: &Path) -> Result<()> {
                 r.zone.clone()
             })
             .or_default()
-            .add(&r.status);
-        race.by_band
-            .entry(band(r.level))
-            .or_default()
-            .add(&r.status);
+            .add(r);
+        race.by_band.entry(band(r.level)).or_default().add(r);
 
         let mut seen_acts = BTreeSet::new();
         for act in &r.act_kinds {
             if !seen_acts.insert(act.clone()) {
                 continue;
             }
-            d.act_kinds
-                .entry(act.clone())
-                .or_default()
-                .counts
-                .add(&r.status);
+            d.act_kinds.entry(act.clone()).or_default().counts.add(r);
         }
 
         if r.status == "failed" {
@@ -214,76 +236,58 @@ fn render(d: &Dashboard) -> String {
         d.generated, d.results
     ));
     s.push_str(&format!(
-        "**Totals:** {} passed, {} failed, {} unsupported, {} skipped.\n\n",
-        d.totals.passed, d.totals.failed, d.totals.unsupported, d.totals.skipped
+        "**Totals:** {} passed, {} passed (GM-assisted), {} failed, {} unsupported, {} skipped, \
+         {} completed before.\n\n",
+        d.totals.passed,
+        d.totals.passed_gm,
+        d.totals.failed,
+        d.totals.unsupported,
+        d.totals.skipped,
+        d.totals.completed_before
     ));
 
-    s.push_str("## Per race\n\n| race | passed | failed | unsupported | skipped |\n|---|---:|---:|---:|---:|\n");
+    s.push_str(&table_header("race"));
     for (race, t) in &d.races {
-        s.push_str(&format!(
-            "| {race} | {} | {} | {} | {} |\n",
-            t.counts.passed, t.counts.failed, t.counts.unsupported, t.counts.skipped
-        ));
+        s.push_str(&table_row(race, &t.counts));
     }
     s.push('\n');
 
-    s.push_str("## Per level band\n\n| band |");
-    for status in STATUSES {
-        s.push_str(&format!(" {status} |"));
-    }
-    s.push('\n');
-    s.push_str("|---|");
-    for _ in STATUSES {
-        s.push_str("---:|");
-    }
-    s.push('\n');
-    let mut bands: BTreeMap<String, Counts> = BTreeMap::new();
+    s.push_str("## Per level band\n\n");
+    s.push_str(&table_header("band"));
+    let mut bands: BTreeMap<u16, Counts> = BTreeMap::new();
     for t in d.races.values() {
-        for (band, c) in &t.by_band {
-            let e = bands.entry(band.clone()).or_default();
-            e.passed += c.passed;
-            e.failed += c.failed;
-            e.unsupported += c.unsupported;
-            e.skipped += c.skipped;
+        for (lo, c) in &t.by_band {
+            let e = bands.entry(*lo).or_default();
+            *e = add_counts(*e, *c);
         }
     }
-    for (band, c) in &bands {
-        s.push_str(&format!(
-            "| {band} | {} | {} | {} | {} |\n",
-            c.passed, c.failed, c.unsupported, c.skipped
-        ));
+    for (lo, c) in &bands {
+        s.push_str(&table_row(&format!("{lo}-{}", lo + 4), c));
     }
     s.push('\n');
 
-    s.push_str("## Per zone\n\n| zone | passed | failed | unsupported | skipped |\n|---|---:|---:|---:|---:|\n");
+    s.push_str("## Per zone\n\n");
+    s.push_str(&table_header("zone"));
     let mut zones: BTreeMap<String, Counts> = BTreeMap::new();
     for t in d.races.values() {
         for (zone, c) in &t.by_zone {
             let e = zones.entry(zone.clone()).or_default();
-            e.passed += c.passed;
-            e.failed += c.failed;
-            e.unsupported += c.unsupported;
-            e.skipped += c.skipped;
+            *e = add_counts(*e, *c);
         }
     }
     let mut zones: Vec<(String, Counts)> = zones.into_iter().collect();
     zones.sort_by_key(|a| std::cmp::Reverse(a.1.total()));
     for (zone, c) in zones.iter().take(40) {
-        s.push_str(&format!(
-            "| {zone} | {} | {} | {} | {} |\n",
-            c.passed, c.failed, c.unsupported, c.skipped
-        ));
+        s.push_str(&table_row(zone, c));
     }
     s.push('\n');
 
-    s.push_str("## Per act kind\n\n| act | passed | failed | unsupported | skipped |\n|---|---:|---:|---:|---:|\n");
+    s.push_str("## Per act kind\n\n");
+    s.push_str(&table_header("act"));
     let mut acts: Vec<(&String, &ActTotals)> = d.act_kinds.iter().collect();
     acts.sort_by_key(|a| std::cmp::Reverse(a.1.counts.total()));
     for (act, t) in acts {
-        s.push_str(&format!(
-            "| {act} | {} | {} | {} | {} |\n",
-            t.counts.passed, t.counts.failed, t.counts.unsupported, t.counts.skipped
-        ));
+        s.push_str(&table_row(act, &t.counts));
     }
     s.push('\n');
 
@@ -337,10 +341,44 @@ fn render(d: &Dashboard) -> String {
     s
 }
 
-fn band(level: u8) -> String {
-    let lo = (u32::from(level) / 5) * 5;
-    let lo = lo.max(1);
-    format!("{lo}-{}", lo + 4)
+/// First level of the 1-5, 6-10, ... band a quest level belongs to.
+fn band(level: u8) -> u16 {
+    let level = u16::from(level.max(1));
+    (level - 1) / 5 * 5 + 1
+}
+
+fn add_counts(a: Counts, b: Counts) -> Counts {
+    Counts {
+        passed: a.passed + b.passed,
+        passed_gm: a.passed_gm + b.passed_gm,
+        failed: a.failed + b.failed,
+        unsupported: a.unsupported + b.unsupported,
+        skipped: a.skipped + b.skipped,
+        completed_before: a.completed_before + b.completed_before,
+    }
+}
+
+fn table_header(first: &str) -> String {
+    let mut s = format!("| {first} |");
+    for column in COLUMNS {
+        s.push_str(&format!(" {column} |"));
+    }
+    s.push('\n');
+    s.push_str("|---|");
+    for _ in COLUMNS {
+        s.push_str("---:|");
+    }
+    s.push('\n');
+    s
+}
+
+fn table_row(name: &str, counts: &Counts) -> String {
+    let mut s = format!("| {} |", escape(name));
+    for value in counts.values() {
+        s.push_str(&format!(" {value} |"));
+    }
+    s.push('\n');
+    s
 }
 
 fn fingerprint_of(path: &str) -> Option<String> {
@@ -369,4 +407,88 @@ fn chrono_like_now() -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     format!("unix {secs}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result(quest: u32, status: &str, gm_assisted: bool) -> QuestResult {
+        QuestResult {
+            quest,
+            name: format!("quest {quest}"),
+            level: 3,
+            zone: "zone".into(),
+            race: "nuian".into(),
+            status: status.into(),
+            step: "complete".into(),
+            reason: String::new(),
+            gm_assisted,
+            gm_assisted_steps: if gm_assisted {
+                vec!["objective 1 QuestActObjItemGather".into()]
+            } else {
+                Vec::new()
+            },
+            act_kinds: Vec::new(),
+            objectives: Vec::new(),
+            duration_ms: 0,
+            warnings: Vec::new(),
+            reports: Vec::new(),
+            account_id: 1,
+        }
+    }
+
+    #[test]
+    fn gm_assisted_passes_are_their_own_column() {
+        let mut counts = Counts::default();
+        counts.add(&result(1, "passed", false));
+        counts.add(&result(2, "passed", true));
+        counts.add(&result(3, "failed", false));
+        counts.add(&result(4, "completed-before", false));
+        assert_eq!(counts.passed, 1);
+        assert_eq!(counts.passed_gm, 1);
+        assert_eq!(counts.failed, 1);
+        assert_eq!(counts.completed_before, 1);
+        assert_eq!(counts.total(), 4);
+
+        let mut dashboard = Dashboard {
+            generated: "test".into(),
+            results: 4,
+            totals: counts,
+            ..Dashboard::default()
+        };
+        let race = dashboard.races.entry("nuian".into()).or_default();
+        race.counts = counts;
+        for level in [11, 1, 6] {
+            race.by_band.insert(band(level), counts);
+        }
+        let md = render(&dashboard);
+        assert!(
+            md.contains("1 passed, 1 passed (GM-assisted), 1 failed"),
+            "{md}"
+        );
+        let first = md.find("| 1-5 |").expect("1-5 row");
+        let second = md.find("| 6-10 |").expect("6-10 row");
+        let third = md.find("| 11-15 |").expect("11-15 row");
+        assert!(first < second && second < third, "{md}");
+    }
+
+    #[test]
+    fn bands_do_not_overlap() {
+        assert_eq!(band(0), 1);
+        assert_eq!(band(1), 1);
+        assert_eq!(band(5), 1);
+        assert_eq!(band(6), 6);
+        assert_eq!(band(10), 6);
+        assert_eq!(band(11), 11);
+        assert_eq!(band(26), 26);
+        let labels: Vec<String> = [26u8, 11, 6, 1]
+            .into_iter()
+            .map(band)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|lo| format!("{lo}-{}", lo + 4))
+            .collect();
+        assert_eq!(labels, ["1-5", "6-10", "11-15", "26-30"]);
+    }
 }

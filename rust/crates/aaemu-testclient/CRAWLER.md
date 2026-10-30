@@ -35,8 +35,11 @@ $TC crawl --race nuian \
 ```
 
 - `--game-config` + `--mysql-bin` grant the crawler's account access level 100 before its
-  first character is created (`accounts` / `characters` in the lane's game database). Without
-  it the GM bootstrap prints the SQL the account needs.
+  first character is created (`accounts` / `characters` in the lane's game database). The
+  file is merged over the `Config.json` next to it and overridden by
+  `Connections__MySQLProvider__*` environment variables, as the game server does; a config
+  without a port is refused (the crawler never assumes 3306) unless `--mysql-port` is given.
+  Without `--game-config` the GM bootstrap prints the SQL the account needs.
 - `--min-level` raises the character before each quest (setup); `0` uses the quest level.
   `--limit` counts quests the crawler can actually attempt, not unsupported/gated ones;
   without it the crawler attempts every quest currently available in the level band.
@@ -61,13 +64,19 @@ $TC crawl --race nuian \
 targets, turn-in, rewards, race/faction/level requirements and the nearest authored target
 positions. It is written on every run and never committed.
 
-Each result records `passed`, `failed`, `unsupported` or `skipped`, the failing step
-(`accept`, `objective N <act>`, `turn-in`, ...), the objective counters reached, the duration,
-the server WARN/ERROR lines in the quest window and new bug-report paths.
+Each result records `passed`, `completed-before`, `failed`, `unsupported` or `skipped`, the
+failing step (`accept`, `objective N <act>`, `turn-in`, ...), the objective counters reached,
+the duration, the server WARN/ERROR lines in the quest window and new bug-report paths. A quest
+that passes only because a GM command satisfied an objective (an item hand-over for a gather
+act with no highlight doodad, or `/level` for a level act) is marked `gm_assisted` with the
+objective list. `completed-before` is error 621 (the character already completed the quest in
+an earlier run); it still unlocks the quests gated on it.
 
 `crawl.json` / `crawl.md` aggregate the latest result per race and quest: totals per race,
-level band, zone and act kind; failing quests ranked by how many races hit them; bug-report
-fingerprints.
+level band, zone and act kind (with GM-assisted passes in their own column, outside the plain
+passed total); failing quests ranked by how many races hit them; bug-report fingerprints.
+Every item the crawler added for a quest and everything the quest left in the bag is destroyed
+after the quest, so a long run does not fill the inventory.
 
 ## Current coverage and limits
 

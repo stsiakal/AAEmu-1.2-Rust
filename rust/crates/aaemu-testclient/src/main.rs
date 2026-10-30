@@ -205,6 +205,9 @@ fn crawl_config(args: &Args) -> anyhow::Result<CrawlConfig> {
     if let Some(v) = args.get("mysql-bin") {
         cfg.mysql_bin = Some(PathBuf::from(v));
     }
+    if let Some(v) = args.get("mysql-port") {
+        cfg.mysql_port = Some(v.parse()?);
+    }
     if let Some(v) = args.get("server-log") {
         cfg.server_log = Some(PathBuf::from(v));
     }
