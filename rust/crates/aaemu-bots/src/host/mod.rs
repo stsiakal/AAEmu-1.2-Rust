@@ -115,10 +115,25 @@ impl BotHost {
         for bot in bots {
             let state = bot.brain().lock().await;
             let (x, y, z) = bot.position().await.unwrap_or((0.0, 0.0, 0.0));
+            let (hp, mp, max_hp, max_mp, battle) = bot.player().await.map_or(
+                (0, 0, 1, 1, false),
+                |p| {
+                    let c = p.data();
+                    (
+                        c.unit.hp,
+                        c.unit.mp,
+                        c.unit.max_hp.max(1),
+                        c.unit.max_mp.max(1),
+                        c.unit.is_in_battle,
+                    )
+                },
+            );
             tracing::info!(
-                "Bots: '{}' {:?} at ({x:.0}, {y:.0}, {z:.0}) kills {} deaths {} casts {} refused {} looted {}",
+                "Bots: '{}' {:?} hp {hp}/{max_hp} mp {mp}/{max_mp} battle {battle} target {:?} resting {} at ({x:.0}, {y:.0}, {z:.0}) kills {} deaths {} casts {} refused {} looted {}",
                 bot.name,
                 state.mode,
+                state.target,
+                state.resting,
                 state.kills,
                 state.deaths,
                 state.casts_started,

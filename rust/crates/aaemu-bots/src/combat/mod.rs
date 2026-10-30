@@ -359,7 +359,7 @@ pub async fn think(bot: &Arc<BotSession>, server: &Arc<GameServer>) -> Duration 
                 if loot::loot_count(server, obj_id).is_some_and(|n| n > 0) {
                     state.loot_target = Some(obj_id);
                 }
-                tracing::debug!(
+                tracing::info!(
                     character = %bot.name,
                     target = obj_id,
                     kills = state.kills,
