@@ -165,6 +165,27 @@ pub fn record_incoming(
     });
 }
 
+/// Records a client packet a server-side caller dispatched directly (the bots): the same `in`
+/// entry as [`record_incoming`], with the packet's `Debug` as the body (there is no wire body).
+pub fn record_incoming_packet<T: fmt::Debug + ?Sized>(
+    ring: Option<&Arc<PacketRing>>,
+    level: u8,
+    opcode: u16,
+    name: &'static str,
+    packet: &T,
+) {
+    let Some(ring) = ring else { return };
+    ring.push(PacketEntry {
+        direction: "in",
+        level,
+        opcode,
+        name,
+        size: 0,
+        timestamp_ms: crate::world::now_ms(),
+        body: debug_prefix(packet, BODY_CHARS),
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

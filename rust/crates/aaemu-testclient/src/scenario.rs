@@ -1,6 +1,7 @@
 //! Scripted bot scenarios with assertions on the server responses.
 
 use std::collections::BTreeMap;
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -9,6 +10,7 @@ use aaemu_game::opcodes::{pp, sc};
 use aaemu_game::systems::quests::model::status;
 use aaemu_game::systems::skills::types::{SkillCastTarget, SkillCaster, SkillObject};
 use anyhow::{bail, ensure, Context};
+use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 
 use crate::game::{GameClient, GameEvent, ItemTaskInfo, Packet, UnitInfo, LEVEL_PROXY};
@@ -17,13 +19,18 @@ use crate::record::Recorder;
 use crate::stream::StreamClient;
 
 mod cometsboon;
+mod coreloop;
 mod craft;
 mod doodad;
 mod fixes;
+mod gather;
+mod housing;
 mod lunafrost;
+mod mount;
 mod music;
 mod plant;
 mod portal;
+mod questchain;
 mod questitem;
 mod script;
 
@@ -90,6 +97,22 @@ pub enum Kind {
     /// `scenario/craft.rs`). GM account.
     #[serde(rename = "craft")]
     Craft,
+    /// Build a small house with `CSCreateHouse` and its build steps, then demolish it (see
+    /// `scenario/housing.rs`). GM account.
+    #[serde(rename = "housing")]
+    Housing,
+    /// Summon a mount, ride it, move, dismount and dismiss it (see `scenario/mount.rs`).
+    /// GM account.
+    #[serde(rename = "mount")]
+    Mount,
+    /// Accept quest 251, kill and loot three boars and turn it in (see `scenario/questchain.rs`).
+    /// GM account.
+    #[serde(rename = "questchain")]
+    QuestChain,
+    /// Mine an iron vein, check the labor cost and the ore (see `scenario/gather.rs`).
+    /// GM account.
+    #[serde(rename = "gather")]
+    Gather,
     /// Ad-hoc live checks driven by the command file `$AAEMU_SCRIPT` (see `scenario/script.rs`).
     /// GM account.
     #[serde(rename = "script")]
@@ -116,9 +139,13 @@ impl std::str::FromStr for Kind {
             "lunafrost" => Self::Lunafrost,
             "portal" => Self::Portal,
             "craft" => Self::Craft,
+            "housing" => Self::Housing,
+            "mount" => Self::Mount,
+            "questchain" => Self::QuestChain,
+            "gather" => Self::Gather,
             "script" => Self::Script,
             _ => bail!(
-                "unknown scenario '{s}' (login, lobby, full, combat, npc-return, mate-revive, questitem, doodad, \n                 plant, cometsboon, stonethrow, ghost, lunafrost, portal, craft, script, load)"
+                "unknown scenario '{s}' (login, lobby, full, combat, npc-return, mate-revive, questitem, doodad, \n                 plant, cometsboon, stonethrow, ghost, lunafrost, portal, craft, housing, mount, \n                 questchain, gather, script, load)"
             ),
         })
     }
@@ -210,6 +237,44 @@ pub struct BotConfig {
     /// `questitem`: casts tried (rejected ones included) before the step fails.
     #[serde(default = "default_quest_item_max_attempts")]
     pub quest_item_max_attempts: u32,
+    /// `questchain`: the bot's slot (0..16) of the spawn grid. Bots running at the same time
+    /// need different ones (`--slot N`); default: the number the account name ends with (the soak
+    /// runner's accounts are `<prefix>b<index>`), else 0.
+    #[serde(default)]
+    pub slot: Option<u32>,
+    /// `housing` / `mount` / `questchain` / `gather`: seconds the scenario body may run
+    /// (`--scenario-timeout S`, default 420). When they are over the body is dropped, its
+    /// cleanup still runs and the run fails; the soak runner sets it below its own kill time.
+    #[serde(default)]
+    pub scenario_timeout_secs: Option<u64>,
+    /// `housing` / `mount` / `questchain` / `gather`: seconds the scenario's cleanup may run
+    /// (`--cleanup-timeout S`, default 90), counted from when the cleanup begins, whatever became
+    /// of the body. The cleanup is dropped when they are over and the run fails; the leave of the
+    /// world that follows has its own limit.
+    #[serde(default)]
+    pub cleanup_timeout_secs: Option<u64>,
+}
+
+impl BotConfig {
+    /// The time limit of a core-loop scenario body.
+    pub fn scenario_timeout(&self) -> Duration {
+        self.scenario_timeout_secs
+            .map_or(coreloop::DEFAULT_SCENARIO_TIMEOUT, Duration::from_secs)
+    }
+
+    /// The time limit of a core-loop scenario's cleanup.
+    pub fn cleanup_timeout(&self) -> Duration {
+        self.cleanup_timeout_secs
+            .map_or(coreloop::DEFAULT_CLEANUP_TIMEOUT, Duration::from_secs)
+    }
+
+    /// The time limits of the parts of a core-loop scenario run.
+    fn limits(&self) -> coreloop::Limits {
+        coreloop::Limits {
+            body: self.scenario_timeout(),
+            cleanup: self.cleanup_timeout(),
+        }
+    }
 }
 
 /// The client packet that asks a stablehand to revive the dead mate. The real protocol is still
@@ -407,17 +472,36 @@ async fn finish(
         rec,
         out: Outcome::default(),
     };
-    if let Err(e) = run_inner(kind, cfg, &mut r, script).await {
+    // A panic anywhere becomes a failed outcome (with its message) instead of a dead process
+    // without an outcome file; the core-loop scenarios clean up before that (`run_scenario`).
+    let result = AssertUnwindSafe(run_inner(kind, cfg, &mut r, script))
+        .catch_unwind()
+        .await;
+    if let Some(note) = failure_note(result) {
         let step = rec.current_step();
         r.out.steps.push(StepResult {
             name: step.clone(),
             ok: false,
             ms: 0,
-            note: format!("{e:#}"),
+            note: note.clone(),
         });
-        r.out.error = Some(format!("[{step}] {e:#}"));
+        r.out.error = Some(format!("[{step}] {note}"));
     }
     r.out
+}
+
+/// The text of a failed scenario run: its error, or the message of the panic that ended it.
+fn failure_note(
+    result: Result<anyhow::Result<()>, Box<dyn std::any::Any + Send>>,
+) -> Option<String> {
+    match result {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => Some(format!("{e:#}")),
+        Err(payload) => Some(format!(
+            "panicked: {}",
+            coreloop::panic_message(payload.as_ref())
+        )),
+    }
 }
 
 const QUIET: Duration = Duration::from_millis(1500);
@@ -435,6 +519,26 @@ fn character_to_select<'a>(
         characters.first()
     }
     .with_context(|| format!("no character returned for {requested} (created={created})"))
+}
+
+#[cfg(test)]
+mod failure_note_tests {
+    use super::failure_note;
+
+    #[test]
+    fn a_panic_becomes_the_failure_text_of_the_run() {
+        let panic = std::panic::catch_unwind(|| panic!("scenario exploded")).unwrap_err();
+        assert_eq!(
+            failure_note(Err(panic)).as_deref(),
+            Some("panicked: scenario exploded")
+        );
+        assert_eq!(failure_note(Ok(Ok(()))), None);
+        let error = anyhow::anyhow!("inner").context("outer");
+        assert_eq!(
+            failure_note(Ok(Err(error))).as_deref(),
+            Some("outer: inner")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -912,6 +1016,26 @@ async fn run_inner(
     }
     if kind == Kind::Craft {
         craft::run(&mut game, r).await?;
+        drop(stream);
+        return Ok(());
+    }
+    if kind == Kind::Housing {
+        housing::run(&mut game, cfg, r).await?;
+        drop(stream);
+        return Ok(());
+    }
+    if kind == Kind::Mount {
+        mount::run(&mut game, cfg, r).await?;
+        drop(stream);
+        return Ok(());
+    }
+    if kind == Kind::QuestChain {
+        questchain::run(&mut game, cfg, r).await?;
+        drop(stream);
+        return Ok(());
+    }
+    if kind == Kind::Gather {
+        gather::run(&mut game, cfg, r).await?;
         drop(stream);
         return Ok(());
     }

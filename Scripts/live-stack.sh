@@ -19,6 +19,9 @@
 # Every path is an environment variable so another machine can override it (e.g. AAEMU_DB_USER, the
 # MySQL user in generated lane configs, default aaemu; AAEMU_DRIVER_DLL / AAEMU_DRIVER_OUT). Secrets (DB and test
 # account passwords) live only in $LIVE/cfg and the runtime Config.Local.json files, never in git.
+#
+# AAEMU_LIVE_NO_MYSQL_START=1: never start or stop mysqld; refuse with a clear message when the
+# shared MySQL is not up (used by Scripts/bots-soak.sh, which must never touch the shared server).
 set -euo pipefail
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
@@ -58,6 +61,7 @@ DB_GAME=${DB_GAME:-rs_game}
 DB_USER=${AAEMU_DB_USER:-aaemu}                           # MySQL user in the generated lane configs
 # Servers run from a copy in $LIVE/bin in lane mode, so the lane can rebuild while its stack runs.
 RUN=$BIN; [ -n "$LANE" ] && RUN=$LIVE/bin
+GAME_BIN=${AAEMU_GAME_BIN:-aaemu-game.exe}   # aaemu-game-bots.exe = the same server with the bots extension
 LOGIN_PORT=${LOGIN##*:}
 
 MYSQL=("$MYSQL_BIN/mysql.exe" -h127.0.0.1 -P"$MYSQL_PORT" -uroot)
@@ -136,6 +140,10 @@ EOF
 
 cmd_mysql() {
   if mysql_up; then return; fi
+  if [ "${AAEMU_LIVE_NO_MYSQL_START:-0}" = 1 ]; then
+    echo "MySQL on 127.0.0.1:$MYSQL_PORT is not up; start it outside live-stack.sh (AAEMU_LIVE_NO_MYSQL_START=1 forbids starting it)" >&2
+    exit 1
+  fi
   ("$MYSQL_BIN/mysqld.exe" --defaults-file="$LIVE/mysql/my.ini" >/dev/null 2>&1 &)
   for _ in $(seq 1 60); do mysql_up && return; sleep 1; done
   echo "MySQL did not start; see $LIVE/logs/mysqld.err" >&2; exit 1
@@ -143,7 +151,7 @@ cmd_mysql() {
 
 cmd_db_reset() {
   cmd_mysql
-  if running aaemu-game.exe || running aaemu-login.exe; then
+  if running "$GAME_BIN" || running aaemu-login.exe; then
     echo "stop the servers first (Scripts/live-stack.sh stop)" >&2; exit 1
   fi
   for k in login game; do
@@ -164,8 +172,8 @@ cmd_start() {
   if [ -n "$LANE" ]; then
     # a lane's databases are created on first start
     "${MYSQL[@]}" -N -e "SHOW DATABASES LIKE '$DB_GAME'" | grep -q . || cmd_db_reset
-    if ! running aaemu-game.exe && ! running aaemu-login.exe; then
-      mkdir -p "$RUN"; cp -f "$BIN"/aaemu-login.exe "$BIN"/aaemu-game.exe "$BIN"/aaemu-launcher.exe "$RUN/"
+    if ! running "$GAME_BIN" && ! running aaemu-login.exe; then
+      mkdir -p "$RUN"; cp -f "$BIN"/aaemu-login.exe "$BIN"/"$GAME_BIN" "$BIN"/aaemu-launcher.exe "$RUN/"
     fi
   fi
   if ! running aaemu-login.exe; then
@@ -174,9 +182,9 @@ cmd_start() {
       > "$LIVE/logs/rs-login.log" 2>&1 &)
     sleep 3
   fi
-  if ! running aaemu-game.exe; then
+  if ! running "$GAME_BIN"; then
     keep_prev "$LIVE/logs/rs-game.log"
-    (cd "$LIVE/rs-game" && NO_COLOR=1 RUST_LOG=${RUST_LOG:-info} "$RUN/aaemu-game.exe" "$LIVE/rs-game" \
+    (cd "$LIVE/rs-game" && NO_COLOR=1 RUST_LOG=${RUST_LOG:-info} "$RUN/$GAME_BIN" "$LIVE/rs-game" \
       > "$LIVE/logs/rs-game.log" 2>&1 &)
   fi
   echo "waiting for the game server (data + physics load takes ~1 min)..."
@@ -187,7 +195,7 @@ cmd_start() {
     fi
     # The process probe is flaky right after the start (the process path is not readable yet):
     # only call the server dead after several misses in a row.
-    if running aaemu-game.exe; then misses=0; else
+    if running "$GAME_BIN"; then misses=0; else
       misses=$((misses + 1))
       [ "$misses" -lt 5 ] || { echo "game server exited; tail $LIVE/logs/rs-game.log" >&2; exit 1; }
     fi
@@ -217,7 +225,7 @@ cmd_status() {
   # (the machine may run other mysqld services, so probe the private port instead of the process)
   [ -n "$LANE" ] && echo "lane  $LANE (ports ${PORT_PREFIX}xxx, $DB_LOGIN/$DB_GAME, $LIVE)"
   if mysql_up; then echo "UP    mysql :$MYSQL_PORT"; else echo "down  mysql :$MYSQL_PORT"; fi
-  for p in aaemu-login.exe aaemu-game.exe archeage.exe; do
+  for p in aaemu-login.exe "$GAME_BIN" archeage.exe; do
     if running "$p"; then echo "UP    $p"; else echo "down  $p"; fi
   done
   for f in rs-login rs-game; do echo "--- $f.log"; tail -3 "$LIVE/logs/$f.log" 2>/dev/null | cut -c1-160; done
@@ -238,10 +246,16 @@ cmd_shot() {
 cmd_stop() {
   # Only this stack's client and servers; the private MySQL is shared by every lane, so it is
   # only shut down on request.
-  for p in archeage.exe aaemu-game.exe aaemu-login.exe; do
+  for p in archeage.exe "$GAME_BIN" aaemu-login.exe; do
     for id in $(pids_of "$p"); do taskkill //F //PID "$id" >/dev/null 2>&1 || true; done
   done
-  if [ "${1:-}" = --mysql ] && mysql_up; then "${MYSQL[@]}" -e "SHUTDOWN"; fi
+  if [ "${1:-}" = --mysql ] && mysql_up; then
+    if [ "${AAEMU_LIVE_NO_MYSQL_START:-0}" = 1 ]; then
+      echo "AAEMU_LIVE_NO_MYSQL_START=1: not stopping the shared MySQL" >&2
+    else
+      "${MYSQL[@]}" -e "SHUTDOWN"
+    fi
+  fi
   echo "stopped"
 }
 

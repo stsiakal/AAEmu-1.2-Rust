@@ -378,6 +378,11 @@ pub struct UnitInfo {
     pub pos: (f32, f32, f32),
     /// Transport-layer id of a mate (type 5, `SCUnitStatePacket`); 0 for every other unit.
     pub tl_id: u16,
+    /// Where the unit was when its `SCUnitStatePacket` announced it (`pos` follows its movement).
+    pub announced_pos: (f32, f32, f32),
+    /// [`GameState::observation_seq`] of that announcement, so units announced after an action
+    /// can be told from the known ones whatever their (recycled) object id.
+    pub announced_seq: u64,
 }
 
 /// A doodad seen in `SCDoodadCreatedPacket` / `SCDoodadsCreatedPacket` (`Doodad.Write`).
@@ -430,6 +435,17 @@ fn read_doodad(s: &mut PacketStream) -> anyhow::Result<DoodadInfo> {
         quest_glow,
         data,
     })
+}
+
+/// A house of the selected character: the head of `SCMyHousePacket` (which the server sends for
+/// every owned house at character select and for a newly created one) or of its own
+/// `SCHouseStatePacket` (`House.Write`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MyHouse {
+    pub obj_id: u32,
+    pub tl: u16,
+    pub template_id: u32,
+    pub owner_id: u32,
 }
 
 /// The last `SCMateSpawnedPacket`: the owner's own view of the summoned mate.
@@ -578,6 +594,9 @@ pub struct GameState {
     pub units: HashMap<u32, UnitInfo>,
     /// Doodads announced by `SCDoodad(s)CreatedPacket` and not removed since.
     pub doodads: HashMap<u32, DoodadInfo>,
+    /// Houses of the selected character the server announced and has not demolished since, in
+    /// arrival order. Kept whoever consumed the packet, so a house announced late is never lost.
+    pub my_houses: Vec<MyHouse>,
     /// First item of the bag (`SCCharacterInvenContentsPacket`, slot type 2): `(item id, slot)`.
     pub bag_items: Vec<(u64, u8, u32)>,
     pub bag_slots: u8,
@@ -675,6 +694,17 @@ impl GameState {
                 st.self_pos = pos;
                 st.observed_self_pos = Some(pos);
             }
+            // A unit announced again while it is still known (it re-entered the view without an
+            // `SCUnitsRemoved` in between) keeps its first announcement: that one says where it
+            // spawned, and a later one would pass an old unit off as new to the scenarios that
+            // match announcements to their own spawn commands.
+            let (announced_pos, announced_seq) = st
+                .units
+                .get(&obj_id)
+                .filter(|known| known.unit_type == unit_type && known.id == id)
+                .map_or((pos, st.observation_seq), |known| {
+                    (known.announced_pos, known.announced_seq)
+                });
             st.units.insert(
                 obj_id,
                 UnitInfo {
@@ -684,6 +714,8 @@ impl GameState {
                     id,
                     pos,
                     tl_id,
+                    announced_pos,
+                    announced_seq,
                 },
             );
         } else if p.is_sc(sc::SCOneUnitMovementPacket) {
@@ -712,6 +744,31 @@ impl GameState {
             st.last_teleport = Some(pos);
             st.self_pos = pos;
             st.observed_self_pos = Some(pos);
+        } else if p.is_sc(sc::SCMyHousePacket) || p.is_sc(sc::SCHouseStatePacket) {
+            // `House.Write` head: tl, database id, object id, template, model, co-owner, owner.
+            let tl = s.read_u16()?;
+            s.read_u32()?;
+            let obj_id = s.read_bc()?;
+            let template_id = s.read_u32()?;
+            s.read_u32()?;
+            s.read_u32()?;
+            let owner_id = s.read_u32()?;
+            // `SCMyHouse` is always the receiver's own; a state broadcast is any house in view.
+            if p.is_sc(sc::SCMyHousePacket) || (owner_id == st.selected_char && owner_id != 0) {
+                let house = MyHouse {
+                    obj_id,
+                    tl,
+                    template_id,
+                    owner_id,
+                };
+                match st.my_houses.iter_mut().find(|h| h.tl == tl) {
+                    Some(known) => *known = house,
+                    None => st.my_houses.push(house),
+                }
+            }
+        } else if p.is_sc(sc::SCMyHouseRemovedPacket) || p.is_sc(sc::SCHouseDemolishedPacket) {
+            let tl = s.read_u16()?;
+            st.my_houses.retain(|h| h.tl != tl);
         } else if p.is_sc(sc::SCDoodadCreatedPacket) {
             let d = read_doodad(&mut s)?;
             st.doodads.insert(d.obj_id, d);
@@ -841,6 +898,36 @@ impl Drop for SocketReader {
     }
 }
 
+/// [`GameClient::timeout`] changed for as long as the guard lives (see
+/// [`GameClient::with_timeout`]). The client is used through the guard, which puts the value it
+/// found back when it is dropped: at the end of its scope, on an early `?` and also when the
+/// future that holds it is dropped at an await point (a scenario body that ran out of time),
+/// which a save before and a restore after the awaited call would skip.
+pub struct TimeoutGuard<'a> {
+    game: &'a mut GameClient,
+    saved: Duration,
+}
+
+impl std::ops::Deref for TimeoutGuard<'_> {
+    type Target = GameClient;
+
+    fn deref(&self) -> &GameClient {
+        self.game
+    }
+}
+
+impl std::ops::DerefMut for TimeoutGuard<'_> {
+    fn deref_mut(&mut self) -> &mut GameClient {
+        self.game
+    }
+}
+
+impl Drop for TimeoutGuard<'_> {
+    fn drop(&mut self) {
+        self.game.timeout = self.saved;
+    }
+}
+
 impl GameClient {
     pub async fn connect(addr: &str, rec: Recorder) -> anyhow::Result<Self> {
         let sock = TcpStream::connect(addr)
@@ -905,6 +992,14 @@ impl GameClient {
 
     pub fn recorder(&self) -> &Recorder {
         &self.rec
+    }
+
+    /// Makes the waits of this client (`wait_for`, `wait_sc`) last up to `timeout` until the
+    /// returned guard is dropped, which puts the previous limit back whatever ended the
+    /// guard's scope, a cancelled future included. Use the client through the guard.
+    pub fn with_timeout(&mut self, timeout: Duration) -> TimeoutGuard<'_> {
+        let saved = std::mem::replace(&mut self.timeout, timeout);
+        TimeoutGuard { game: self, saved }
     }
 
     /// Close both game socket halves, without sending `CSLeaveWorldPacket`.
@@ -1641,6 +1736,66 @@ mod socket_reader_tests {
 }
 
 #[cfg(test)]
+mod timeout_guard_tests {
+    use super::*;
+
+    /// A client on an in-memory connection nobody sends on (the other end stays open), whose
+    /// waits last 400 ms.
+    fn client() -> (GameClient, tokio::io::DuplexStream) {
+        let (io, peer) = tokio::io::duplex(1024);
+        let mut game = GameClient::from_io(io, Recorder::new(false));
+        game.timeout = Duration::from_millis(400);
+        (game, peer)
+    }
+
+    fn stops_early(game: &mut GameClient) -> anyhow::Result<()> {
+        let _patient = game.with_timeout(Duration::from_secs(30));
+        bail!("stopped early")
+    }
+
+    #[tokio::test]
+    async fn the_guard_changes_the_wait_limit_and_puts_the_previous_one_back() {
+        let (mut game, _peer) = client();
+        {
+            let mut patient = game.with_timeout(Duration::from_secs(30));
+            assert_eq!(patient.timeout, Duration::from_secs(30));
+            // The client is used through the guard, the way it is outside of it.
+            patient.timeout = Duration::from_secs(40);
+        }
+        assert_eq!(game.timeout, Duration::from_millis(400));
+        // An early return, such as the `?` of a failed step, ends the guard too.
+        stops_early(&mut game).unwrap_err();
+        assert_eq!(game.timeout, Duration::from_millis(400));
+        // A wait through the guard lasts as long as the guard says.
+        let started = Instant::now();
+        let error = game
+            .with_timeout(Duration::from_millis(50))
+            .wait_sc(sc::SCLeaveWorldGrantedPacket)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        assert!(started.elapsed() < Duration::from_millis(350));
+        assert_eq!(game.timeout, Duration::from_millis(400));
+    }
+
+    #[tokio::test]
+    async fn a_wait_dropped_by_a_time_limit_still_puts_the_limit_back() {
+        let (mut game, _peer) = client();
+        let cut = tokio::time::timeout(Duration::from_millis(100), async {
+            game.with_timeout(Duration::from_secs(30))
+                .wait_sc(sc::SCLeaveWorldGrantedPacket)
+                .await
+        })
+        .await;
+        assert!(
+            cut.is_err(),
+            "the 30 s wait must have been dropped, not ended"
+        );
+        assert_eq!(game.timeout, Duration::from_millis(400));
+    }
+}
+
+#[cfg(test)]
 mod observed_position_tests {
     use super::*;
 
@@ -1692,6 +1847,257 @@ fn read_quest_row(s: &mut PacketStream) -> anyhow::Result<(i64, u32, u8)> {
     s.read_u8()?;
     s.read_u32()?;
     Ok((id, template, status))
+}
+
+#[cfg(test)]
+mod announcement_tests {
+    use super::test_packets::npc_state;
+    use super::*;
+
+    fn removed(obj_id: u32) -> Packet {
+        let mut body = PacketStream::new();
+        body.write_u16(1).write_bc(obj_id);
+        Packet {
+            level: LEVEL_GAME,
+            opcode: sc::SCUnitsRemovedPacket,
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    fn ambient(state: &mut GameState) {
+        let mut body = PacketStream::new();
+        body.write_i16(7)
+            .write_i16(0)
+            .write_u32(0)
+            .write_bool(false);
+        let packet = Packet {
+            level: LEVEL_GAME,
+            opcode: sc::SCErrorMsgPacket,
+            body: body.as_bytes().to_vec(),
+        };
+        state.observe(&packet).unwrap();
+    }
+
+    #[test]
+    fn a_unit_announced_again_keeps_its_first_announcement() {
+        let mut state = GameState::default();
+        state
+            .observe(&npc_state(9, 3475, (100.0, 203.0, 50.0)))
+            .unwrap();
+        let first = state.units[&9].clone();
+        ambient(&mut state);
+        ambient(&mut state);
+        // The same unit re-enters the view somewhere else, after the bot's next command.
+        state
+            .observe(&npc_state(9, 3475, (140.0, 260.0, 52.0)))
+            .unwrap();
+        let again = &state.units[&9];
+        assert_eq!(again.announced_seq, first.announced_seq);
+        assert_eq!(again.announced_pos, first.announced_pos);
+        // Where it is now follows the new announcement.
+        assert!((again.pos.0 - 140.0).abs() < 0.01 && (again.pos.1 - 260.0).abs() < 0.01);
+        assert!(state.observation_seq > again.announced_seq);
+    }
+
+    #[test]
+    fn a_unit_removed_and_announced_again_is_announced_anew() {
+        let mut state = GameState::default();
+        state
+            .observe(&npc_state(9, 3475, (100.0, 203.0, 50.0)))
+            .unwrap();
+        let first = state.units[&9].announced_seq;
+        state.observe(&removed(9)).unwrap();
+        assert!(!state.units.contains_key(&9));
+        state
+            .observe(&npc_state(9, 3475, (140.0, 260.0, 52.0)))
+            .unwrap();
+        let again = &state.units[&9];
+        assert!(again.announced_seq > first);
+        assert!((again.announced_pos.0 - 140.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_recycled_object_id_of_another_template_is_a_new_announcement() {
+        let mut state = GameState::default();
+        state
+            .observe(&npc_state(9, 3475, (100.0, 203.0, 50.0)))
+            .unwrap();
+        let first = state.units[&9].announced_seq;
+        // The server gave the id to a different NPC without a removal the client saw.
+        state
+            .observe(&npc_state(9, 3512, (100.0, 203.0, 50.0)))
+            .unwrap();
+        let again = &state.units[&9];
+        assert_eq!(again.id, 3512);
+        assert!(again.announced_seq > first);
+    }
+}
+
+/// Packet bodies shared by the unit tests of this crate.
+#[cfg(test)]
+pub(crate) mod test_packets {
+    use super::*;
+
+    /// A `House.Write` body (`SCMyHouse`, `SCHouseState`; `SCLoginCharInfoHouse` prefixes the
+    /// owner id).
+    pub(crate) fn house_body(
+        tl: u16,
+        obj_id: u32,
+        template: u32,
+        owner: u32,
+        all_action: i32,
+        current_action: i32,
+    ) -> Vec<u8> {
+        let mut s = PacketStream::new();
+        s.write_u16(tl)
+            .write_u32(77) // database id
+            .write_bc(obj_id)
+            .write_u32(template)
+            .write_u32(0) // model
+            .write_u32(0) // co-owner
+            .write_u32(owner)
+            .write_str("owner")
+            .write_u32(5) // account
+            .write_u8(1) // permission
+            .write_i32(all_action)
+            .write_i32(current_action)
+            .write_i32(0) // tax
+            .write_i64(aaemu_commons::helpers::convert_coord_to_long(13944.5))
+            .write_i64(aaemu_commons::helpers::convert_coord_to_long(14216.25))
+            .write_f32(120.0)
+            .write_str("house");
+        s.into_bytes()
+    }
+
+    pub(crate) fn packet(opcode: u16, body: Vec<u8>) -> Packet {
+        Packet {
+            level: LEVEL_GAME,
+            opcode,
+            body,
+        }
+    }
+
+    /// The body of an NPC's `SCUnitStatePacket`.
+    pub(crate) fn npc_state_body(obj_id: u32, template: u32, pos: (f32, f32, f32)) -> Vec<u8> {
+        let mut body = PacketStream::new();
+        body.write_bc(obj_id)
+            .write_str("npc")
+            .write_u8(1)
+            .write_bc(0)
+            .write_u32(template)
+            .write_u32(0)
+            .write_u8(0)
+            .write_str("")
+            .write_position(pos.0, pos.1, pos.2);
+        body.into_bytes()
+    }
+
+    pub(crate) fn npc_state(obj_id: u32, template: u32, pos: (f32, f32, f32)) -> Packet {
+        packet(sc::SCUnitStatePacket, npc_state_body(obj_id, template, pos))
+    }
+}
+
+#[cfg(test)]
+mod my_house_tests {
+    use super::test_packets::{house_body, packet};
+    use super::*;
+
+    fn state() -> GameState {
+        GameState {
+            selected_char: 42,
+            ..GameState::default()
+        }
+    }
+
+    fn house(obj_id: u32, tl: u16) -> MyHouse {
+        MyHouse {
+            obj_id,
+            tl,
+            template_id: 172,
+            owner_id: 42,
+        }
+    }
+
+    #[test]
+    fn my_house_packets_are_remembered_whoever_reads_them() {
+        let mut st = state();
+        st.observe(&packet(
+            sc::SCMyHousePacket,
+            house_body(7, 900, 172, 42, 0, 0),
+        ))
+        .unwrap();
+        assert_eq!(st.my_houses, [house(900, 7)]);
+        // Announced again (a re-select, a state change): updated in place, not duplicated.
+        st.observe(&packet(
+            sc::SCMyHousePacket,
+            house_body(7, 901, 172, 42, 3, 1),
+        ))
+        .unwrap();
+        st.observe(&packet(
+            sc::SCMyHousePacket,
+            house_body(8, 950, 172, 42, 3, 1),
+        ))
+        .unwrap();
+        assert_eq!(st.my_houses, [house(901, 7), house(950, 8)]);
+    }
+
+    #[test]
+    fn a_house_state_broadcast_counts_only_for_the_characters_own_house() {
+        let mut st = state();
+        // Another player's house in view is not ours.
+        st.observe(&packet(
+            sc::SCHouseStatePacket,
+            house_body(5, 800, 172, 43, 0, 0),
+        ))
+        .unwrap();
+        assert!(st.my_houses.is_empty());
+        st.observe(&packet(
+            sc::SCHouseStatePacket,
+            house_body(7, 900, 172, 42, 0, 0),
+        ))
+        .unwrap();
+        assert_eq!(st.my_houses, [house(900, 7)]);
+        // Before a character is selected nothing can be ours.
+        let mut st = GameState::default();
+        st.observe(&packet(
+            sc::SCHouseStatePacket,
+            house_body(7, 900, 172, 0, 0, 0),
+        ))
+        .unwrap();
+        assert!(st.my_houses.is_empty());
+    }
+
+    #[test]
+    fn a_demolished_or_removed_house_is_forgotten() {
+        let mut st = state();
+        for (tl, obj) in [(7, 900), (8, 901), (9, 902)] {
+            st.observe(&packet(
+                sc::SCMyHousePacket,
+                house_body(tl, obj, 172, 42, 0, 0),
+            ))
+            .unwrap();
+        }
+        st.observe(&packet(
+            sc::SCHouseDemolishedPacket,
+            7u16.to_le_bytes().to_vec(),
+        ))
+        .unwrap();
+        st.observe(&packet(
+            sc::SCMyHouseRemovedPacket,
+            9u16.to_le_bytes().to_vec(),
+        ))
+        .unwrap();
+        assert_eq!(st.my_houses, [house(901, 8)]);
+    }
+
+    #[test]
+    fn a_truncated_house_packet_is_an_observation_error_not_a_house() {
+        let mut st = state();
+        let mut body = house_body(7, 900, 172, 42, 0, 0);
+        body.truncate(6);
+        assert!(st.observe(&packet(sc::SCMyHousePacket, body)).is_err());
+        assert!(st.my_houses.is_empty());
+    }
 }
 
 fn dist2(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {

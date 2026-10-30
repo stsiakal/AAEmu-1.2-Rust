@@ -420,6 +420,32 @@ pub struct VehicleModel {
     pub wheeled_vehicle_gear_speed_ratio_1: f32,
     pub wheeled_vehicle_gear_speed_ratio_2: f32,
     pub wheeled_vehicle_gear_speed_ratio_3: f32,
+    /// Ground carriage / cart / tram (not an airship, boat or floating platform). The bot
+    /// road graph only uses these routes.
+    pub ground: bool,
+}
+
+/// A transfer model is a ground route only when it neither flies nor floats and its model
+/// path is not a ship / boat / airship / carpet (the 1.2 `VehicleModel` type alone does not
+/// separate carriages from airships).
+pub fn is_ground_transfer_model(normal: &str, can_fly: bool, floating_height: f32) -> bool {
+    if can_fly || floating_height > 0.0 {
+        return false;
+    }
+    let path = normal.to_ascii_lowercase();
+    // Model names compound these words (`floatship`, `ferryboat`, `smallboat`, `middleship`),
+    // so they match inside a longer word ...
+    if ["ship", "boat", "ferry", "carpet", "float"]
+        .iter()
+        .any(|word| path.contains(word))
+    {
+        return false;
+    }
+    // ... but `air` is too short for that (a chair or a stair is no airship): only a word that
+    // starts with it counts (`airship`, `air_balloon`).
+    !path
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .any(|word| word.starts_with("air"))
 }
 
 /// `ShipModelV1` (the members the slave spawning reads; the rest is the physics' data).
@@ -1074,6 +1100,13 @@ impl VehiclesData {
                 wheeled_vehicle_gear_speed_ratio_1: r.f32("wheeled_vehicle_gear_speed_ratio_1")?,
                 wheeled_vehicle_gear_speed_ratio_2: r.f32("wheeled_vehicle_gear_speed_ratio_2")?,
                 wheeled_vehicle_gear_speed_ratio_3: r.f32("wheeled_vehicle_gear_speed_ratio_3")?,
+                // Tolerant readers: a NULL here (a model row without a prefab path / flags)
+                // must not make the whole game data load fatal; non-NULL values read as before.
+                ground: is_ground_transfer_model(
+                    &r.string_or("normal", "")?,
+                    r.string_or("can_fly", "")?.eq_ignore_ascii_case("t"),
+                    r.f32_or("floating_height", 0.0)?,
+                ),
             };
             self.vehicle_models.entry(m.id).or_insert(m);
             Ok(())
@@ -1495,5 +1528,101 @@ mod tests {
         assert_eq!(t.transfer_roads.len(), 1);
         assert_eq!(t.transfer_roads[0].zone_id, 0);
         assert_eq!(t.transfer_roads[0].pos.len(), 2);
+    }
+
+    /// `load_models` on an in-memory database shaped like the compact `vehicle_models` table:
+    /// a model row with NULL `normal` / `can_fly` / `floating_height` loads (as a ground model)
+    /// instead of failing the whole game data load, and non-NULL rows read as before.
+    #[test]
+    fn a_vehicle_model_row_with_null_columns_still_loads() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE vehicle_models (id, velocity, angVel, wheeled_vehicle_mass,
+                wheeled_vehicle_max_gear, wheeled_vehicle_gear_speed_ratio_reverse,
+                wheeled_vehicle_gear_speed_ratio_1, wheeled_vehicle_gear_speed_ratio_2,
+                wheeled_vehicle_gear_speed_ratio_3, normal, can_fly, floating_height);
+             CREATE TABLE ship_models (id, velocity, mass, mass_center_x, mass_center_y,
+                mass_center_z, mass_box_size_x, mass_box_size_y, mass_box_size_z, keel_length,
+                keel_height, keel_offset_z);
+             CREATE TABLE models (id, sub_id, sub_type);
+             INSERT INTO vehicle_models VALUES
+                (1, 1, 1, 1, 1, 1, 1, 1, 1, NULL, NULL, NULL),
+                (2, 1, 1, 1, 1, 1, 1, 1, 1, 'cgf://objects/Env/carriage_a.cgf', 'f', 0.0),
+                (3, 1, 1, 1, 1, 1, 1, 1, 1, 'prefab://Prefabs/airship.xml/airship.normal', 't', 0.0),
+                (4, 1, 1, 1, 1, 1, 1, 1, 1, 'cgf://objects/Env/carriage_a.cgf', 'f', 1.0),
+                (5, 1, 1, 1, 1, 1, 1, 1, 1, 'cgf://objects/Env/carriage_a.cgf', 'T', 0.0);",
+        )
+        .unwrap();
+        let files = crate::data::client_files::ClientFileManager::default();
+        let ctx = DataLoadCtx {
+            conn: &conn,
+            app_path: std::path::Path::new("."),
+            files: &files,
+            language: "en_us",
+        };
+        let mut data = VehiclesData::default();
+        data.load_models(&ctx).expect("a NULL column is not fatal");
+        let ground = |id: u32| data.vehicle_models[&id].ground;
+        assert!(ground(1), "no path, no flags: not an airship or a boat");
+        assert!(ground(2));
+        assert!(!ground(3), "can_fly = 't'");
+        assert!(!ground(4), "floating_height > 0");
+        assert!(!ground(5), "the flag is case-insensitive as before");
+    }
+
+    #[test]
+    fn only_carriages_are_ground_transfer_models() {
+        assert!(is_ground_transfer_model(
+            "cgf://objects/Env/06_unit/05_carriage/transfers_carriageb01.cgf",
+            false,
+            0.0
+        ));
+        assert!(is_ground_transfer_model(
+            "cgf://cart/mine_tub.cgf",
+            false,
+            0.0
+        ));
+        assert!(!is_ground_transfer_model(
+            "prefab://Prefabs/airship.xml/airship.normal",
+            true,
+            0.0
+        ));
+        assert!(!is_ground_transfer_model(
+            "cgf://Objects/.../ferryboat_b.cgf",
+            true,
+            0.0
+        ));
+        assert!(!is_ground_transfer_model(
+            "cgf://.../transfers_floatship01.chr",
+            false,
+            0.0
+        ));
+        assert!(!is_ground_transfer_model(
+            "cgf://.../housing_carpet01.cgf",
+            false,
+            0.0
+        ));
+    }
+
+    /// `air` only counts as a word of its own (or the start of one), not inside a longer word:
+    /// carriages with a chair or a stair in the model path are still ground routes.
+    #[test]
+    fn air_is_a_word_not_a_substring() {
+        for path in [
+            "cgf://objects/Env/06_unit/05_carriage/carriage_chair_a.cgf",
+            "cgf://objects/Env/housing/stair_wood01.cgf",
+            "cgf://objects/Env/06_unit/repair/transfers_cart01.cgf",
+            "cgf://objects\\Env\\hair\\carriage_a.cgf",
+        ] {
+            assert!(is_ground_transfer_model(path, false, 0.0), "{path}");
+        }
+        for path in [
+            "prefab://Prefabs/airship.xml/airship.normal",
+            "cgf://objects/Env/06_unit/air_balloon/balloon_a.cgf",
+            "cgf://objects/Env/06_unit/AirShip/transfers_a.cgf",
+            "cgf://objects\\Env\\air\\carriage_a.cgf",
+        ] {
+            assert!(!is_ground_transfer_model(path, false, 0.0), "{path}");
+        }
     }
 }

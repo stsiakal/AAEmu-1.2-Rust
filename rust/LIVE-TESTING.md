@@ -273,6 +273,67 @@ least two completed crafts (`SCSkillStarted` + `SCSkillEnded`), then `SCErrorMsg
 on, besides a failed `SCSkillStarted`), and no cast after it. Run it on an account whose labor is not hugely negative
 or positive (a character with 30 labor runs about 15 crafts, 1 s each). Server log:
 `craft 8000001 refused by skill 8000016: skill result 39`.
+
+`housing` (GM account) builds design 172 "cozy Nuian house" on the original client's housing polygon in zone 142
+(13944.868, 14216.393, area 52 / group 1). It adds the design item 21166 and only the bound tax certificates
+(31892) the `CSConstructHouseTax` quote needs, sends `CSCreateHouse`, then runs the three build steps with
+skills 14575 / 14575 / 14574 and their tradepack materials (17684 / 17684 / 17683, added one at a time because
+the single backpack slot must be free for the next one), asserting each material is consumed. It requires
+`SCMyHouse` + `SCHouseState` with the bot as owner, the `SCHouseBuildProgress` steps up to 3/3, `SCHouseTaxInfo`,
+and finally demolishes the house with the GM `/house forcedemo` command and requires
+`SCHouseDemolished`. Tries nearby offsets if an earlier run's house still occupies the plot (a rejected spot ends its
+wait after a second: with other bots moving around the plot the connection is never quiet, and waiting for quiet
+cost 8 s per rejected spot; a slow server is still waited for, up to 30 s). Every item the run
+added that the server did not consume (design item and certificates when the creation fails, the material of a
+failed step) is destroyed on the cleanup path, also when the run fails during the re-select: the run records how far
+the way back into the world got (leave, lobby, select, spawn) and the cleanup finishes the missing steps (pending
+grant, lobby steps, spawn, in-game notices) before it demolishes, so the GM command always runs in the world. The
+cleanup demolishes every house of the bot's character the server announced (`SCMyHouse`, which the game state keeps
+whoever read the packet): a house announced after the create step stopped listening, or left by an earlier run, is
+demolished too. A client that is killed mid-build cannot clean up: its unfinished house stays on the plot (the next
+run builds at another offset and demolishes it); the server still finishes the cast.
+
+`mount` (GM account) adds the brown Lilliot horse whistle (item 8159), summons it with use skill 10602, sends
+`CSMountMate` (driver point 1) and requires its own `SCUnitAttached`, moves the mate with `CSMoveUnit` (20 m at
+20 m/s, echoed by `SCOneUnitMovement`), reads the server's `/position` for the rider and requires the rider to stand
+at the mount after the move, then `CSUnMountMate` (its own `SCUnitDetached`) and `CSRemoveMate`. The cleanup
+teleports the bot back to where the run began (the ride carried it 20 m away).
+
+`questchain` (GM account) spawns the quest giver 3512 and quest 251 "Angry Boars" in front of the bot, accepts with
+`CSStartQuestContext`, spawns a boar 3475 per objective, weakens it with the GM `/damage 99%` setup command (this skips the server's damage/HP calculation and the boar combat AI), kills it
+with the player's melee `CSStartSkill` 2 and loots the corpse with `CSLootOpenBag(lootAll)`; the quest must count
+3 x boar meat (item 4058). It then reports with `CSCompleteQuestContext` and requires `SCQuestContextCompleted` and
+the reward item 18791. The quest must start at objective 0 (meat left in the bag would pre-fill it), so the
+looted items are destroyed again unless the turn-in consumed them. The completion flag and the spawned NPCs are
+reset with GM commands so the next run can accept the quest again. GM-spawned NPCs carry no owner: every bot of a
+parallel run owns one slot of a 4 x 4 grid (`--slot N`, 25 m apart, centred on the origin where its run began; default
+the number the account name ends with, the soak runner passes the bot index; more than 16 bots would share slots),
+teleports back to its slot before each `/spawn npc` (a boar chase drifts the bot away), takes only the NPC announced
+within 1 m of the point straight north of its slot that its own command asked for (judged by the position of the
+announcement, hostile boars run off at once) and walks back to where it began in the cleanup. A boar that moved makes
+the bot walk up to it and hit again; the refused hits are counted in the run variables `retry_too_far`,
+`retry_out_of_angle` and `retry_obstacle` (an intermittent server facing / line-of-sight refusal shows there, the soak
+dashboard sums them). Note that the runtime spawner of a `/spawn npc` NPC tries to respawn it 15 s after it died or
+was despawned and fails (`Can't spawn npc N from spawnerId 0 - Template is null`, one WARN and one ERROR line per
+NPC in the server log): that noise is not a bot failure.
+
+`gather` (GM account) tops labor up, spawns iron vein 1671 with `/spawn doodad` and mines it with the vein's
+`DoodadFuncUse` skill 13986 (doodad target, 10 labor, 4.5 s cast, range 4). It requires `SkillResult` 0, a
+`SCCharacterLaborPowerChanged` of -10, the vein's phase change and a loot item from pack 6359 (iron ore 8022,
+rare 8081 or stone 8008); a genuine empty roll is retried on a fresh vein, while a labor mismatch or error fails at
+once. The GM spawn makes the spawner the doodad's owner and the bot only mines the new vein owned by its own
+object, so bots in parallel at the same spot each mine their own. The ore and the GM-placed vein are removed
+afterwards.
+
+`housing`, `mount`, `questchain` and `gather` end in a failed outcome instead of a dead or hanging client: a panic in
+the scenario body is caught, and a body still running after `--scenario-timeout S` seconds (default 420; the soak
+runner passes its attempt timeout minus its login allowance and cleanup budget) is dropped at its next await. In both
+cases the scenario's cleanup (demolish, dismount, destroy the items, ...) and the leave of the world still run, and
+the error names the step the body stopped in (`scenario panicked in step ...` / `scenario timed out after ... in step
+...`). The cleanup has a time limit of its own (`--cleanup-timeout S`, default 90) which starts when the body ends,
+so a body that ran out of time cannot cut it short; the soak runner passes both budgets and keeps them inside its
+attempt timeout, so it never kills the client mid-cleanup.
+
 `m*` script commands (`aaemu-testclient/src/scenario/music.rs`, used by `rust/verify/musicrun1.vtest` /
 `musicrun2.vtest`) replay the 1.2 client's music wire sequence and fail on a missing callback:
 `mcompose` (item cast 22215, CS122 only after the received own `SCSkillFired`), `mrequest` (CS123 cold /
