@@ -73,6 +73,12 @@ DEFAULT_SCENARIOS = KNOWN_SCENARIOS + ["load"]
 SPAWN_SLOTS = 16
 SLOT_SCENARIOS = {"questchain"}
 
+# Seconds one scenario attempt may take before the runner kills the testclient. Housing, the
+# longest, took up to ~200 s of scenario time with 8 bots fighting over its plot, plus ~35 s to
+# log in and enter the world, so the testclient's own scenario timeout (this minus the reserve
+# below) must stay well above that.
+DEFAULT_ATTEMPT_TIMEOUT = 420
+
 # Seconds of `--attempt-timeout` left for a scenario's cleanup, the leave of the world and the
 # exit: the testclient's own `--scenario-timeout` is that much shorter, so a scenario that hangs
 # or panics still demolishes / dismounts / destroys before the runner would kill the process.
@@ -1612,7 +1618,15 @@ def main(argv: list[str]) -> int:
         default=None,
         help="accounts in the parallel 'load' phase (default: --bots; 0 disables it)",
     )
-    parser.add_argument("--attempt-timeout", type=int, default=300, help="seconds per scenario attempt (default 300)")
+    parser.add_argument(
+        "--attempt-timeout",
+        type=int,
+        default=DEFAULT_ATTEMPT_TIMEOUT,
+        help=(
+            f"seconds per scenario attempt (default {DEFAULT_ATTEMPT_TIMEOUT}); the testclient "
+            f"stops its scenario {CLEANUP_RESERVE} s earlier and cleans up"
+        ),
+    )
     parser.add_argument(
         "--between-seconds",
         type=float,

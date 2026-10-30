@@ -410,6 +410,11 @@ class ScenarioCommandTests(unittest.TestCase):
         cmd = self.runner({}, attempt_timeout=480).scenario_command("housing", "a", Path("o.json"), None)
         self.assertEqual(self.value(cmd, "--scenario-timeout"), "405")
 
+    def test_the_default_leaves_housing_a_wide_margin(self):
+        # Housing took up to ~200 s of scenario time with 8 bots contending for its plot.
+        self.assertGreaterEqual(bots_soak.scenario_timeout(bots_soak.DEFAULT_ATTEMPT_TIMEOUT), 300)
+        self.assertGreater(bots_soak.DEFAULT_ATTEMPT_TIMEOUT, bots_soak.scenario_timeout(bots_soak.DEFAULT_ATTEMPT_TIMEOUT))
+
 
 class ScenarioListTests(unittest.TestCase):
     def test_the_core_loop_scenarios_are_known_and_part_of_the_default_soak(self):
