@@ -390,13 +390,16 @@ impl NpcSkillHooks for NpcSkills {
         }
         if delay_ms > 0 {
             // `SpawnDoodad.cs`: `doodad.InitDoodad(); if (delay > 0) Thread.Sleep(delay);
-            // doodad.Spawn();`. The C# sleep blocked the game loop, so the area trigger created
-            // by `InitDoodad` could not be ticked (and removed as its owner was not visible yet)
-            // before the spawn. The spawn and the init run together after the delay here.
-            doodad.data().spawn_pending = true;
+            // doodad.Spawn();`. The init and the spawn run together once the delay is over (the
+            // start phase, e.g. a clout, begins with the visible summon). `InitDoodad()` hands
+            // the phase `ParentWorld.GetUnit(OwnerObjId)`: that unit is taken here, at the cast,
+            // so a caster who leaves during the delay still owns the clout.
+            let owner_obj_id = doodad.data().owner_obj_id;
+            let owner = world.unit(owner_obj_id);
             tasks::schedule_spawn(
                 server,
                 &doodad,
+                owner.as_ref(),
                 std::time::Duration::from_millis(delay_ms as u64),
             );
         } else {

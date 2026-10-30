@@ -46,11 +46,6 @@ pub struct Doodad {
     /// `DbId` (doodads table id; 0 = not persistent).
     pub db_id: u32,
     pub is_persistent: bool,
-    /// Not a C# member: `SpecialType.SpawnDoodad` with `value2 > 0` defers `InitDoodad` to its
-    /// scheduled `Spawn()` (see `systems::npcs::bridges`), where the doodad is already visible.
-    /// A `DoodadFuncClout` with `UseOriginSource` of such a summon keeps the summon as its area
-    /// origin instead of borrowing a nearby doodad.
-    pub spawn_pending: bool,
     /// `FuncGroupId` (current phase).
     pub func_group_id: u32,
     /// `FuncType` of each entry of `CurrentFuncs` (what `Write`'s `hasLootItem` needs).
@@ -198,7 +193,6 @@ impl Doodad {
             buffs: Buffs::default(),
             db_id: 0,
             is_persistent: false,
-            spawn_pending: false,
             func_group_id: 0,
             current_func_types: Vec::new(),
             item_id: 0,
