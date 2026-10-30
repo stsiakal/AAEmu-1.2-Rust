@@ -351,3 +351,19 @@ async fn a_slowed_bot_walks_at_the_units_actual_speed() {
         "a 50% slow covers about 2.7 m per second, not {covered:.2}"
     );
 }
+
+/// The movement packets' client time never goes backwards (the verifier's reason 0) and runs at
+/// wall-clock rate, also across an idle stretch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_movement_clock_is_monotonic_and_runs_at_wall_clock_rate() {
+    let server = nav_server();
+    let bot = bot_at(&server, 2, "Walker", 100.0, 100.0).await;
+    let first = bot.next_move_time_ms();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let second = bot.next_move_time_ms();
+    assert!(
+        second >= first + 240 && second <= first + 600,
+        "{first} -> {second}"
+    );
+    assert!(bot.next_move_time_ms() >= second);
+}

@@ -1,6 +1,6 @@
 //! One live bot: its socketless connection, the replies it can read, and its think schedule.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -12,7 +12,7 @@ use aaemu_game::GameServer;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
-use crate::nav::{PlanCancel, PlanGate, RoadGraphCache, STEP_MS};
+use crate::nav::{PlanCancel, PlanGate, RoadGraphCache};
 
 /// Idle cadence of a bot between thinks (the cadence table / governor comes in P2/P3).
 const IDLE_THINK: Duration = Duration::from_millis(1_000);
@@ -33,9 +33,10 @@ pub struct BotSession {
     cancelled_generation: AtomicU64,
     /// The host's concurrent-plan gate (defaults to the server-wide gate in tests).
     plan_gate: OnceLock<Arc<PlanGate>>,
-    /// Monotonic movement-packet time: `ms_of_day` wraps at UTC midnight and the verifier
-    /// would see time go backwards.
-    move_time_ms: AtomicU32,
+    /// Movement-packet clock: `ms_of_day` at the session start plus the monotonic time since
+    /// then (`ms_of_day` itself wraps at UTC midnight and the verifier would see time go
+    /// backwards), so it runs at wall-clock rate like a real client's, also across idle stretches.
+    move_clock: (u32, std::time::Instant),
     /// Places the walker got stuck at (routed around by later plans).
     stuck_spots: Mutex<Vec<(f32, f32)>>,
     /// Test hook: an upper bound (ms) for the overall walk deadline (`0` = none).
@@ -57,7 +58,10 @@ impl BotSession {
             nav_generation: Arc::new(AtomicU64::new(0)),
             cancelled_generation: AtomicU64::new(u64::MAX),
             plan_gate: OnceLock::new(),
-            move_time_ms: AtomicU32::new(aaemu_game::systems::ai::npc::ms_of_day()),
+            move_clock: (
+                aaemu_game::systems::ai::npc::ms_of_day(),
+                std::time::Instant::now(),
+            ),
             stuck_spots: Mutex::new(Vec::new()),
             #[cfg(test)]
             walk_deadline_cap_ms: AtomicU64::new(0),
@@ -122,11 +126,11 @@ impl BotSession {
         let _ = self.plan_gate.set(gate);
     }
 
-    /// The next movement-packet time: a monotonic per-session clock (100 ms per step), not the
+    /// The next movement-packet time: a monotonic per-session clock at wall-clock rate, not the
     /// UTC day clock.
     pub(crate) fn next_move_time_ms(&self) -> u32 {
-        self.move_time_ms
-            .fetch_add(STEP_MS as u32, Ordering::Relaxed)
+        let (base, started) = self.move_clock;
+        base.wrapping_add(started.elapsed().as_millis() as u32)
     }
 
     /// The overall walk deadline (tests may cap it with [`BotSession::set_walk_deadline_cap`]).

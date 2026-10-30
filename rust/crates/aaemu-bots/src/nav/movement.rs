@@ -892,19 +892,21 @@ async fn plan_blocking(
             radius: AVOID_RADIUS_M,
         })
     };
+    let started = std::time::Instant::now();
     let Some(report) = nav::plan_guarded(world, from, to, bot.plan_gate(), cancel).await else {
         return Err("plan cancelled".to_string());
     };
     match report.plan {
         Some(plan) => {
             tracing::info!(
-                "Bots: route ({:.1}, {:.1}) -> ({:.1}, {:.1}) planned via {} ({} waypoints)",
+                "Bots: route ({:.1}, {:.1}) -> ({:.1}, {:.1}) planned via {} ({} waypoints) in {} ms (gate wait included)",
                 from.x,
                 from.y,
                 to.x,
                 to.y,
                 plan.source,
-                plan.points.len()
+                plan.points.len(),
+                started.elapsed().as_millis()
             );
             Ok(plan.points)
         }
