@@ -281,7 +281,9 @@ skills 14575 / 14575 / 14574 and their tradepack materials (17684 / 17684 / 1768
 the single backpack slot must be free for the next one), asserting each material is consumed. It requires
 `SCMyHouse` + `SCHouseState` with the bot as owner, the `SCHouseBuildProgress` steps up to 3/3, `SCHouseTaxInfo`,
 and finally demolishes the house with the GM `/house forcedemo` command and requires
-`SCHouseDemolished`. Tries nearby offsets if an earlier run's house still occupies the plot. Every item the run
+`SCHouseDemolished`. Tries nearby offsets if an earlier run's house still occupies the plot (a rejected spot ends its
+wait after a second: with other bots moving around the plot the connection is never quiet, and waiting for quiet
+cost 8 s per rejected spot; a slow server is still waited for, up to 30 s). Every item the run
 added that the server did not consume (design item and certificates when the creation fails, the material of a
 failed step) is destroyed on the cleanup path, also when the run fails during the re-select: the run records how far
 the way back into the world got (leave, lobby, select, spawn) and the cleanup finishes the missing steps (pending

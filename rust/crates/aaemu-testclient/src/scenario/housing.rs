@@ -551,20 +551,57 @@ async fn finish_entry(game: &mut GameClient, cleanup: &mut Cleanup) -> anyhow::R
     Ok(())
 }
 
-/// How [`create_answers`] listens: the quiet time that ends a burst, the longest single burst and
-/// the total time to keep listening when nothing decisive has come.
+/// How [`create_answers`] listens: the quiet time that ends a burst, the longest single burst, how
+/// much longer a burst lasts once the server rejected the placement, and the total time to keep
+/// listening when nothing decisive has come.
 #[derive(Clone, Copy)]
 struct AnswerWait {
     quiet: Duration,
     burst: Duration,
+    after_rejection: Duration,
     total: Duration,
 }
 
 const CREATE_ANSWER_WAIT: AnswerWait = AnswerWait {
     quiet: Duration::from_millis(1000),
     burst: Duration::from_secs(8),
+    after_rejection: Duration::from_millis(1000),
     total: Duration::from_secs(30),
 };
+
+/// Whether `p` is one of the placement rejections worth retrying on another spot.
+fn is_rejection(p: &Packet) -> bool {
+    matches!(
+        error_code(p),
+        Some(INVALID_AREA | OVERLAP_HOUSE | OVERLAP_UNIT)
+    )
+}
+
+/// One burst of the server's answer: everything until the connection is quiet for `wait.quiet` or
+/// the burst has lasted `wait.burst`. A rejection needs nothing more than what arrives at once, so
+/// it cuts the burst to `wait.after_rejection`: with the other bots moving around the plot the
+/// connection is never quiet, and every rejected spot would cost the whole burst.
+async fn answer_burst(game: &mut GameClient, wait: AnswerWait) -> anyhow::Result<Vec<Packet>> {
+    let mut end = Instant::now() + wait.burst;
+    let mut quiet = wait.quiet;
+    let mut packets = Vec::new();
+    loop {
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(packets);
+        }
+        match game.recv_within(quiet.min(left)).await? {
+            Some(p) => {
+                if is_rejection(&p) {
+                    end = end.min(Instant::now() + wait.after_rejection);
+                    quiet = quiet.min(wait.after_rejection);
+                }
+                packets.push(p);
+            }
+            None => return Ok(packets),
+        }
+    }
+}
 
 /// The server's answer to a `CSCreateHouse`: the burst that follows it and, when that holds
 /// neither a rejection nor a house of the bot's (a loaded server answers late), more bursts until
@@ -574,7 +611,7 @@ async fn create_answers(game: &mut GameClient, wait: AnswerWait) -> anyhow::Resu
     let deadline = Instant::now() + wait.total;
     let mut answers = Vec::new();
     loop {
-        answers.extend(game.drain(wait.quiet, wait.burst).await?);
+        answers.extend(answer_burst(game, wait).await?);
         let decided = answers
             .iter()
             .any(|p| error_code(p).is_some() || own_house(p, owner).is_some());
@@ -1209,6 +1246,7 @@ mod tests {
         let wait = AnswerWait {
             quiet: Duration::from_millis(150),
             burst: Duration::from_millis(600),
+            after_rejection: Duration::from_millis(100),
             total: Duration::from_secs(5),
         };
         let server = tokio::spawn(async move {
@@ -1235,24 +1273,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_rejection_ends_the_wait_for_the_house_at_once() {
+    async fn a_rejection_ends_the_wait_even_while_other_players_keep_the_connection_busy() {
         let (mut game, mut peer) = scripted_game();
         game.state.selected_char = CHAR;
         let wait = AnswerWait {
             quiet: Duration::from_millis(100),
-            burst: Duration::from_millis(500),
+            burst: Duration::from_secs(5),
+            after_rejection: Duration::from_millis(200),
             total: Duration::from_secs(30),
         };
         let server = tokio::spawn(async move {
-            peer.send(sc::SCErrorMsgPacket, &OVERLAP_HOUSE.to_le_bytes())
-                .await;
+            // Ambient traffic of the other bots all along, the rejection after 100 ms.
+            for i in 0..400 {
+                if i == 5 {
+                    peer.send(sc::SCErrorMsgPacket, &OVERLAP_HOUSE.to_le_bytes())
+                        .await;
+                }
+                peer.send(sc::SCUnitStatePacket, &unit_state()).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
             peer
         });
         let started = Instant::now();
         let answers = create_answers(&mut game, wait).await.unwrap();
+        // Without the cut the busy connection never goes quiet and the wait lasts the whole
+        // burst (5 s).
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
         assert_eq!(answers.iter().find_map(error_code), Some(OVERLAP_HOUSE));
-        assert!(started.elapsed() < Duration::from_secs(5));
-        server.await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_house_is_still_waited_for_on_a_busy_connection_until_it_is_quiet_or_the_burst_ends()
+    {
+        // No rejection: the whole burst is read, so the packets that follow the house arrive too.
+        let (mut game, mut peer) = scripted_game();
+        game.state.selected_char = CHAR;
+        let wait = AnswerWait {
+            quiet: Duration::from_millis(100),
+            burst: Duration::from_millis(700),
+            after_rejection: Duration::from_millis(50),
+            total: Duration::from_secs(30),
+        };
+        let server = tokio::spawn(async move {
+            peer.send(
+                sc::SCMyHousePacket,
+                &house_body(TL, HOUSE_OBJ, DESIGN, CHAR, 3, 3),
+            )
+            .await;
+            for _ in 0..100 {
+                peer.send(sc::SCUnitStatePacket, &unit_state()).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            peer
+        });
+        let started = Instant::now();
+        let answers = create_answers(&mut game, wait).await.unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(600));
+        assert!(answers.iter().any(|p| own_house(p, CHAR).is_some()));
+        assert!(
+            answers
+                .iter()
+                .filter(|p| p.is_sc(sc::SCUnitStatePacket))
+                .count()
+                > 10
+        );
+        server.abort();
     }
 
     #[tokio::test]
@@ -1261,6 +1351,7 @@ mod tests {
         let wait = AnswerWait {
             quiet: Duration::from_millis(50),
             burst: Duration::from_millis(100),
+            after_rejection: Duration::from_millis(50),
             total: Duration::from_millis(300),
         };
         let started = Instant::now();

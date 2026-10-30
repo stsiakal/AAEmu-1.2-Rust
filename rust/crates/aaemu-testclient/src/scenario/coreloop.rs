@@ -75,8 +75,14 @@ where
 {
     let rec = r.rec;
     let result = guarded(rec, limit, body(game, r, state)).await;
+    let failed_in = result.is_err().then(|| rec.current_step());
     let cleanup_result = clean_up(game, r, state).await;
     let leave = leave_world(game).await;
+    if let Some(step) = failed_in {
+        // The failure belongs to the step the body stopped in, not to the cleanup step that
+        // ran after it (the outcome names the step that is current when the error is read).
+        rec.step(&step);
+    }
     result?;
     cleanup_result?;
     leave?;
@@ -837,7 +843,58 @@ pub(super) mod tests {
         Ok(())
     }
 
-    async fn cleanup_fails(log: &mut Log) -> anyhow::Result<()> {
+    /// The step the recorder names once the scenario ended, for a body that fails and a cleanup
+    /// that begins a step of its own.
+    async fn step_after(body_fails: bool, cleanup_fails: bool) -> String {
+        let (mut game, peer) = scripted_game();
+        let server = tokio::spawn(serve_leave(peer));
+        let rec = Recorder::new(false);
+        let mut r = Runner {
+            rec: &rec,
+            out: Default::default(),
+        };
+        let mut log = Log::new();
+        let _ = run_scenario(
+            &mut game,
+            &mut r,
+            Duration::from_secs(5),
+            &mut log,
+            |_game, r, log| {
+                Box::pin(async move {
+                    let _ = r.begin("game.test.report");
+                    if body_fails {
+                        fails(log).await
+                    } else {
+                        finishes(log).await
+                    }
+                })
+            },
+            |_game, r, log| {
+                Box::pin(async move {
+                    let _ = r.begin("game.test.cleanup");
+                    if cleanup_fails {
+                        cleanup_fails_fn(log).await
+                    } else {
+                        cleans(log).await
+                    }
+                })
+            },
+        )
+        .await;
+        server.await.unwrap();
+        rec.current_step()
+    }
+
+    #[tokio::test]
+    async fn a_failed_body_keeps_the_blame_instead_of_the_cleanup_step_that_ran_after_it() {
+        assert_eq!(step_after(true, false).await, "game.test.report");
+        assert_eq!(step_after(true, true).await, "game.test.report");
+        // A failing cleanup is its own step's failure; a clean run ends in the cleanup step.
+        assert_eq!(step_after(false, true).await, "game.test.cleanup");
+        assert_eq!(step_after(false, false).await, "game.test.cleanup");
+    }
+
+    async fn cleanup_fails_fn(log: &mut Log) -> anyhow::Result<()> {
         log.push("cleanup");
         anyhow::bail!("the cleanup failed")
     }
@@ -934,7 +991,7 @@ pub(super) mod tests {
         let (log, result, left) = drive(
             Duration::from_secs(5),
             |log| Box::pin(fails(log)),
-            |log| Box::pin(cleanup_fails(log)),
+            |log| Box::pin(cleanup_fails_fn(log)),
         )
         .await;
         assert_eq!(log, ["body", "cleanup"]);
@@ -944,7 +1001,7 @@ pub(super) mod tests {
         let (log, result, left) = drive(
             Duration::from_secs(5),
             |log| Box::pin(finishes(log)),
-            |log| Box::pin(cleanup_fails(log)),
+            |log| Box::pin(cleanup_fails_fn(log)),
         )
         .await;
         assert_eq!(log, ["body", "cleanup"]);
