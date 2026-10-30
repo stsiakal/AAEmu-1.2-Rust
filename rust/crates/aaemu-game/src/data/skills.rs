@@ -215,6 +215,50 @@ pub const ITEM_SKILL_SOURCES: &[(&str, &str)] =
 /// NPC / event skills.
 pub const CLIENT_SKILL_SPECIAL_EFFECT_SOURCES: &[i32] = &[30];
 
+/// Effect classes whose skills the client casts from its own UI even though no source table
+/// names them: the priest's lost-experience prayer (skill 17063 "Offer Prayer",
+/// `recover_exp_effects` 1, `need_priest`) is a plain `CSStartSkill` sent by the 1.2 client's
+/// priest interaction window (`scriptsbin/x2ui/messageboximpl/message_box_from_npc_interaction.alb`
+/// -> `X2Priest:RecoverExp`). 26611 "Full XP Restoration" (`recover_exp_effects` 5) is not cast
+/// there: it is the skill of the XP Restoration Scrolls (items 33965 / 33966 / 34024-34029,
+/// `items.use_skill_id`), effect 5 has no priest and no labor and a 300 s cooldown, and it was
+/// already client-sourced through `items`. The C# `CSStartSkillPacket` ran every template skill
+/// here, so the prayer worked there; the effect itself still checks the priest distance and the
+/// labor cost.
+///
+/// `(actual_type, table, column)` selects only the effect rows the client's own UI names: only
+/// `recover_exp_effects.need_priest` rows are priest-window casts, while the other rows are item
+/// skills already named by `items.use_skill_id`.
+pub const CLIENT_SKILL_EFFECT_SOURCES: &[(&str, &str, &str)] =
+    &[("RecoverExpEffect", "recover_exp_effects", "need_priest")];
+
+/// Skill ids named by one effect source table: `skill_effects` -> `effects` -> the source table.
+///
+/// The effect source tables are keyed by `effects.actual_id` (the effect template id, the C#
+/// `SkillEffect.Template` key), not by `effects.id`: in the real data `recover_exp_effects` 1 / 5
+/// are the `actual_id`s of `effects` 18268 / 39213. Only rows whose `column` flag is `'t'` are
+/// casts of the client's own UI.
+pub(crate) fn effect_sourced_skills(
+    conn: &Connection,
+    actual_type: &str,
+    table: &str,
+    column: &str,
+) -> rusqlite::Result<Vec<u32>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT se.skill_id FROM skill_effects se \
+         JOIN effects e ON e.id = se.effect_id \
+         JOIN {table} ef ON ef.id = e.actual_id \
+         WHERE e.actual_type = ?1 AND ef.{column} = 't' AND se.skill_id > 0"
+    ))?;
+    let mut ids = Vec::new();
+    for id in stmt.query_map([actual_type], |r| r.get::<_, i64>(0))? {
+        if let Ok(id) = u32::try_from(id?) {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
 impl SkillData {
     /// Whether `id` is named by a client-driven source ([`CLIENT_SKILL_SOURCES`]).
     pub fn is_client_sourced_skill(&self, id: u32) -> bool {
@@ -415,6 +459,19 @@ impl SkillData {
                 tracing::warn!(
                     "client skill special effect source {special_effect_type_id} not loaded: {e}"
                 );
+            }
+        }
+        for &(actual_type, table, column) in CLIENT_SKILL_EFFECT_SOURCES {
+            // The effect table is the C# `SkillManager._effects` key: player recovery skills
+            // (the priest's prayer) are reached through the client's own interaction UI.
+            match effect_sourced_skills(conn, actual_type, table, column) {
+                Ok(ids) => {
+                    non_item_sourced.extend(ids.iter().copied());
+                    d.client_sourced.extend(ids);
+                }
+                Err(e) => {
+                    tracing::warn!("client skill effect source {actual_type} not loaded: {e}")
+                }
             }
         }
         // An item skill that another source also hands to players (doodad / NPC interaction,

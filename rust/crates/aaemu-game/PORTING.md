@@ -1531,7 +1531,7 @@ is no longer mirrored (see "Known deviations", dead NPC returned and healed).
   `do_fall_damage` deals no damage (and sends no `SCEnvDamagePacket`) up to
   `pl_fallDamage_SpeedSafe` (20 m/s, `collision::fall::SPEED_SAFE`, the threshold of the zone's
   own fall check; the client unit is the inferred 32000 / 63.25 per m/s, so `fallVel <= 10118`
-  is safe and 10119 hurts), clamps the damage after the multiplier at 0, and keeps the C# curve
+  is safe and 10119 hurts), clamps the damage after the multiplier at 0 (a fall cancelled to 0 neither stuns nor sends a packet), and keeps the C# curve
   above the gate (`fallVel >= 32000` still kills, the 5 % floor and the stun are unchanged).
   `reduce_current_hp` treats a negative damage value as 0 (a WARN; every caller passes a
   positive value, heals use `effects::combat::heal`) and keeps the result in `[0, max_hp]` (a
@@ -2595,18 +2595,28 @@ Additional world-side fixes from the same audit:
   wins. A candidate passes when (ships) the collision terrain is not above the water surface at
   x/y, (land) the terrain is at most 10 m above the player, a ray from the player's eyes to the
   candidate hits nothing (mask `SOLID_TERRAIN` 0x107, flags 0x8F; ships end at the water surface,
-  land at the candidate's own ground + 1 m, i.e. the 1.2 eye-to-eye rule), the model box (the
+  land at the candidate's terrain point lifted by 0.2 m), the model box (the
   unclipped model bbox from the prefab collision proxies; the inertia mass box of the ship model
   when the model reference is unavailable, e.g. no client assets) rotated to player yaw + 90
   degrees overlaps no blocking static and no terrain heightfield, and the 3D player-to-candidate
-  distance is at most 80 m. The land candidate z is the static-aware ground (`ground_height_or`:
-  bridges, plazas, quays, then the heightmap), and the final spawn re-grounds a positioned land
-  slave the same way, so a vehicle on a bridge or quay does not sink to the terrain below it.
+  distance is at most 80 m. The land candidate z, its distance check, the model box and the
+  final spawn (search, `SummonPos` validation, post-wait recheck and re-ground) are all the
+  terrain heightfield only (`GetTerrainElevation`, vtable `+0x1fc`), never statics: a deck,
+  bridge or quay above the candidate's terrain lies between the eyes and the terrain point, so
+  the 1.2 rule refuses the summon (error 100) instead of placing the vehicle on the floor. The
+  0.2 m lift of the land ray end is a deviation: 1.2 ends the ray exactly at the terrain point
+  and the lift avoids a float graze between the ray end and the heightfield (the Bevy client
+  port lifts its end the same way).
   The box is an oriented `PrimitiveWorldIntersection` query (`box_obstacles`) for statics plus
   `box_overlaps_terrain` for the heightfield (the PWI box query does not report heightfield
   contacts); this 1.2 path has no +1 m top margin, no terrain point sampling and no
   containment rays. Statics with a world AABB under 2 m (buoys, bollards, mooring posts) and
-  vegetation are ignored. If none of the 120 passes, the summon is refused with `SCErrorMsg`
+  vegetation are ignored. The box query batches: the engine's per-thread contact pool holds 64
+  records and 2040 border points and silently drops further parts, so a saturated round is
+  repeated with the entities already seen in the skip list (the batch box stays the client's exact
+  box; the caller's identical-box query cache is invalidated before every round with
+  `World::invalidate_box_query_cache`) for at most 8
+  rounds; a still-saturated query reports the spot as blocked. If none of the 120 passes, the summon is refused with `SCErrorMsg`
   100 (`SLAVE_SPAWN_SHIP_NEED_MORE_SPACE`), the summon item is not committed, the skill
   cooldown and GCD are refunded — on the server and on the client with the same
   `SCSkillCooldownResetPacket` the skill system uses — (also when a client `SummonPos` placement
@@ -2622,7 +2632,9 @@ Additional world-side fixes from the same audit:
   wholly inside the model box is not reported on this path (the old containment rays are
   GM-only); land slaves use the terrain step and line of sight, not a vehicle-model box (only
   ship models are loaded); and without a collision world (tests, Physics off) player placement
-  falls back to the C# in-front placement.
+  falls back to the C# in-front placement. `Physics:SummonDiagnostics` (Rust only, default
+  off) keeps scanning all 120 candidates after the first valid one and logs the 1.2 model box
+  against the old hull envelope per candidate (debug only).
 Remaining packet stubs and table candidates are still subject to behavior review. Missing SQL
 mentions do not establish disuse (some names are selected dynamically); empty tables, client
 visuals and schema migration metadata do not imply missing server features. The 10.x reference
@@ -2928,10 +2940,11 @@ two bots before the fix (a foreign `Mount` caster, an NPC-only skill and a far d
   data (`SkillData::is_client_sourced_skill`, `CLIENT_SKILL_SOURCES`): doodad funcs / uses / fake
   uses / conditional uses / skill hits, sphere doodad interacts, crafts, NPC interactions, slash
   commands, buff skills, quest accept / supply / component / timer skills, item use skills and the
-  housing / shipyard build steps. Mount skills, mount-attached (rider) skills and NPC AI skills
-  (`np_skills`) are deliberately absent. Possible over-blocking: a skill the 1.2 client casts that
-  none of these tables names (the retail rule is not confirmed); such a cast is refused with a
-  warning naming the skill id, so it is easy to add the table.
+  housing / shipyard build steps, plus the effect-based recovery skills below. Mount skills,
+  mount-attached (rider) skills and NPC AI skills (`np_skills`) are deliberately absent. Possible
+  over-blocking: a skill the 1.2 client casts that none of these tables names (the retail rule is
+  not confirmed); such a cast is refused with a warning naming the skill id, so it is easy to add
+  the table.
 - **Ability-tree skills need an active ability and a learned skill.** The C# `CSStartSkill` fell
   through to the catch-all above and cast any skill id. The 1.2 client marks unlearned and
   inactive-tree skills unusable in its UI: the action-slot UI carries `canUse` / `learned`
@@ -2990,6 +3003,28 @@ two bots before the fix (a foreign `Mount` caster, an NPC-only skill and a far d
   `slave_mount_skills`, or a `buff_mount_skills` entry of an active vehicle buff, each mapped
   through `mount_skills.skill_id`. This closes the NPC / boss / GM skill bypass; the rider /
   operator skill still runs as the player through `mount_attached_skills`.
+
+## Lost-experience prayer cast (2026-10-30)
+
+The player report "lost XP not given back at Nuia" was the skill-cast hardening above refusing the
+priest's prayer: the client shows "You don't have permission." (`NO_PERM`, 0x2D). The 1.2 client
+casts skill 17063 "Offer Prayer" (`recover_exp_effects` 1: labor plus a priest within 10 m) as a
+plain `CSStartSkill` from its own interaction window
+(`scriptsbin/x2ui/messageboximpl/message_box_from_npc_interaction.alb` -> `X2Priest:RecoverExp`);
+it appears in no `CLIENT_SKILL_SOURCES` table, and `skill_req_skills` is a peace-zone restriction
+list, not a grant. 26611 "Full XP Restoration" is a different skill: `recover_exp_effects` 5 has no
+priest and no labor (300 s cooldown), and it is the skill of the XP Restoration Scrolls (items
+33965 / 33966 / 34024-34029, `items.use_skill_id`), already client-sourced through `items`; the
+priest window never casts it. The C# `CSStartSkillPacket` cast every template skill in its fallback
+branch, so the prayer worked there. `SkillData` now also marks the skills whose `skill_effects` row
+points at an `effects.actual_type = 'RecoverExpEffect'` row with
+`recover_exp_effects.need_priest = 't'` (`CLIENT_SKILL_EFFECT_SOURCES`): data-driven, not an id
+allowlist, so it adds only 17063 and item skills stay item-driven, and the effect's own
+`need_priest` / `need_labor_power` checks are unchanged. Labor is now spent only when
+`need_labor_power` is set, and saturating at 0: the scroll used to subtract the level-based amount
+anyway and could wrap labor negative. `recoverable_exp` was already saved and loaded
+(`db_character.rs`), so it survives a relog; a second death overwrites it exactly as
+`CharacterCombat.DoDie` does (`RecoverableExp = round(LastExpLoss * 0.8)`).
 
 ## Ship repair timer and destroyed-vehicle HP (2026-10-20)
 
