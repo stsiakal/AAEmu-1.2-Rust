@@ -2613,8 +2613,9 @@ Additional world-side fixes from the same audit:
   containment rays. Statics with a world AABB under 2 m (buoys, bollards, mooring posts) and
   vegetation are ignored. The box query batches: the engine's per-thread contact pool holds 64
   records and 2040 border points and silently drops further parts, so a saturated round is
-  repeated with the entities already seen in the skip list (the identical-box query cache is
-  defeated by growing the batch box 1 mm per round, a conservative superset) for at most 8
+  repeated with the entities already seen in the skip list (the batch box stays the client's exact
+  box; the caller's identical-box query cache is invalidated before every round with
+  `World::invalidate_box_query_cache`) for at most 8
   rounds; a still-saturated query reports the spot as blocked. If none of the 120 passes, the summon is refused with `SCErrorMsg`
   100 (`SLAVE_SPAWN_SHIP_NEED_MORE_SPACE`), the summon item is not committed, the skill
   cooldown and GCD are refunded — on the server and on the client with the same
@@ -2631,7 +2632,9 @@ Additional world-side fixes from the same audit:
   wholly inside the model box is not reported on this path (the old containment rays are
   GM-only); land slaves use the terrain step and line of sight, not a vehicle-model box (only
   ship models are loaded); and without a collision world (tests, Physics off) player placement
-  falls back to the C# in-front placement.
+  falls back to the C# in-front placement. `Physics:SummonDiagnostics` (Rust only, default
+  off) keeps scanning all 120 candidates after the first valid one and logs the 1.2 model box
+  against the old hull envelope per candidate (debug only).
 Remaining packet stubs and table candidates are still subject to behavior review. Missing SQL
 mentions do not establish disuse (some names are selected dynamically); empty tables, client
 visuals and schema migration metadata do not imply missing server features. The 10.x reference
