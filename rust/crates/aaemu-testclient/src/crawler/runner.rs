@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use super::catalog::{Catalog, GateVerdict, Objective, Quest};
 use super::CrawlConfig;
-use crate::game::{DoodadInfo, GameClient, Packet, UnitInfo, LEVEL_PROXY};
+use crate::game::{DoodadInfo, GameClient, GameState, Packet, UnitInfo, LEVEL_PROXY};
 use crate::login::LoginClient;
 use crate::record::Recorder;
 use crate::stream::StreamClient;
@@ -87,6 +87,20 @@ struct QuestTracker {
 }
 
 impl QuestTracker {
+    /// Copies the quest state `GameClient` collected from every accepted packet; packets read
+    /// by `wait_for` never reach a drain, so this is the reliable source.
+    fn sync(&mut self, state: &GameState) {
+        for (quest, (status, objectives)) in &state.quest_states {
+            self.states.insert(
+                *quest,
+                QuestState {
+                    status: *status,
+                    objectives: *objectives,
+                },
+            );
+        }
+    }
+
     fn observe(&mut self, packets: &[Packet]) {
         for p in packets {
             if p.is_sc(sc::SCQuestContextStartedPacket) || p.is_sc(sc::SCQuestContextUpdatedPacket)
@@ -153,6 +167,7 @@ impl Session {
     async fn pump(&mut self) -> Result<Vec<Packet>> {
         let packets = self.game.drain(QUIET, Duration::from_millis(1500)).await?;
         self.tracker.observe(&packets);
+        self.tracker.sync(&self.game.state);
         for p in &packets {
             if p.is_sc(sc::SCLevelChangedPacket) {
                 let mut s = p.stream();
@@ -178,6 +193,7 @@ impl Session {
             .drain(Duration::from_millis(120), Duration::from_millis(max_ms))
             .await?;
         self.tracker.observe(&packets);
+        self.tracker.sync(&self.game.state);
         ensure!(!self.game.state.disconnected, "disconnected");
         Ok(packets)
     }
@@ -321,7 +337,9 @@ fn finish_result(
         Err(f) => {
             if f.step == "unsupported" {
                 r.status = "unsupported".into();
-            } else if f.step == "gate" {
+            } else if f.step == "gate"
+                || (f.step == "accept" && f.reason.contains("already completed"))
+            {
                 r.status = "skipped".into();
             }
             r.step = f.step;
@@ -892,9 +910,10 @@ async fn play_objective(
                         .ok_or_else(|| "item group has no members".to_string())?
                 };
                 let need = (obj.required - current).max(1) as u32;
-                ensure_item(session, item, need, anchor)
+                // Always hand over a fresh stack: an existing stack raises no acquisition event.
+                gm_command(&mut session.game, &format!("item add self {item} {need}"))
                     .await
-                    .map_err(|e| format!("gather item {item}: {e}"))?;
+                    .map_err(|e| format!("gather item {item}: {e:#}"))?;
                 let _ = session.sleep_pump(800).await;
             }
         }

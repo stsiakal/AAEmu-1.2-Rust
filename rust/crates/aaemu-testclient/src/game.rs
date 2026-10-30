@@ -583,6 +583,10 @@ pub struct GameState {
     pub bag_slots: u8,
     /// Active quests from `SCQuestsPacket`: template id -> status.
     pub active_quests: HashMap<u32, u8>,
+    /// Latest `SCQuestContextStarted/Updated` state: template id -> (status, objectives).
+    pub quest_states: HashMap<u32, (u8, [i32; 5])>,
+    /// Quest ids from `SCQuestContextCompletedPacket`.
+    pub completed_quests: HashSet<u32>,
     /// Latest `SCUnitPointsPacket` per unit: `(hp, mp)` (the wire carries them times 100).
     pub unit_points: HashMap<u32, (i32, i32)>,
     /// Units announced dead by `SCUnitDeathPacket` (and not removed since).
@@ -761,6 +765,21 @@ impl GameState {
                 user_state: s.read_u8()?,
             });
             st.mate_spawn_count += 1;
+        } else if p.is_sc(sc::SCQuestContextStartedPacket)
+            || p.is_sc(sc::SCQuestContextUpdatedPacket)
+        {
+            s.read_i64()?;
+            let quest = s.read_u32()?;
+            let status = s.read_u8()?;
+            let mut objectives = [0; 5];
+            for o in &mut objectives {
+                *o = s.read_i32()?;
+            }
+            st.quest_states.insert(quest, (status, objectives));
+        } else if p.is_sc(sc::SCQuestContextCompletedPacket) {
+            let quest = s.read_u32()?;
+            st.completed_quests.insert(quest);
+            st.quest_states.insert(quest, (5, [0; 5]));
         } else if p.is_sc(sc::SCQuestsPacket) {
             let count = s.read_i32()?;
             if count > 0 {
