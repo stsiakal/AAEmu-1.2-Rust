@@ -984,6 +984,9 @@ async fn play_objective(
                     .map_err(|e| format!("using item {item}: {e:#}"))?;
             }
             let _ = wait_skill(session, use_skill, CAST_ANSWER).await;
+            // Item skills often have a cast time; let the fired packet arrive before the next
+            // attempt, or the retry replaces the pending effect.
+            let _ = wait_skill_fired(session, use_skill, Duration::from_secs(6)).await;
             let _ = session.sleep_pump(600).await;
         }
         "QuestActObjInteraction" => {
@@ -1103,7 +1106,6 @@ async fn hunt_once(
                 .await
                 .map_err(|e| format!("face: {e:#}"))?;
             let _ = session.pump_fast(400).await;
-            auto_started = false;
         }
         if !auto_started || last_cast.elapsed() > Duration::from_secs(8) {
             let _ = session.game.set_force_attack(true).await;
@@ -1164,6 +1166,7 @@ async fn interact_doodad(
         .await
         .map_err(|e| format!("cast {skill}: {e:#}"))?;
     let _ = wait_skill(session, skill, CAST_ANSWER).await;
+    let _ = wait_skill_fired(session, skill, Duration::from_secs(8)).await;
     let _ = session.sleep_pump(1000).await;
     Ok(())
 }
@@ -1598,6 +1601,22 @@ async fn wait_skill(session: &mut Session, skill_id: u32, wait: Duration) -> boo
         }
         Err(_) => false,
     }
+}
+
+async fn wait_skill_fired(session: &mut Session, skill_id: u32, wait: Duration) -> bool {
+    let caster = session.game.state.self_obj;
+    let saved = session.game.timeout;
+    session.game.timeout = wait;
+    let fired = session
+        .game
+        .wait_for("skill fired", |p| {
+            (p.is_sc(sc::SCSkillFiredPacket) && own_skill_response(p, skill_id, caster))
+                || p.is_sc(sc::SCErrorMsgPacket)
+        })
+        .await
+        .is_ok_and(|p| !p.is_sc(sc::SCErrorMsgPacket));
+    session.game.timeout = saved;
+    fired
 }
 
 fn skill_response_result(packet: &Packet) -> anyhow::Result<u8> {
