@@ -77,6 +77,43 @@ pub fn back_off(state: &mut CombatState, player: &PlayerRef, skill: u32, target:
     back_off_until(state, player, skill, target, now + REFUSAL_BACKOFF_MS);
 }
 
+/// How long a `Cooldown` answer really blocks this skill: the largest remaining end among the
+/// skill's own cooldown, its tag cooldown, the server's per-use interval and the global
+/// cooldown, as the unit's own state has them after the answer. Never below
+/// [`REFUSAL_BACKOFF_MS`], so a zero-cooldown skill (a GCD-only refusal) still waits the short
+/// window instead of re-sending on the next think.
+fn cooldown_backoff(server: &GameServer, player: &PlayerRef, skill_id: u32, now: i64) -> i64 {
+    let c = player.data();
+    let mut end = c
+        .unit
+        .cooldowns
+        .cooldowns
+        .get(&skill_id)
+        .copied()
+        .unwrap_or(0);
+    if let Some(template) = server.game_data.systems.skills.skill(skill_id) {
+        if template.cooldown_tag_id > 0 {
+            end = end.max(
+                c.unit
+                    .cooldowns
+                    .tag_cooldowns
+                    .get(&(template.cooldown_tag_id as u32))
+                    .copied()
+                    .unwrap_or(0),
+            );
+        }
+        let delay: i64 = if matches!(template.id, 2..=4) {
+            500
+        } else {
+            150
+        };
+        // `cast_throttled` allows the next use once the interval minus its grace passed.
+        end = end.max(c.unit.skill_last_used_ms + delay - super::skills::GCD_GRACE_MS);
+    }
+    end = end.max(c.unit.global_cooldown_ms);
+    (end - now).max(REFUSAL_BACKOFF_MS)
+}
+
 /// Is `skill` still backed off for this target from the bot's 2 m cell with its loadout?
 pub fn refused(state: &CombatState, player: &PlayerRef, skill: u32, target: u32, now: i64) -> bool {
     let t = player.data().unit.transform;
@@ -97,7 +134,10 @@ pub enum CastOutcome {
     /// the server's check: close in rather than back the skill off.
     OutOfRange,
     /// The unit was on cooldown / already casting: wait, do not back the skill off.
-    Cooldown,
+    /// `backoff_ms` is the real remaining time read from the unit's own cooldown state (the
+    /// skill, tag and global cooldowns), or the short refusal window when the answer carries no
+    /// usable time (`ON_CASTING`, a race).
+    Cooldown { backoff_ms: i64 },
     /// It refused for another reason; the skill is in back-off.
     Refused,
 }
@@ -204,7 +244,7 @@ pub async fn cast(
     // Test hook: let a test change the server's state in the window between the bot's read and
     // the handler (a cooldown race the bot-side gate cannot see yet).
     #[cfg(test)]
-    bot.run_before_cast(&player);
+    bot.run_before_cast(skill_id, &player);
     let packet = CSStartSkillPacket {
         skill_id,
         caster,
@@ -257,11 +297,17 @@ pub async fn cast(
                 state.casts_out_of_range += 1;
                 return CastOutcome::OutOfRange;
             }
-            Some(result)
-                if result == skill_result::COOLDOWN_TIME || result == skill_result::ON_CASTING =>
-            {
+            Some(result) if result == skill_result::COOLDOWN_TIME => {
                 state.casts_on_cooldown += 1;
-                return CastOutcome::Cooldown;
+                return CastOutcome::Cooldown {
+                    backoff_ms: cooldown_backoff(server, &player, skill_id, now),
+                };
+            }
+            Some(result) if result == skill_result::ON_CASTING => {
+                state.casts_on_cooldown += 1;
+                return CastOutcome::Cooldown {
+                    backoff_ms: REFUSAL_BACKOFF_MS,
+                };
             }
             _ => {}
         }
@@ -435,6 +481,60 @@ mod tests {
         packet.write_body(&mut s);
         let frames = vec![(sc::SCSkillStartedPacket, s.as_bytes().to_vec())];
         assert_eq!(cast_result(&frames), Some(0));
+    }
+
+    fn backoff_fixture() -> (Arc<GameServer>, PlayerRef) {
+        use aaemu_game::test_support::{spawn_player, test_character, test_server, TestClient};
+
+        let server = Arc::new(test_server());
+        server.set_self();
+        let client = TestClient::new(&server, 1, 1);
+        let player = spawn_player(
+            &server,
+            &client,
+            test_character(1, "Bot", 100.0, 100.0),
+            0x100,
+        );
+        (server, player)
+    }
+
+    #[tokio::test]
+    async fn a_real_skill_cooldown_backs_off_for_its_remaining_time() {
+        let (server, player) = backoff_fixture();
+        let now = aaemu_game::world::now_ms();
+        player
+            .data()
+            .unit
+            .cooldowns
+            .cooldowns
+            .insert(60_001, now + 10_000);
+        let backoff = cooldown_backoff(&server, &player, 60_001, now);
+        assert!(
+            (9_900..=10_100).contains(&backoff),
+            "the real remaining cooldown is used: {backoff}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gcd_only_refusal_backs_off_for_the_short_window() {
+        let (server, player) = backoff_fixture();
+        let now = aaemu_game::world::now_ms();
+        player.data().unit.global_cooldown_ms = now + 600;
+        assert_eq!(
+            cooldown_backoff(&server, &player, 60_005, now),
+            REFUSAL_BACKOFF_MS,
+            "a global cooldown is not a long skill cooldown"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_zero_cooldown_skill_backs_off_at_least_the_refusal_window() {
+        let (server, player) = backoff_fixture();
+        let now = aaemu_game::world::now_ms();
+        assert_eq!(
+            cooldown_backoff(&server, &player, 60_005, now),
+            REFUSAL_BACKOFF_MS
+        );
     }
 
     #[test]

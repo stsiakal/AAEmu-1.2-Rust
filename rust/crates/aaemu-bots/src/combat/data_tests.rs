@@ -492,8 +492,8 @@ async fn the_rotation_skips_ground_and_doodad_skills() {
 }
 
 /// A server-side heal cooldown (the bot's own state said the skill was ready) sent a packet,
-/// so it ends the think, and the heal is backed off for its template cooldown, not the short
-/// refusal window.
+/// so it ends the think, and the heal is backed off for the real remaining time carried by the
+/// answer.
 #[tokio::test]
 async fn a_server_side_heal_cooldown_is_backed_off_for_its_cooldown() {
     let server = combat_server(None);
@@ -504,13 +504,12 @@ async fn a_server_side_heal_cooldown_is_backed_off_for_its_cooldown() {
         &mut state,
         &player,
         KILL_SKILL,
-        10_000,
         now,
-        CastOutcome::Cooldown,
+        CastOutcome::Cooldown { backoff_ms: 10_000 },
     );
     assert_eq!(
         outcome,
-        Some(CastOutcome::Cooldown),
+        Some(CastOutcome::Cooldown { backoff_ms: 10_000 }),
         "the attempt sent a packet, so it ends the think"
     );
     let key = state
@@ -522,13 +521,7 @@ async fn a_server_side_heal_cooldown_is_backed_off_for_its_cooldown() {
         key.until >= now + 9_000,
         "backed off for the skill's cooldown, not the refusal window: {key:?}"
     );
-    let outcome = super::heal_attempt_outcome(
-        &mut state,
-        &player,
-        KILL_SKILL,
-        10_000,
-        now,
-        CastOutcome::Started,
-    );
+    let outcome =
+        super::heal_attempt_outcome(&mut state, &player, KILL_SKILL, now, CastOutcome::Started);
     assert_eq!(outcome, Some(CastOutcome::Started));
 }

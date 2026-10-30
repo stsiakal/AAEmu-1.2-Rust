@@ -133,9 +133,9 @@ fn add_heal_skill(data: &mut GameData, id: u32, heal: i32, cooldown_ms: i32) {
     data.systems.skills.add_skill(template);
 }
 
-/// The test world: a flat surface, the combat skills, a default melee attack and an always-drop
-/// loot pack on the monster template.
-fn combat_server() -> Arc<GameServer> {
+/// The test world's data: the combat skills, a default melee attack and an always-drop loot
+/// pack on the monster template.
+fn combat_data() -> GameData {
     let mut data = GameData::empty();
     add_damage_skill(&mut data, KILL_SKILL, 5_000, 0, 0);
     add_damage_skill(&mut data, SLOW_SKILL, 5_000, 800, 0);
@@ -199,12 +199,38 @@ fn combat_server() -> Arc<GameServer> {
             loots_by_group_no: vec![(0, vec![entry])],
         },
     );
+    data
+}
+
+/// The test world: a flat surface with [`combat_data`].
+fn combat_server() -> Arc<GameServer> {
+    combat_server_with(combat_data())
+}
+
+fn combat_server_with(data: GameData) -> Arc<GameServer> {
     let server = Arc::new(test_server_with(data));
     server.set_self();
     aaemu_game::systems::skills::bind(&server);
     install_flat_heightmap(&server, 100.0);
     install_test_terrain(&server, 100.0);
     server
+}
+
+/// A world where the player's and the monsters' faction resolve (same neutral treatment), so
+/// the bot may not attack the monsters: what an "evading" / unattackable mob feels like.
+fn unattackable_server() -> Arc<GameServer> {
+    use aaemu_game::data::world_data::SystemFaction;
+
+    let mut data = combat_data();
+    for id in [0, 101] {
+        data.factions.add(SystemFaction {
+            id,
+            name: format!("Faction{id}"),
+            mother_id: 2,
+            ..Default::default()
+        });
+    }
+    combat_server_with(data)
 }
 
 async fn bot(
@@ -960,20 +986,13 @@ async fn a_skill_problem_ignored_attacker_is_still_fought() {
 }
 
 /// A heal the server answers with a cooldown sent its `CSStartSkill` already: the think ends
-/// there (one cast per think), the heal is backed off for its template cooldown, and the next
-/// thinks fight.
+/// there (one cast per think), the heal is backed off for the remaining time of that cooldown,
+/// and the next thinks fight. The hook is bound to the heal id and the bot has no damage skill,
+/// so only the heal can consume it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_server_side_heal_cooldown_ends_the_think_with_one_cast() {
     let server = combat_server();
-    let bot = bot(
-        &server,
-        2,
-        "Cooldown",
-        100.0,
-        100.0,
-        &[COOLDOWN_HEAL, KILL_SKILL],
-    )
-    .await;
+    let bot = bot(&server, 2, "Cooldown", 100.0, 100.0, &[COOLDOWN_HEAL]).await;
     spawn_monster(&server, 0x400, MONSTER, 2, 50_000, 101.0, 100.0);
     bot.set_mode(Mode::Fight {
         wanted: Vec::new(),
@@ -981,7 +1000,96 @@ async fn a_server_side_heal_cooldown_ends_the_think_with_one_cast() {
     })
     .await;
     // A fight is already running when the bot gets hurt, so the same think that tries the heal
-    // would otherwise fall through to the rotation on this target.
+    // would otherwise fall through to the default attack on this target.
+    let engaged = wait_until(&server, &bot, Duration::from_secs(5), || {
+        bot.brain()
+            .try_lock()
+            .ok()
+            .is_some_and(|s| s.target == Some(0x400))
+    })
+    .await;
+    assert!(engaged, "the bot engaged the monster");
+    let (started_before, cooldown_before) = {
+        let state = bot.brain().lock().await;
+        (state.casts_started, state.casts_on_cooldown)
+    };
+    let player = bot.player().await.expect("a live bot");
+    {
+        let mut c = player.data();
+        c.unit.max_hp = 1_000;
+        c.unit.hp = 300; // below HEAL_BELOW: the heal is tried first
+    }
+
+    // The bot's own state says the heal is ready; the server state gains the cooldown in the
+    // window between the bot's read and the handler (the race the fix is for).
+    let cooldown_until = aaemu_game::world::now_ms() + 10_000;
+    bot.before_next_cast(move |skill, p| {
+        if skill == COOLDOWN_HEAL {
+            p.data()
+                .unit
+                .cooldowns
+                .cooldowns
+                .insert(COOLDOWN_HEAL, cooldown_until);
+        }
+    });
+
+    let answered = wait_until(&server, &bot, Duration::from_secs(5), || {
+        bot.brain()
+            .try_lock()
+            .ok()
+            .is_some_and(|s| s.casts_on_cooldown > cooldown_before)
+    })
+    .await;
+    assert!(answered, "the server answered the heal with a cooldown");
+    {
+        let state = bot.brain().lock().await;
+        assert_eq!(
+            state.casts_started, started_before,
+            "the fight cast followed the heal in the same think"
+        );
+        let key = state
+            .refused_on
+            .get(&COOLDOWN_HEAL)
+            .copied()
+            .expect("the heal is backed off");
+        assert!(
+            key.until >= cooldown_until,
+            "backed off for the real cooldown: {key:?}"
+        );
+    }
+
+    // The next thinks skip the backed-off heal and fight.
+    run_for(&server, &bot, Duration::from_millis(900)).await;
+    let state = bot.brain().lock().await;
+    assert!(
+        state.max_casts_per_think <= 1,
+        "one think sent {} casts",
+        state.max_casts_per_think
+    );
+    assert_eq!(
+        state.casts_on_cooldown,
+        cooldown_before + 1,
+        "the heal was retried"
+    );
+    assert!(
+        state.casts_started > started_before,
+        "the bot never fought after the heal was backed off"
+    );
+    assert!(monster_hp(&server, 0x400) < 50_000, "the fight stood still");
+}
+
+/// A heal the server answers with the global cooldown (not the skill's own cooldown) is backed
+/// off for the short window, not a long template cooldown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_heal_refused_on_the_gcd_backs_off_short() {
+    let server = combat_server();
+    let bot = bot(&server, 2, "Gcd", 100.0, 100.0, &[COOLDOWN_HEAL]).await;
+    spawn_monster(&server, 0x400, MONSTER, 2, 50_000, 101.0, 100.0);
+    bot.set_mode(Mode::Fight {
+        wanted: Vec::new(),
+        radius: 20.0,
+    })
+    .await;
     let engaged = wait_until(&server, &bot, Duration::from_secs(5), || {
         bot.brain()
             .try_lock()
@@ -994,54 +1102,66 @@ async fn a_server_side_heal_cooldown_ends_the_think_with_one_cast() {
     {
         let mut c = player.data();
         c.unit.max_hp = 1_000;
-        c.unit.hp = 300; // below HEAL_BELOW: the heal is tried first
+        c.unit.hp = 300;
     }
-
-    // The bot's own state says the heal is ready; the server state gains the cooldown in the
-    // window between the bot's read and the handler (the race the fix is for).
-    let cooldown_until = aaemu_game::world::now_ms() + 10_000;
-    bot.before_next_cast(move |p| {
-        p.data()
-            .unit
-            .cooldowns
-            .cooldowns
-            .insert(COOLDOWN_HEAL, cooldown_until);
+    let now = aaemu_game::world::now_ms();
+    let gcd_until = now + 600;
+    bot.before_next_cast(move |skill, p| {
+        if skill == COOLDOWN_HEAL {
+            p.data().unit.global_cooldown_ms = gcd_until;
+        }
     });
 
     let answered = wait_until(&server, &bot, Duration::from_secs(5), || {
         bot.brain()
             .try_lock()
             .ok()
-            .is_some_and(|s| s.casts_on_cooldown == 1)
+            .is_some_and(|s| s.refused_on.contains_key(&COOLDOWN_HEAL))
     })
     .await;
-    assert!(answered, "the server answered the heal with a cooldown");
-    {
-        let state = bot.brain().lock().await;
-        assert_eq!(
-            state.casts_started, 0,
-            "the fight cast followed the heal in the same think"
-        );
-        let key = state
-            .refused_on
-            .get(&COOLDOWN_HEAL)
-            .copied()
-            .expect("the heal is backed off");
-        assert!(
-            key.until >= cooldown_until,
-            "backed off for the template cooldown: {key:?}"
-        );
-    }
-
-    // The next thinks skip the backed-off heal and fight.
-    run_for(&server, &bot, Duration::from_millis(900)).await;
+    assert!(answered, "the server answered the heal with the gcd");
     let state = bot.brain().lock().await;
+    let key = state.refused_on[&COOLDOWN_HEAL];
     assert!(
-        state.max_casts_per_think <= 1,
-        "one think sent {} casts",
-        state.max_casts_per_think
+        key.until >= now && key.until - now <= 3_000,
+        "a gcd refusal must back off for the short window, not {key:?}"
     );
-    assert_eq!(state.casts_on_cooldown, 1, "the heal was retried");
-    assert!(state.casts_started >= 1, "the bot never fought");
-    assert!(monster_hp(&server, 0x400) < 50_000, "the fight stood still");
+}
+
+/// An unattackable (evading) attacker makes every skill unusable: after the wait give-up the
+/// bot re-acquires it once, and the second give-up escalates it to unreachable, so it retreats
+/// instead of cycling forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unattackable_attacker_is_retreated_after_the_second_give_up() {
+    let server = unattackable_server();
+    let bot = bot(&server, 2, "Cycled", 100.0, 100.0, &[]).await;
+    let player = player_of(&bot);
+    let mob = spawn_monster(&server, 0x400, MONSTER, 2, 50_000, 104.0, 100.0);
+    mob.data().current_aggro_target = player.obj_id;
+    bot.set_mode(Mode::Fight {
+        wanted: Vec::new(),
+        radius: 20.0,
+    })
+    .await;
+
+    let first = wait_until(&server, &bot, Duration::from_secs(15), || {
+        bot.brain().try_lock().ok().is_some_and(|s| {
+            s.ignored
+                .get(&0x400)
+                .is_some_and(|entry| entry.reason == crate::combat::IgnoreReason::NothingCastable)
+        })
+    })
+    .await;
+    assert!(first, "the first wait give-up did not happen");
+
+    let retreated = wait_until(&server, &bot, Duration::from_secs(15), || {
+        bot.brain().try_lock().ok().is_some_and(|s| {
+            s.is_unreachable(0x400, aaemu_game::world::now_ms()) && s.fleeing_to.is_some()
+        })
+    })
+    .await;
+    assert!(
+        retreated,
+        "the bot re-acquired the unattackable attacker forever"
+    );
 }

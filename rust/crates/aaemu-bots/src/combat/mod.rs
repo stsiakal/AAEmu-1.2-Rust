@@ -136,6 +136,9 @@ pub struct CombatState {
     waiting_since: Option<(u32, i64)>,
     /// Monsters left out of target selection, with the reason and the ignore window.
     pub ignored: HashMap<u32, Ignored>,
+    /// How often each monster was given up on since the session started. It survives the
+    /// re-acquire (the cycle breaker): a second give-up makes the monster unreachable.
+    give_up_counts: HashMap<u32, u8>,
     /// When expired ignore entries were last pruned.
     ignore_pruned_ms: i64,
     /// The last monster seen attacking the bot (the likely killer when it dies).
@@ -208,6 +211,7 @@ impl Default for CombatState {
             approach_walk: None,
             waiting_since: None,
             ignored: HashMap::new(),
+            give_up_counts: HashMap::new(),
             ignore_pruned_ms: 0,
             last_attacker: None,
             safe_pos: None,
@@ -265,6 +269,7 @@ impl CombatState {
         self.flee_fails = 0;
         self.loot_target = None;
         self.ignored.clear();
+        self.give_up_counts.clear();
         self.refused_on.clear();
         self.dropped.clear();
         self.never.clear();
@@ -289,15 +294,25 @@ impl CombatState {
             .is_some_and(|entry| entry.reason == IgnoreReason::Unreachable && entry.until > now)
     }
 
-    /// Ignores the monster for the bounded window, with the reason.
+    /// Ignores the monster for the bounded window, with the reason. A second give-up on the
+    /// same monster escalates it to [`IgnoreReason::Unreachable`] (the bot stops re-acquiring
+    /// what it cannot fight and retreats), and a new window never shortens a longer one.
     pub fn ignore(&mut self, obj_id: u32, now: i64, reason: IgnoreReason) {
-        self.ignored.insert(
-            obj_id,
-            Ignored {
-                until: now + IGNORE_MS,
-                reason,
-            },
-        );
+        let count = self.give_up_counts.entry(obj_id).or_insert(0);
+        *count = count.saturating_add(1);
+        let reason = if *count >= 2 {
+            IgnoreReason::Unreachable
+        } else {
+            reason
+        };
+        let until = now + IGNORE_MS;
+        self.ignored
+            .entry(obj_id)
+            .and_modify(|entry| {
+                entry.until = entry.until.max(until);
+                entry.reason = reason;
+            })
+            .or_insert(Ignored { until, reason });
     }
 
     /// Extends an existing ignore entry while the monster keeps attacking (an unreachable
@@ -313,6 +328,11 @@ impl CombatState {
     pub fn prune_ignored(&mut self, now: i64) -> usize {
         let before = self.ignored.len();
         self.ignored.retain(|_, entry| entry.until > now);
+        // The give-up count is only needed while the monster is ignored: drop the ones whose
+        // window ended so a long session does not grow one entry per monster ever given up.
+        let ignored = &self.ignored;
+        self.give_up_counts
+            .retain(|obj_id, _| ignored.contains_key(obj_id));
         before - self.ignored.len()
     }
 
@@ -638,7 +658,7 @@ pub async fn think(bot: &Arc<BotSession>, server: &Arc<GameServer>) -> Duration 
                     .await;
                     Duration::from_millis(300)
                 }
-                CastOutcome::Cooldown => Duration::from_millis(300),
+                CastOutcome::Cooldown { .. } => Duration::from_millis(300),
                 CastOutcome::Refused => Duration::from_millis(900),
             }
         }
@@ -1107,36 +1127,28 @@ async fn heal_if_hurt(
                 .await
             }
         };
-        return heal_attempt_outcome(
-            state,
-            player,
-            id,
-            i64::from(template.cooldown_time.max(0)),
-            now,
-            outcome,
-        );
+        return heal_attempt_outcome(state, player, id, now, outcome);
     }
     None
 }
 
 /// Reads one heal attempt's outcome. The attempt already sent a `CSStartSkill`, so it always
 /// ends the think (no second cast follows it). A server-side cooldown the bot's own state
-/// missed backs that heal off until its real cooldown (the template's) expires, so the next
+/// missed backs that heal off for the remaining time the server's answer reports, so the next
 /// thinks skip the heal and fight instead of re-trying it.
 fn heal_attempt_outcome(
     state: &mut CombatState,
     player: &PlayerRef,
     skill: u32,
-    cooldown_ms: i64,
     now: i64,
     outcome: CastOutcome,
 ) -> Option<CastOutcome> {
-    if outcome == CastOutcome::Cooldown {
-        cast::back_off_until(state, player, skill, player.obj_id, now + cooldown_ms);
+    if let CastOutcome::Cooldown { backoff_ms } = outcome {
+        cast::back_off_until(state, player, skill, player.obj_id, now + backoff_ms);
         tracing::debug!(
             skill,
-            cooldown_ms,
-            "Bots: heal on the server's cooldown, backed off for its cooldown"
+            backoff_ms,
+            "Bots: heal on the server's cooldown, backed off for the real remaining time"
         );
     }
     if outcome == CastOutcome::Started {
@@ -1207,6 +1219,30 @@ mod state_tests {
             "the expired id was dropped"
         );
         assert!(state.ignored.contains_key(&2));
+    }
+
+    #[test]
+    fn a_second_give_up_escalates_and_never_shortens_the_window() {
+        let mut state = CombatState::default();
+        state.ignore(7, 1_000, IgnoreReason::NothingCastable);
+        assert!(
+            !state.is_unreachable(7, 1_000),
+            "the first give-up is not fatal"
+        );
+        let first_until = state.ignored[&7].until;
+        state.ignore(7, 2_000, IgnoreReason::NoSight);
+        assert!(
+            state.is_unreachable(7, 2_000),
+            "the second give-up escalates to unreachable"
+        );
+        assert!(state.ignored[&7].until >= first_until);
+        // A later window is not shortened by a new give-up.
+        state.ignored.get_mut(&7).expect("ignored").until = 999_999;
+        state.ignore(7, 3_000, IgnoreReason::Unreachable);
+        assert_eq!(state.ignored[&7].until, 999_999);
+        // Once the window ends the count is forgotten with it.
+        state.prune_ignored(1_000_000);
+        assert!(!state.give_up_counts.contains_key(&7));
     }
 
     #[test]

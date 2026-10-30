@@ -17,9 +17,9 @@ use crate::nav::movement::{NavFailure, NavOutcome};
 use crate::nav::{PlanCancel, PlanGate, RoadGraphCache};
 use crate::rotation::ClassData;
 
-/// A one-shot hook run between a cast's state read and its dispatch (tests only).
+/// A hook run between a cast's state read and its dispatch, for every cast (tests only).
 #[cfg(test)]
-type BeforeCastHook = Box<dyn FnOnce(&PlayerRef) + Send>;
+type BeforeCastHook = Box<dyn Fn(u32, &PlayerRef) + Send + Sync>;
 
 /// Idle cadence of a bot between thinks (the cadence table / governor comes in P2/P3).
 /// A bot character in the world on a socketless connection.
@@ -53,8 +53,9 @@ pub struct BotSession {
     /// Test hook: parks the next walk step between choosing it and sending it.
     #[cfg(test)]
     step_pause: std::sync::Mutex<Option<Arc<StepPause>>>,
-    /// Test hook: runs once between a cast's state read and its dispatch, to stage a
-    /// server-side answer (a cooldown / refusal) the bot's own snapshot did not see.
+    /// Test hook: runs between a cast's state read and its dispatch, to stage a server-side
+    /// answer (a cooldown / refusal) the bot's own snapshot did not see. It gets the skill id,
+    /// so a test can stage the race for one skill only.
     #[cfg(test)]
     before_cast: std::sync::Mutex<Option<BeforeCastHook>>,
     /// The combat / survival brain (target, rotation, resting, death, counters).
@@ -370,23 +371,19 @@ impl BotSession {
         pause
     }
 
-    /// Test hook: runs `hook` once just before the next cast packet is dispatched (after the
-    /// bot read its own state, before the server handler answers).
+    /// Test hook: runs `hook(skill_id, player)` before every cast packet is dispatched (after
+    /// the bot read its own state, before the server handler answers).
     #[cfg(test)]
-    pub(crate) fn before_next_cast(&self, hook: impl FnOnce(&PlayerRef) + Send + 'static) {
+    pub(crate) fn before_next_cast(&self, hook: impl Fn(u32, &PlayerRef) + Send + Sync + 'static) {
         *self.before_cast.lock().expect("before-cast hook poisoned") = Some(Box::new(hook));
     }
 
     /// Runs the pending [`BotSession::before_next_cast`] hook (a no-op without one).
     #[cfg(test)]
-    pub(crate) fn run_before_cast(&self, player: &PlayerRef) {
-        let hook = self
-            .before_cast
-            .lock()
-            .expect("before-cast hook poisoned")
-            .take();
-        if let Some(hook) = hook {
-            hook(player);
+    pub(crate) fn run_before_cast(&self, skill_id: u32, player: &PlayerRef) {
+        let hook = self.before_cast.lock().expect("before-cast hook poisoned");
+        if let Some(hook) = hook.as_ref() {
+            hook(skill_id, player);
         }
     }
 
