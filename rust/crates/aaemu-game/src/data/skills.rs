@@ -198,6 +198,15 @@ pub const CLIENT_SKILL_SOURCES: &[(&str, &str)] = &[
     ("shipyard_steps", "skill_id"),
 ];
 
+/// Effect classes whose skills the client casts from its own UI even though no source table
+/// names them: the priest's lost-experience prayer (skill 17063 "Offer Prayer",
+/// `recover_exp_effects` 1, and 26611 "Full XP Restoration", effect 5) is a plain
+/// `CSStartSkill` sent by the 1.2 client's priest interaction window
+/// (`scriptsbin/x2ui/messageboximpl/message_box_from_npc_interaction.alb` ->
+/// `X2Priest:RecoverExp`). The C# `CSStartSkillPacket` ran every template skill here, so these
+/// casts worked there; the effect itself still checks the priest distance and the labor cost.
+pub const CLIENT_SKILL_EFFECT_SOURCES: &[&str] = &["RecoverExpEffect"];
+
 impl SkillData {
     /// Whether `id` is named by a client-driven source ([`CLIENT_SKILL_SOURCES`]).
     pub fn is_client_sourced_skill(&self, id: u32) -> bool {
@@ -361,6 +370,28 @@ impl SkillData {
             });
             if let Err(e) = loaded {
                 tracing::warn!("client skill source {table}.{column} not loaded: {e}");
+            }
+        }
+        for actual_type in CLIENT_SKILL_EFFECT_SOURCES {
+            // The effect table is the C# `SkillManager._effects` key: player recovery skills
+            // (the priest's prayer) are reached through the client's own interaction UI.
+            let loaded = conn
+                .prepare(
+                    "SELECT se.skill_id FROM skill_effects se \
+                     JOIN effects e ON e.id = se.effect_id \
+                     WHERE e.actual_type = ?1 AND se.skill_id > 0",
+                )
+                .and_then(|mut stmt| {
+                    let ids = stmt.query_map([actual_type], |r| r.get::<_, i64>(0))?;
+                    for id in ids {
+                        if let Ok(id) = u32::try_from(id?) {
+                            d.client_sourced.insert(id);
+                        }
+                    }
+                    Ok(())
+                });
+            if let Err(e) = loaded {
+                tracing::warn!("client skill effect source {actual_type} not loaded: {e}");
             }
         }
         d.finish();
