@@ -517,6 +517,9 @@ mod tests {
         // 26611 "Full XP Restoration" belongs to the XP Restoration Scrolls only.
         assert!(d.is_client_sourced_skill(26611));
         assert!(d.is_item_only_skill(26611));
+        // The priest prayer (PR #21's effect source) stays a plain cast, never item-only.
+        assert!(d.is_client_sourced_skill(17063));
+        assert!(!d.is_item_only_skill(17063));
         // The Teleport Book's record / rename are SavePortal special-effect casts.
         assert!(d.is_client_sourced_skill(11215));
         assert!(d.is_client_sourced_skill(16841));
