@@ -21,10 +21,16 @@ use crate::nav::movement::NavOutcome;
 const SURFACE: f32 = 100.0;
 
 fn nav_server() -> Arc<aaemu_game::GameServer> {
+    nav_server_at(SURFACE)
+}
+
+/// A flat world at `surface` metres (the test world's sea level is z = 100: a landing there is a
+/// water landing, which the zone's fall check treats differently).
+fn nav_server_at(surface: f32) -> Arc<aaemu_game::GameServer> {
     let server = Arc::new(test_server());
     server.set_self();
-    install_flat_heightmap(&server, SURFACE);
-    install_test_terrain(&server, SURFACE);
+    install_flat_heightmap(&server, surface);
+    install_test_terrain(&server, surface);
     server
 }
 
@@ -241,6 +247,40 @@ async fn a_teleported_bot_stops_its_walk() {
             ))
         ),
         "{outcome:?}"
+    );
+}
+
+/// A bot that stands 9 m above dry ground walks off: the drop is a controlled, safe fall (below
+/// the 20 m/s damage-free fall speed), not a teleport, even though that one step moves the bot
+/// further than the teleport threshold; it arrives and takes no fall damage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_nine_metre_safe_drop_does_not_end_the_walk() {
+    const GROUND: f32 = 120.0;
+    let server = nav_server_at(GROUND);
+    let bot = bot_at(&server, 2, "Walker", 100.0, 100.0).await;
+    let player = bot.player().await.expect("player");
+    aaemu_game::world::WorldObject::from(player.clone())
+        .with_transform(|t| t.set_xyz(100.0, 100.0, GROUND + 9.0));
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(25),
+        bot.goto(&server, Vec3::new(130.0, 100.0, GROUND), 1.0),
+    )
+    .await
+    .expect("the walk finished in time");
+    assert_eq!(outcome, NavOutcome::Arrived);
+    let (x, y, z) = position(&server, 2);
+    assert!(
+        (x - 130.0).abs() <= 1.0 && (y - 100.0).abs() <= 1.0,
+        "{x} {y}"
+    );
+    assert!(
+        (z - GROUND).abs() < 0.5,
+        "the bot stands on the ground: {z}"
+    );
+    assert_eq!(
+        player.data().unit.hp,
+        1000,
+        "a 9 m drop is below the damage-free fall speed"
     );
 }
 

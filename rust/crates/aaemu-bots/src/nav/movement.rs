@@ -52,7 +52,10 @@ const DETOUR_M: f32 = 8.0;
 const MAX_REPLANS: u32 = 3;
 /// Radius of the circles the repath rung routes around.
 const AVOID_RADIUS_M: f32 = 3.0;
-/// A position jump between two ticks larger than this is a server teleport, not movement.
+/// A position change this large that the walker's own packets did not make is a server
+/// teleport, not movement. The walker's packets are excluded by comparing against where the
+/// bot stood right after its last packet: a safe drop (up to `MAX_SAFE_DROP_M`, 9.5 m) moves
+/// the bot further than this in one step.
 const MAX_TELEPORT_STEP_M: f32 = 8.0;
 
 /// Why a walk ended without arriving.
@@ -598,6 +601,7 @@ async fn walk(
                 jump = None;
                 send_stop(bot, server, &player, to, heading(pos, to)).await;
             }
+            last_pos = position(&player);
             continue;
         }
         // The steering probes (capsule sweeps / water) may load collision geometry, so they
@@ -646,6 +650,9 @@ async fn walk(
                     bot, server, &player, pos, step, &mut jump, run_speed, swim_speed,
                 )
                 .await;
+                // Where the bot stands after its own packet is the baseline of the next
+                // tick's teleport check (a drop moves it far; that is not a teleport).
+                last_pos = position(&player);
                 if sent && dist2(position(&player), step.to) > REJECTED_MOVE_M {
                     let actual = position(&player);
                     let now = chrono::Utc::now().timestamp_millis();
