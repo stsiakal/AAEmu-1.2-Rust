@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 use crate::combat::{self, CombatState, Mode};
+use crate::nav::movement::{NavFailure, NavOutcome};
 use crate::nav::{PlanCancel, PlanGate, RoadGraphCache};
 use crate::rotation::ClassData;
 
@@ -53,6 +54,9 @@ pub struct BotSession {
     /// Generation of the navigation task that owns the walk (`0` = none). A walk replaced or
     /// cancelled by a newer generation is not walking any more, even before its task ends.
     walk_generation: Arc<AtomicU64>,
+    /// The outcome of the last walk that ended, with its generation (combat reads it back to
+    /// tell a failed approach from a completed one).
+    last_walk: Mutex<Option<(u64, NavOutcome)>>,
 }
 
 /// What became of one packet of a walk ([`BotSession::dispatch_walk`]).
@@ -101,6 +105,7 @@ impl BotSession {
             step_pause: std::sync::Mutex::new(None),
             brain: Mutex::new(CombatState::default()),
             walk_generation: Arc::new(AtomicU64::new(0)),
+            last_walk: Mutex::new(None),
         }
     }
 
@@ -109,9 +114,16 @@ impl BotSession {
         &self.brain
     }
 
-    /// `/bot fight` / `/bot grind`: switch what the bot hunts and think right away.
+    /// `/bot fight` / `/bot grind`: switch what the bot hunts and think right away. A new
+    /// command drops the old fight (its target, approach walk and refusals).
     pub async fn set_mode(&self, mode: Mode) {
-        self.brain.lock().await.mode = mode;
+        {
+            let mut state = self.brain.lock().await;
+            state.mode = mode;
+            state.disengage();
+            state.loot_target = None;
+            state.ignored.clear();
+        }
         *self.next_think.lock().await = Instant::now();
     }
 
@@ -260,16 +272,42 @@ impl BotSession {
         }
     }
 
-    /// Dispatches one client packet through the real handler on this bot's connection.
+    /// Dispatches one client packet through the real handler on this bot's connection. A bot
+    /// that left the world (removal / logout / a closed connection) sends nothing: the check
+    /// runs under the connection lock a logout holds, like [`BotSession::dispatch_walk`]'s.
     pub async fn dispatch<P: ClientPacket + std::fmt::Debug>(
         &self,
         server: &GameServer,
         packet: P,
     ) -> anyhow::Result<()> {
         let mut conn = self.conn.lock().await;
+        let online = conn
+            .conn
+            .active_char
+            .as_ref()
+            .is_some_and(|player| player.data().is_online);
+        if !online {
+            anyhow::bail!("bot '{}' is not in the world", self.name);
+        }
         self.dispatched.fetch_add(1, Ordering::Relaxed);
         conn.dispatch(server, packet).await?;
         Ok(())
+    }
+
+    /// Records the outcome of the walk of `generation` (the walk task calls it once).
+    pub(crate) async fn record_walk_outcome(&self, generation: u64, outcome: NavOutcome) {
+        *self.last_walk.lock().await = Some((generation, outcome));
+    }
+
+    /// Did the walk of `generation` end failed? A walk replaced or cancelled is not a failure
+    /// (something newer took over), so only unreachable / stuck / timeout count.
+    pub(crate) async fn walk_failed(&self, generation: u64) -> bool {
+        match self.last_walk.lock().await.as_ref() {
+            Some((g, NavOutcome::Failed(failure))) => {
+                *g == generation && !matches!(failure, NavFailure::Interrupted(_))
+            }
+            _ => false,
+        }
     }
 
     /// Dispatches one packet of the walk of `generation`, unless that walk is stale by the time
@@ -379,6 +417,11 @@ impl BotSession {
     /// The normal logout without the client's logout timer: save + remove from the world. The
     /// connection stays alive (in the lobby) until [`BotSession::disconnect`].
     pub async fn logout(&self, server: &GameServer) {
+        // The fight belongs to the session: clear it under the brain lock (the same
+        // brain-then-connection order a think takes) so no think can start another packet
+        // between the clear and the leave.
+        let mut brain = self.brain.lock().await;
+        brain.clear_session();
         let mut conn = self.conn.lock().await;
         session::leave_world_now(server, &mut conn.conn, leave_target::CHARACTER_SELECT).await;
     }
@@ -392,6 +435,7 @@ impl BotSession {
         let Some(server) = server.self_arc() else {
             return;
         };
+        self.brain.lock().await.clear_session();
         let mut conn = self.conn.lock().await;
         aaemu_game::net::listener::on_disconnect(&server, &mut conn.conn).await;
     }

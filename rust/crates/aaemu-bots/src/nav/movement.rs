@@ -164,6 +164,7 @@ impl BotSession {
         tokio::spawn(async move {
             let outcome = walk(&bot, &server, target, radius, generation).await;
             bot.clear_walk_generation(generation);
+            bot.record_walk_outcome(generation, outcome.clone()).await;
             let at = bot.position().await;
             tracing::info!(
                 "Bots: '{}' goto ({:.1}, {:.1}, {:.1}) r={radius:.1}: {:?} at {:?}",
