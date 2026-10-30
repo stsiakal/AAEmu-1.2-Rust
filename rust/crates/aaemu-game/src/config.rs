@@ -210,6 +210,12 @@ pub struct BotsConfig {
     /// Archetype a `/bot add` without a name argument creates (`darkrunner` by default).
     #[serde(rename = "defaultarchetype")]
     pub default_archetype: String,
+    /// Bots started with the server (`Name` or `Name:archetype`, the same text `/bot add` takes).
+    #[serde(rename = "startcharacters")]
+    pub start_characters: Vec<String>,
+    /// When non-zero, a started bot begins grinding around its spawn point with this radius.
+    #[serde(rename = "autogrindradius", deserialize_with = "lenient")]
+    pub auto_grind_radius: f32,
 }
 
 impl Default for BotsConfig {
@@ -224,6 +230,8 @@ impl Default for BotsConfig {
             archetypes_file: String::new(),
             rotation_dir: String::new(),
             default_archetype: "darkrunner".into(),
+            start_characters: Vec::new(),
+            auto_grind_radius: 0.0,
         }
     }
 }
@@ -1425,10 +1433,13 @@ mod tests {
         assert_eq!(cfg.bots.max_target_level_gap, 3);
         assert!(cfg.bots.archetypes_file.is_empty());
         assert_eq!(cfg.bots.default_archetype, "darkrunner");
+        assert!(cfg.bots.start_characters.is_empty());
+        assert_eq!(cfg.bots.auto_grind_radius, 0.0);
         let cfg = AppConfig::from_value(json!({
             "Bots": { "Enabled": "True", "AccountBase": "1000042", "MaxBots": "3", "PlanConcurrency": "2",
                       "BrainTickMs": "500", "MaxTargetLevelGap": "2",
-                      "ArchetypesFile": "a.json", "RotationDir": "r", "DefaultArchetype": "cleric" }
+                      "ArchetypesFile": "a.json", "RotationDir": "r", "DefaultArchetype": "cleric",
+                      "StartCharacters": ["One:cleric", "Two"], "AutoGrindRadius": "80" }
         }))
         .unwrap();
         assert!(cfg.bots.enabled);
@@ -1440,6 +1451,8 @@ mod tests {
         assert_eq!(cfg.bots.archetypes_file, "a.json");
         assert_eq!(cfg.bots.rotation_dir, "r");
         assert_eq!(cfg.bots.default_archetype, "cleric");
+        assert_eq!(cfg.bots.start_characters, vec!["One:cleric", "Two"]);
+        assert_eq!(cfg.bots.auto_grind_radius, 80.0);
     }
 
     #[test]
