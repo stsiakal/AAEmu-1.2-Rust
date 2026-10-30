@@ -31,6 +31,11 @@ use super::types::{KillReason, SkillCastTarget, SkillCaster, SkillObject};
 const PRAYER_SKILL: u32 = 17_063;
 /// `effects.id` of the prayer's `RecoverExpEffect` row.
 const PRAYER_EFFECT: u32 = 18_268;
+/// Skill 26611 "Full XP Restoration" (`recover_exp_effects` 5: no priest, no labor), the item
+/// skill of the XP Restoration Scrolls 33965 / 33966 / 34024-34029 (`items.use_skill_id`).
+const SCROLL_SKILL: u32 = 26_611;
+/// `effects.id` of the scroll's `RecoverExpEffect` row.
+const SCROLL_EFFECT: u32 = 39_213;
 /// `NpcTemplate` id of the Nui temple priest.
 const PRIEST: u32 = 502;
 const PLAYER_OBJ: u32 = 0x100;
@@ -40,13 +45,21 @@ const LEVEL_10_START: i32 = 10_000;
 const LEVEL_10_SPAN: i32 = 1_000;
 
 /// `SkillData` as `compact.sqlite3` shapes it: 17063 is named only by the `effects` table
-/// (`actual_type = 'RecoverExpEffect'`), which is the client-sourced rule under test.
+/// (`actual_type = 'RecoverExpEffect'`, `need_priest = 't'`), while 26611 is named by
+/// `items.use_skill_id`; both are the client-sourced rules under test.
 fn client_source_skills() -> crate::data::SkillData {
+    client_source_skills_with_items(true)
+}
+
+/// `with_items` false removes the scroll from the source set: 26611 must then stay unsourced,
+/// because effect 5 (`need_priest = 'f'`) is not a cast of the client's priest window.
+fn client_source_skills_with_items(with_items: bool) -> crate::data::SkillData {
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(
         "CREATE TABLE skills (id INT, show TEXT, ability_id INT, ability_level INT, \
              level_step INT, skill_points INT, auto_learn TEXT, need_learn TEXT);
          INSERT INTO skills VALUES (17063, 't', 0, 1, 1, 1, 't', 't');
+         INSERT INTO skills VALUES (26611, 't', 0, 1, 1, 1, 't', 't');
          CREATE TABLE default_skills (skill_id INT, slot_index INT, add_to_slot TEXT);
          CREATE TABLE passive_buffs (id INT, ability_id INT, level INT, buff_id INT, \
              req_points INT, active TEXT);
@@ -54,15 +67,25 @@ fn client_source_skills() -> crate::data::SkillData {
              tick REAL, stack_rule_id INT, max_stack INT, init_min_charge INT);
          CREATE TABLE effects (id INT, actual_type TEXT);
          INSERT INTO effects VALUES (18268, 'RecoverExpEffect');
+         INSERT INTO effects VALUES (39213, 'RecoverExpEffect');
          CREATE TABLE skill_effects (skill_id INT, effect_id INT);
-         INSERT INTO skill_effects VALUES (17063, 18268);",
+         INSERT INTO skill_effects VALUES (17063, 18268);
+         INSERT INTO skill_effects VALUES (26611, 39213);
+         CREATE TABLE recover_exp_effects (id INT, need_priest TEXT);
+         INSERT INTO recover_exp_effects VALUES (18268, 't');
+         INSERT INTO recover_exp_effects VALUES (39213, 'f');
+         CREATE TABLE items (id INT, use_skill_id INT);",
     )
     .unwrap();
+    if with_items {
+        conn.execute("INSERT INTO items VALUES (33965, 26611)", [])
+            .unwrap();
+    }
     crate::data::SkillData::load(&conn).unwrap()
 }
 
-/// NPC data + the experience table + the prayer skill and its `RecoverExpEffect`, and the Nui
-/// priest template.
+/// NPC data + the experience table + the prayer and scroll skills with their `RecoverExpEffect`
+/// rows, and the Nui priest template.
 fn game_data() -> GameData {
     use crate::systems::skills::tests::{skill_effect, skill_template};
 
@@ -92,6 +115,28 @@ fn game_data() -> GameData {
     effect.non_friendly = true;
     prayer.effects.push(effect);
     s.add_skill(prayer);
+    s.add_effect(
+        EffectKind::RecoverExpEffect,
+        EffectTemplate::RecoverExp(RecoverExpEffect {
+            id: 5,
+            need_money: false,
+            need_labor_power: false,
+            need_priest: false,
+        }),
+        SCROLL_EFFECT,
+    );
+    let mut scroll = skill_template(SCROLL_SKILL);
+    scroll.target_type = 0;
+    scroll.damage_type_id = 0;
+    scroll.max_range = 4;
+    scroll.default_gcd = false;
+    scroll.casting_time = 0;
+    scroll.level_rule_no_consideration = true;
+    let mut effect = skill_effect(SCROLL_EFFECT, EffectKind::RecoverExpEffect, 5);
+    effect.friendly = true;
+    effect.non_friendly = true;
+    scroll.effects.push(effect);
+    s.add_skill(scroll);
     gd.systems.npcs.npc.templates.insert(
         PRIEST,
         NpcTemplate {
@@ -195,16 +240,20 @@ impl Fx {
         self.client.drain();
     }
 
-    fn pray(&mut self) {
+    fn cast(&mut self, skill_id: u32) {
         self.player.data().unit.skill_last_used_ms = 0;
         let packet = CSStartSkillPacket {
-            skill_id: PRAYER_SKILL,
+            skill_id,
             caster: SkillCaster::Unit(self.player.obj_id),
             target: SkillCastTarget::Unit(self.player.obj_id),
             flag: 0,
             skill_object: SkillObject::None,
         };
         start_skill(&self.server, &mut self.client.conn, packet);
+    }
+
+    fn pray(&mut self) {
+        self.cast(PRAYER_SKILL);
     }
 }
 
@@ -226,6 +275,23 @@ fn recover_exp_skills_are_client_sourced_from_the_effect_table() {
     assert!(
         !data.is_client_sourced_skill(PRAYER_SKILL + 1),
         "an unrelated skill must stay unsourced"
+    );
+}
+
+#[test]
+fn scroll_skill_is_sourced_by_items_not_by_the_priest_window() {
+    let data = client_source_skills();
+    assert!(data.is_client_sourced_skill(PRAYER_SKILL));
+    assert!(
+        data.is_client_sourced_skill(SCROLL_SKILL),
+        "the scrolls name 26611 through items.use_skill_id"
+    );
+
+    let without_items = client_source_skills_with_items(false);
+    assert!(without_items.is_client_sourced_skill(PRAYER_SKILL));
+    assert!(
+        !without_items.is_client_sourced_skill(SCROLL_SKILL),
+        "effect 5 has need_priest = 'f': the priest window does not cast it"
     );
 }
 
@@ -264,6 +330,50 @@ async fn prayer_at_a_priest_restores_the_lost_experience() {
         }),
         "the client cast must not be refused: {frames:x?}"
     );
+    let labor_amount = frames
+        .iter()
+        .find(|(op, _)| *op == sc::SCCharacterLaborPowerChangedPacket)
+        .map(|(_, body)| i32::from_le_bytes(body[0..4].try_into().unwrap()));
+    assert_eq!(
+        labor_amount,
+        Some(-10),
+        "the prayer spends exactly the level-10 labor"
+    );
+}
+
+#[tokio::test]
+async fn scroll_restores_the_lost_experience_without_spending_labor() {
+    let mut fx = fixture(2.0);
+    fx.player.data().labor_power = 0;
+    fx.die();
+    let (experience, recoverable) = {
+        let c = fx.player.data();
+        (c.experience, c.recoverable_exp)
+    };
+    assert!(recoverable > 0);
+    fx.client.drain();
+
+    fx.cast(SCROLL_SKILL);
+    let c = fx.player.data();
+    assert_eq!(
+        c.experience,
+        experience + recoverable,
+        "the scroll must restore the recoverable experience"
+    );
+    assert_eq!(c.recoverable_exp, 0);
+    assert_eq!(
+        c.labor_power, 0,
+        "a labor-free effect must not subtract the level cost (or wrap labor below 0)"
+    );
+    let frames = fx.client.drain();
+    assert!(
+        !frames
+            .iter()
+            .any(|(op, _)| *op == sc::SCCharacterLaborPowerChangedPacket),
+        "no labor change for a labor-free effect: {frames:x?}"
+    );
+    let ops: Vec<u16> = frames.iter().map(|(op, _)| *op).collect();
+    assert!(ops.contains(&sc::SCRecoverableExpPacket), "{ops:x?}");
 }
 
 #[tokio::test]

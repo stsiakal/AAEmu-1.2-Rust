@@ -2958,16 +2958,22 @@ two bots before the fix (a foreign `Mount` caster, an NPC-only skill and a far d
 
 The player report "lost XP not given back at Nuia" was the skill-cast hardening above refusing the
 priest's prayer: the client shows "You don't have permission." (`NO_PERM`, 0x2D). The 1.2 client
-casts skill 17063 "Offer Prayer" (`recover_exp_effects` 1: labor plus a priest within 10 m) and
-26611 "Full XP Restoration" (effect 5) as a plain `CSStartSkill` from its own interaction window
+casts skill 17063 "Offer Prayer" (`recover_exp_effects` 1: labor plus a priest within 10 m) as a
+plain `CSStartSkill` from its own interaction window
 (`scriptsbin/x2ui/messageboximpl/message_box_from_npc_interaction.alb` -> `X2Priest:RecoverExp`);
-neither skill appears in any `CLIENT_SKILL_SOURCES` table, and `skill_req_skills` is a peace-zone
-restriction list, not a grant. The C# `CSStartSkillPacket` cast every template skill in its
-fallback branch, so the prayer worked there. `SkillData` now also marks every skill whose
-`skill_effects` row points at an `effects.actual_type = 'RecoverExpEffect'` row
-(`CLIENT_SKILL_EFFECT_SOURCES`): data-driven, not an id allowlist, and the effect's own
-`need_priest` / `need_labor_power` checks are unchanged. `recoverable_exp` was already saved and
-loaded (`db_character.rs`), so it survives a relog; a second death overwrites it exactly as
+it appears in no `CLIENT_SKILL_SOURCES` table, and `skill_req_skills` is a peace-zone restriction
+list, not a grant. 26611 "Full XP Restoration" is a different skill: `recover_exp_effects` 5 has no
+priest and no labor (300 s cooldown), and it is the skill of the XP Restoration Scrolls (items
+33965 / 33966 / 34024-34029, `items.use_skill_id`), already client-sourced through `items`; the
+priest window never casts it. The C# `CSStartSkillPacket` cast every template skill in its fallback
+branch, so the prayer worked there. `SkillData` now also marks the skills whose `skill_effects` row
+points at an `effects.actual_type = 'RecoverExpEffect'` row with
+`recover_exp_effects.need_priest = 't'` (`CLIENT_SKILL_EFFECT_SOURCES`): data-driven, not an id
+allowlist, so it adds only 17063 and item skills stay item-driven, and the effect's own
+`need_priest` / `need_labor_power` checks are unchanged. Labor is now spent only when
+`need_labor_power` is set, and saturating at 0: the scroll used to subtract the level-based amount
+anyway and could wrap labor negative. `recoverable_exp` was already saved and loaded
+(`db_character.rs`), so it survives a relog; a second death overwrites it exactly as
 `CharacterCombat.DoDie` does (`RecoverableExp = round(LastExpLoss * 0.8)`).
 
 ## Ship repair timer and destroyed-vehicle HP (2026-10-20)

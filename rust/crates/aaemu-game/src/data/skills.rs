@@ -200,12 +200,20 @@ pub const CLIENT_SKILL_SOURCES: &[(&str, &str)] = &[
 
 /// Effect classes whose skills the client casts from its own UI even though no source table
 /// names them: the priest's lost-experience prayer (skill 17063 "Offer Prayer",
-/// `recover_exp_effects` 1, and 26611 "Full XP Restoration", effect 5) is a plain
-/// `CSStartSkill` sent by the 1.2 client's priest interaction window
-/// (`scriptsbin/x2ui/messageboximpl/message_box_from_npc_interaction.alb` ->
-/// `X2Priest:RecoverExp`). The C# `CSStartSkillPacket` ran every template skill here, so these
-/// casts worked there; the effect itself still checks the priest distance and the labor cost.
-pub const CLIENT_SKILL_EFFECT_SOURCES: &[&str] = &["RecoverExpEffect"];
+/// `recover_exp_effects` 1, `need_priest`) is a plain `CSStartSkill` sent by the 1.2 client's
+/// priest interaction window (`scriptsbin/x2ui/messageboximpl/message_box_from_npc_interaction.alb`
+/// -> `X2Priest:RecoverExp`). 26611 "Full XP Restoration" (`recover_exp_effects` 5) is not cast
+/// there: it is the skill of the XP Restoration Scrolls (items 33965 / 33966 / 34024-34029,
+/// `items.use_skill_id`), effect 5 has no priest and no labor and a 300 s cooldown, and it was
+/// already client-sourced through `items`. The C# `CSStartSkillPacket` ran every template skill
+/// here, so the prayer worked there; the effect itself still checks the priest distance and the
+/// labor cost.
+///
+/// `(actual_type, table, column)` selects only the effect rows the client's own UI names: only
+/// `recover_exp_effects.need_priest` rows are priest-window casts, while the other rows are item
+/// skills already named by `items.use_skill_id`.
+pub const CLIENT_SKILL_EFFECT_SOURCES: &[(&str, &str, &str)] =
+    &[("RecoverExpEffect", "recover_exp_effects", "need_priest")];
 
 impl SkillData {
     /// Whether `id` is named by a client-driven source ([`CLIENT_SKILL_SOURCES`]).
@@ -372,15 +380,16 @@ impl SkillData {
                 tracing::warn!("client skill source {table}.{column} not loaded: {e}");
             }
         }
-        for actual_type in CLIENT_SKILL_EFFECT_SOURCES {
+        for &(actual_type, table, column) in CLIENT_SKILL_EFFECT_SOURCES {
             // The effect table is the C# `SkillManager._effects` key: player recovery skills
             // (the priest's prayer) are reached through the client's own interaction UI.
             let loaded = conn
-                .prepare(
+                .prepare(&format!(
                     "SELECT se.skill_id FROM skill_effects se \
                      JOIN effects e ON e.id = se.effect_id \
-                     WHERE e.actual_type = ?1 AND se.skill_id > 0",
-                )
+                     JOIN {table} ef ON ef.id = e.id \
+                     WHERE e.actual_type = ?1 AND ef.{column} = 't' AND se.skill_id > 0"
+                ))
                 .and_then(|mut stmt| {
                     let ids = stmt.query_map([actual_type], |r| r.get::<_, i64>(0))?;
                     for id in ids {
