@@ -224,9 +224,6 @@ impl<'a> RouteWalker<'a> {
         if self.tracker.observe((pos.x, pos.y), now_ms) {
             return self.deliver_rung(pos, now_ms);
         }
-        if let Some(action) = self.rejected_step(pos, now_ms) {
-            return action;
-        }
         loop {
             if self.index >= self.plan.len() {
                 self.retrace = false;
@@ -285,14 +282,6 @@ impl<'a> RouteWalker<'a> {
         dist2(pos, self.final_target) <= close
             || (self.index >= self.plan.len()
                 && dist2(pos, self.final_target) <= GOAL_TOLERANCE_M + close)
-    }
-
-    /// Applies a refused step that the caller reported before calling [`Self::next`] again.
-    fn rejected_step(&mut self, pos: Vec3, now_ms: i64) -> Option<WalkAction> {
-        if self.tracker.blocked((pos.x, pos.y), now_ms) {
-            return Some(self.deliver_rung(pos, now_ms));
-        }
-        None
     }
 
     fn deliver_rung(&mut self, pos: Vec3, now_ms: i64) -> WalkAction {
@@ -577,8 +566,8 @@ async fn replan(
     }
 }
 
-/// Sends the packet of one [`MoveStep`]; `true` when a movement packet was sent (a jump
-/// starts its own tick loop), `false` when a refusal should be checked by the caller.
+/// Sends the packet of one [`MoveStep`]; `true` when a movement packet was sent (a jump starts
+/// its own tick loop instead and returns `false`).
 async fn send_step(
     bot: &Arc<BotSession>,
     server: &Arc<GameServer>,
