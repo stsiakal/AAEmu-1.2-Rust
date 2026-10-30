@@ -190,6 +190,9 @@ pub struct BotsConfig {
     /// Number of bot accounts (and the upper bound for `/bot add`).
     #[serde(rename = "maxbots", deserialize_with = "lenient")]
     pub max_bots: usize,
+    /// Concurrent route plans (blocking workers doing terrain / collision queries).
+    #[serde(rename = "planconcurrency", deserialize_with = "lenient")]
+    pub plan_concurrency: usize,
 }
 
 impl Default for BotsConfig {
@@ -198,6 +201,7 @@ impl Default for BotsConfig {
             enabled: false,
             account_base: 1_000_000,
             max_bots: 10,
+            plan_concurrency: 4,
         }
     }
 }
@@ -1394,13 +1398,15 @@ mod tests {
         assert!(!cfg.bots.enabled);
         assert_eq!(cfg.bots.account_base, 1_000_000);
         assert_eq!(cfg.bots.max_bots, 10);
+        assert_eq!(cfg.bots.plan_concurrency, 4);
         let cfg = AppConfig::from_value(json!({
-            "Bots": { "Enabled": "True", "AccountBase": "1000042", "MaxBots": "3" }
+            "Bots": { "Enabled": "True", "AccountBase": "1000042", "MaxBots": "3", "PlanConcurrency": "2" }
         }))
         .unwrap();
         assert!(cfg.bots.enabled);
         assert_eq!(cfg.bots.account_base, 1_000_042);
         assert_eq!(cfg.bots.max_bots, 3);
+        assert_eq!(cfg.bots.plan_concurrency, 2);
     }
 
     #[test]

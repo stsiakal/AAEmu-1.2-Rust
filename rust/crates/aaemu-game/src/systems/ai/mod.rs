@@ -26,6 +26,7 @@
 //! | [`hooks`] | the AI entry points for npcs / skills |
 //! | [`physics`] | `Physics/**`, `PhysicsManager`, `WaterBodies` (ship physics, water) |
 //! | [`collision`] | the zone's collision world on the CryPhysics port + the query service (Rust only) |
+//! | [`nav`] | the nav facade for non-NPC movers (`.bai` routes, heightmap, collision queries) |
 
 pub mod behaviors;
 pub mod collision;
@@ -37,6 +38,7 @@ pub mod gimmick;
 pub mod hooks;
 pub mod lua;
 pub mod manager;
+pub mod nav;
 pub mod npc;
 pub mod npc_events;
 pub mod numerics;
