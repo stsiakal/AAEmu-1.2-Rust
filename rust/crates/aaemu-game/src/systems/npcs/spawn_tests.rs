@@ -2888,19 +2888,37 @@ async fn real_data_main_world_spawn_files() {
     let c = m.counts();
     println!("counts (npc clones, event, doodad, transfer, gimmick, slave) = {c:?}");
 
-    // Independent re-count of the raw JSON (straightforward quadratic filters on a grid).
-    let raw = |name: &str| -> Vec<serde_json::Value> {
-        let text = std::fs::read_to_string(world_path.join(name)).unwrap();
-        crate::systems::npcs::json::parse(&text)
+    // Independent re-count of the raw JSON (straightforward quadratic filters on a grid). The
+    // loader reads every `<prefix>*.json` in reverse file-name order (`spawn_files`), so the
+    // re-count concatenates them the same way.
+    let raw = |prefix: &str| -> Vec<serde_json::Value> {
+        let mut files: Vec<(String, std::path::PathBuf)> = std::fs::read_dir(&world_path)
             .unwrap()
-            .as_array()
-            .unwrap()
-            .clone()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().to_ascii_lowercase();
+                (name.starts_with(prefix) && name.ends_with(".json")).then(|| (name, e.path()))
+            })
+            .collect();
+        files.sort();
+        files.reverse();
+        files
+            .into_iter()
+            .flat_map(|(_, path)| {
+                let text = std::fs::read_to_string(path).unwrap();
+                crate::systems::npcs::json::parse(&text)
+                    .unwrap()
+                    .as_array()
+                    .unwrap()
+                    .clone()
+            })
+            .collect()
     };
     let num = |v: &serde_json::Value, k: &str| {
         v.get(k).and_then(serde_json::Value::as_f64).unwrap_or(0.0)
     };
-    let npc_raw = raw("npc_spawns.json");
+    let npc_raw = raw("npc_spawns");
     type NpcGrid = std::collections::HashMap<(u32, i64, i64, i64), Vec<(f32, f32, f32)>>;
     let mut kept: NpcGrid = std::collections::HashMap::new();
     let mut fake_seen: HashSet<u32> = HashSet::new();
@@ -2980,7 +2998,7 @@ async fn real_data_main_world_spawn_files() {
     assert_eq!(stats.npc_spawners, clones);
     assert_eq!(c[0], clones);
 
-    let doodad_raw = raw("doodad_spawns.json");
+    let doodad_raw = raw("doodad_spawns");
     type Grid = std::collections::HashMap<(u32, i64, i64), Vec<(f32, f32, f32)>>;
     let mut grid = Grid::new();
     let (mut ddup, mut dmissing, mut dkept) = (0, 0, 0);
@@ -3024,9 +3042,9 @@ async fn real_data_main_world_spawn_files() {
     assert_eq!(stats.doodad_spawners, dkept);
     assert_eq!(c[2], dkept);
 
-    assert_eq!(stats.gimmick_entries, raw("gimmick_spawns.json").len());
-    assert_eq!(stats.transfer_entries, raw("transfer_spawns.json").len());
-    assert_eq!(stats.slave_entries, raw("slave_spawns.json").len());
+    assert_eq!(stats.gimmick_entries, raw("gimmick_spawns").len());
+    assert_eq!(stats.transfer_entries, raw("transfer_spawns").len());
+    assert_eq!(stats.slave_entries, raw("slave_spawns").len());
     assert!(stats.npc_spawners > 10_000);
     assert!(stats.doodad_spawners > 10_000);
     assert!(stats.gimmick_spawners > 0 && stats.transfer_spawners > 0 && stats.slave_spawners > 0);
