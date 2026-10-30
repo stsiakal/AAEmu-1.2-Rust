@@ -1162,6 +1162,36 @@ fn ucc_item_state(w: &World, id: u64) -> (Vec<u8>, u64, u64, bool) {
     (body(&item), item.ucc_id, item.owner_id, item.dirty)
 }
 
+/// [`ucc_item_state`] without `dirty`: a cancelled cast that debited a partial stack marks it
+/// dirty while restoring its count, which is not a data change.
+fn ucc_item_values(w: &World, id: u64) -> (Vec<u8>, u64, u64) {
+    let (body, ucc, owner, _) = ucc_item_state(w, id);
+    (body, ucc, owner)
+}
+
+/// The `SCItemTaskSuccessPacket` bodies a cast sent, in order.
+fn item_task_bodies(packets: &[(u16, Vec<u8>)]) -> Vec<Vec<u8>> {
+    packets
+        .iter()
+        .filter(|(op, _)| *op == sc::SCItemTaskSuccessPacket)
+        .map(|(_, body)| body.clone())
+        .collect()
+}
+
+/// The take/refund pair of a cancelled partial debit of one unit: count -1 then +1.
+fn partial_debit_refund_tasks(item: &crate::models::item::Item) -> Vec<Vec<u8>> {
+    vec![
+        tasks(
+            task_type::SKILL_REAGENTS,
+            vec![ItemTask::count_update(item, -1)],
+        ),
+        tasks(
+            task_type::SKILL_REAGENTS,
+            vec![ItemTask::count_update(item, 1)],
+        ),
+    ]
+}
+
 /// Exercise the real effect dispatch followed by skill-owned source consumption, rather
 /// than directly calling an effect and simulating its debit in the test.
 fn cast_ucc(
@@ -1376,8 +1406,9 @@ async fn ucc_foreign_source_target_or_resolved_player_cancels_without_debit() {
                 .get_item_by_id_mut(target_id)
                 .unwrap()
                 .set_ucc(0x1234);
-            let source_before = ucc_item_state(&w, source_id);
-            let target_before = ucc_item_state(&w, target_id);
+            let source_before = ucc_item_values(&w, source_id);
+            let target_before = ucc_item_values(&w, target_id);
+            let source_item = w.server.items.item_by_id(source_id).expect("source");
             let resolved_player = if matches!(case, "foreign_player" | "both_foreign") {
                 &w.pb
             } else {
@@ -1394,9 +1425,17 @@ async fn ucc_foreign_source_target_or_resolved_player_cancels_without_debit() {
                 resolved_player,
             );
             assert!(skill.cancelled(), "{case}, cleanup={cleanup}");
-            assert_eq!(ucc_item_state(&w, source_id), source_before, "{case}");
-            assert_eq!(ucc_item_state(&w, target_id), target_before, "{case}");
-            assert!(w.a.drain().is_empty(), "{case}");
+            assert_eq!(ucc_item_values(&w, source_id), source_before, "{case}");
+            assert_eq!(ucc_item_values(&w, target_id), target_before, "{case}");
+            // Only a source in the caster's own bag is debited and refunded; a foreign source
+            // is refused before the debit.
+            let own_source = !matches!(case, "foreign_source" | "both_foreign");
+            let expected = if own_source {
+                partial_debit_refund_tasks(&source_item)
+            } else {
+                Vec::new()
+            };
+            assert_eq!(item_task_bodies(&w.a.drain()), expected, "{case}");
             assert!(w.b.drain().is_empty(), "{case}");
         }
     }
@@ -1434,8 +1473,9 @@ async fn ucc_invalid_source_count_template_or_same_item_cancels_without_mutation
                 }
                 bag.get_item_by_id_mut(target_id).unwrap().set_ucc(0x1234);
             }
-            let source_before = ucc_item_state(&w, source_id);
-            let target_before = ucc_item_state(&w, target_id);
+            let source_before = ucc_item_values(&w, source_id);
+            let target_before = ucc_item_values(&w, target_id);
+            let source_item = w.server.items.item_by_id(source_id).expect("source");
             let skill = cast_ucc(
                 &w,
                 cleanup,
@@ -1455,9 +1495,15 @@ async fn ucc_invalid_source_count_template_or_same_item_cancels_without_mutation
                 &w.pa,
             );
             assert!(skill.cancelled(), "{case}, cleanup={cleanup}");
-            assert_eq!(ucc_item_state(&w, source_id), source_before, "{case}");
-            assert_eq!(ucc_item_state(&w, target_id), target_before, "{case}");
-            assert!(w.a.drain().is_empty(), "{case}");
+            assert_eq!(ucc_item_values(&w, source_id), source_before, "{case}");
+            assert_eq!(ucc_item_values(&w, target_id), target_before, "{case}");
+            // Only `same_item` takes a valid partial debit before the effect refuses it.
+            let expected = if case == "same_item" {
+                partial_debit_refund_tasks(&source_item)
+            } else {
+                Vec::new()
+            };
+            assert_eq!(item_task_bodies(&w.a.drain()), expected, "{case}");
             assert!(w.b.drain().is_empty(), "{case}");
         }
     }
@@ -2470,4 +2516,58 @@ async fn fishing_loot_from_a_position_target_gives_the_sea_pack_item() {
     let mut rng = crate::systems::economy::loot::SharedRandom;
     fishing_loot(&w.server, &w.pa, &target, [0; 4], &mut rng);
     assert!(bag_count(&w, STACK) >= 1, "no fish was given");
+}
+
+#[tokio::test]
+async fn full_refund_on_a_full_bag_keeps_the_item_loose_and_notifies_the_client() {
+    use crate::systems::skills::ext::{ItemSkillHooks, TakenCastItem};
+
+    let mut w = world();
+    let bag = Inv::of(&w.pa).bag();
+    let size = bag.lock().unwrap().container_size();
+    for slot in 0..size {
+        give(&w, &w.pa, slot_type::INVENTORY, ARMOR, 1, slot);
+    }
+    assert_eq!(bag.lock().unwrap().free_slot_count(), 0, "bag is full");
+
+    let mut item = w
+        .server
+        .items
+        .create(
+            STACK,
+            1,
+            0,
+            1,
+            &w.server.game_data.items,
+            &w.server.ids.item,
+            0,
+        )
+        .expect("debited item");
+    let id = item.id;
+    item.owner_id = u64::from(w.pa.character_id);
+    item.slot = 0;
+    item.slot_type = slot_type::INVENTORY;
+    let taken = TakenCastItem {
+        item: item.clone(),
+        container: bag.clone(),
+        slot: 0,
+        amount: 1,
+        removed: true,
+    };
+
+    w.a.drain();
+    super::bridges::EconomyForSkills.refund_cast_source_item(&w.server, taken);
+    let loose = w.server.items.item_by_id(id).expect("loose refund");
+    assert!(loose.dirty, "the loose refund must be saved");
+    let bodies: Vec<Vec<u8>> =
+        w.a.drain()
+            .into_iter()
+            .filter(|(op, _)| *op == sc::SCItemTaskSuccessPacket)
+            .map(|(_, body)| body)
+            .collect();
+    assert_eq!(
+        bodies,
+        vec![tasks(task_type::SKILL_REAGENTS, vec![ItemTask::add(&item)])],
+        "the client is told about the restored item even when the bag is full"
+    );
 }

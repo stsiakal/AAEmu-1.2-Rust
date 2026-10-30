@@ -45,6 +45,43 @@ fn lock(c: &ContainerRef) -> std::sync::MutexGuard<'_, ItemContainer> {
     c.lock().expect("container poisoned")
 }
 
+/// Puts a taken/refunded item back into `container`, preferring `preferred_slot` only while it
+/// is free; a full container keeps the item tracked as loose and still tells the client.
+fn put_restored_item(
+    server: &GameServer,
+    txn: &mut ItemTxn<'_>,
+    container: &ContainerRef,
+    preferred_slot: i32,
+    mut item: Item,
+    owner: u32,
+) {
+    item.dirty = true;
+    let mut guard = lock(container);
+    let slot = guard.get_unused_slot(preferred_slot);
+    if slot < 0 {
+        drop(guard);
+        tracing::error!(
+            item_id = item.id,
+            template_id = item.template_id,
+            "cast source could not be placed back into its container"
+        );
+        server.items.add_loose(item.clone());
+        txn.env
+            .fx
+            .tasks(owner, task_type::SKILL_REAGENTS, vec![ItemTask::add(&item)]);
+        return;
+    }
+    item.slot = slot;
+    item.slot_type = guard.slot_type;
+    guard.items.insert(0, item.clone());
+    guard.update_free_slot_count();
+    guard.notify_enter(&item, &mut txn.env.fx);
+    drop(guard);
+    txn.env
+        .fx
+        .tasks(owner, task_type::SKILL_REAGENTS, vec![ItemTask::add(&item)]);
+}
+
 fn task_packet(action: u8, tasks: Vec<ItemTask>) -> SCItemTaskSuccessPacket {
     SCItemTaskSuccessPacket {
         action,
@@ -999,7 +1036,7 @@ impl ItemSkillHooks for EconomyForSkills {
     ) -> Option<Result<TakenCastItem, ()>> {
         let amount = amount.max(0);
         let inv = Inv::of(player);
-        let txn = ItemTxn::begin(server);
+        let mut txn = ItemTxn::begin(server);
         // Only the caster's bag or equipment may hold the cast item: a trade, mail, auction,
         // bank or coffer copy is not a usable cast source.
         for st in [slot_type::INVENTORY, slot_type::EQUIPMENT] {
@@ -1030,96 +1067,146 @@ impl ItemSkillHooks for EconomyForSkills {
             if !txn.env.rules.can_destroy(&item) {
                 return Some(Err(()));
             }
-            let Some(removed) = guard.remove_item(item_id) else {
-                return Some(Err(()));
+            if amount >= item.count {
+                // Full consume: the item leaves its container now, so the client removal comes
+                // before any product can take the freed slot.
+                let Some(removed) = guard.remove_item(item_id) else {
+                    return Some(Err(()));
+                };
+                let slot = removed.slot;
+                guard.notify_leave(&removed, removed.slot as u8, &mut txn.env.fx);
+                txn.env.fx.tasks(
+                    player.character_id,
+                    task_type::SKILL_REAGENTS,
+                    vec![ItemTask::remove_slot(&removed)],
+                );
+                drop(guard);
+                return Some(Ok(TakenCastItem {
+                    item: removed,
+                    container,
+                    slot,
+                    amount,
+                    removed: true,
+                }));
+            }
+            // Partial consume: debit in place, keeping the stack in its slot so a product or
+            // loot drop can never be placed into the same slot.
+            let after = {
+                let Some(live) = guard.get_item_by_id_mut(item_id) else {
+                    return Some(Err(()));
+                };
+                live.count -= amount;
+                live.dirty = true;
+                live.clone()
             };
-            let slot = removed.slot;
+            guard.update_free_slot_count();
+            txn.env.fx.tasks(
+                player.character_id,
+                task_type::SKILL_REAGENTS,
+                vec![ItemTask::count_update(&after, -amount)],
+            );
             drop(guard);
             return Some(Ok(TakenCastItem {
-                item: removed,
+                item,
                 container,
-                slot,
+                slot: after.slot,
                 amount,
-                removed: true,
+                removed: false,
             }));
         }
         Some(Err(()))
     }
 
     fn commit_cast_source_item(&self, server: &GameServer, taken: TakenCastItem) {
-        if !taken.removed {
+        if taken.amount == 0 {
             return;
         }
         let owner = taken.item.owner_id as u32;
         let mut txn = ItemTxn::begin(server);
-        if taken.amount >= taken.item.count {
-            txn.env.fx.tasks(
-                owner,
-                task_type::SKILL_REAGENTS,
-                vec![ItemTask::remove_slot(&taken.item)],
-            );
-            txn.env.fx.push(ItemFx::Consumed {
-                owner,
-                template_id: taken.item.template_id,
-                count: taken.item.count,
-            });
+        // A partial debit drops the same count; the client already got its count update.
+        txn.env.fx.push(ItemFx::Consumed {
+            owner,
+            template_id: taken.item.template_id,
+            count: taken.amount,
+        });
+        if taken.removed {
+            // The client already got the removal at take time.
             txn.env.fx.push(ItemFx::ReleaseId(taken.item.id));
-            return;
         }
-        // A partial debit keeps the stack (same id, grade, flags and details); put the
-        // unconsumed units back before the operation ends.
-        let container = taken.container.clone();
-        let mut rest = taken.item.clone();
-        rest.count -= taken.amount;
-        rest.dirty = true;
-        let mut guard = lock(&container);
-        let slot = guard.get_unused_slot(taken.slot);
-        if slot < 0 {
-            drop(guard);
-            tracing::error!(
-                item_id = rest.id,
-                "cast source remainder could not be placed back into its container"
-            );
-            server.items.add_loose(rest);
-            return;
-        }
-        rest.slot = slot;
-        rest.slot_type = guard.slot_type;
-        guard.items.insert(0, rest.clone());
-        guard.update_free_slot_count();
-        drop(guard);
-        let tasks = if rest.slot == taken.slot {
-            vec![ItemTask::count_update(&rest, -taken.amount)]
-        } else {
-            vec![ItemTask::remove_slot(&taken.item), ItemTask::add(&rest)]
-        };
-        txn.env.fx.tasks(owner, task_type::SKILL_REAGENTS, tasks);
     }
 
     fn refund_cast_source_item(&self, server: &GameServer, taken: TakenCastItem) {
-        if !taken.removed {
+        if taken.amount == 0 {
             return;
         }
-        // Serialise with every other item operation, even though the refund itself sends no
-        // packets (the client never saw the failed cast touch the item).
-        let _txn = ItemTxn::begin(server);
+        let owner = taken.item.owner_id as u32;
+        let mut txn = ItemTxn::begin(server);
+        if !taken.removed {
+            // Partial debit: put the units back into the same stack (same id and slot).
+            let container = taken.container.clone();
+            let mut guard = lock(&container);
+            let max_count = server
+                .game_data
+                .items
+                .template(taken.item.template_id)
+                .map_or(0, |t| t.max_count);
+            if let Some(live) = guard
+                .get_item_by_id_mut(taken.item.id)
+                .filter(|live| max_count <= 0 || live.count + taken.amount <= max_count)
+            {
+                live.count += taken.amount;
+                live.dirty = true;
+                let after = live.clone();
+                drop(guard);
+                txn.env.fx.tasks(
+                    owner,
+                    task_type::SKILL_REAGENTS,
+                    vec![ItemTask::count_update(&after, taken.amount)],
+                );
+                return;
+            }
+            drop(guard);
+            // The kept remainder moved or was consumed while the effects ran: return the
+            // debited units as a fresh stack with the snapshot's template and properties.
+            let Some(mut restored) = server.items.create(
+                taken.item.template_id,
+                taken.amount,
+                taken.item.grade,
+                taken.item.world_id,
+                &server.game_data.items,
+                &server.ids.item,
+                chrono::Utc::now().timestamp(),
+            ) else {
+                tracing::error!(
+                    item_id = taken.item.id,
+                    template_id = taken.item.template_id,
+                    "cancelled cast could not recreate its debited source units"
+                );
+                return;
+            };
+            restored.flags = taken.item.flags;
+            restored.ucc_id = taken.item.ucc_id;
+            restored.details = taken.item.details.clone();
+            restored.lifespan_mins = taken.item.lifespan_mins;
+            restored.made_unit_id = taken.item.made_unit_id;
+            restored.create_time = taken.item.create_time;
+            restored.unsecure_time = taken.item.unsecure_time;
+            restored.unpack_time = taken.item.unpack_time;
+            restored.charge_start_time = taken.item.charge_start_time;
+            restored.bind_on_unpack = taken.item.bind_on_unpack;
+            restored.expiration_time = taken.item.expiration_time;
+            restored.expiration_online_minutes_left = taken.item.expiration_online_minutes_left;
+            restored.charge_count = taken.item.charge_count;
+            restored.owner_id = taken.item.owner_id;
+            restored.dirty = true;
+            put_restored_item(server, &mut txn, &container, taken.slot, restored, owner);
+            return;
+        }
+        // Full consume: restore the whole item to its slot if it is still free.
         let container = taken.container.clone();
         let mut item = taken.item;
-        let mut guard = lock(&container);
-        let slot = guard.get_unused_slot(item.slot);
-        if slot < 0 {
-            drop(guard);
-            tracing::error!(
-                item_id = item.id,
-                "cancelled cast could not restore its source item to the bag"
-            );
-            server.items.add_loose(item);
-            return;
-        }
-        item.slot = slot;
-        item.slot_type = guard.slot_type;
-        guard.items.insert(0, item);
-        guard.update_free_slot_count();
+        item.dirty = true;
+        put_restored_item(server, &mut txn, &container, taken.slot, item, owner);
     }
 
     fn take_item_template(

@@ -1760,16 +1760,24 @@ async fn kept_cast_item_grants_its_product_and_effect_and_is_consumed_once() {
         1,
         "exactly one of the two source units is consumed"
     );
-    assert_eq!(
-        crate::systems::economy::inventory::Inv::of(&a)
-            .bag()
-            .lock()
-            .unwrap()
-            .get_item_by_id(0x7023)
-            .expect("the stack keeps its id")
-            .slot,
-        0,
-        "the remainder is restored to its slot"
+    let bag = crate::systems::economy::inventory::Inv::of(&a).bag();
+    let (source_slot, product_slot) = {
+        let bag = bag.lock().unwrap();
+        (
+            bag.get_item_by_id(0x7023)
+                .expect("the stack keeps its id")
+                .slot,
+            bag.items
+                .iter()
+                .find(|i| i.template_id == CAST_PRODUCT)
+                .expect("product")
+                .slot,
+        )
+    };
+    assert_eq!(source_slot, 0, "the partial debit keeps the stack in place");
+    assert_ne!(
+        product_slot, source_slot,
+        "the product must not be placed into the occupied source slot"
     );
 }
 
@@ -1836,5 +1844,244 @@ async fn channeled_cast_cancelled_after_a_tick_consumes_the_item_once() {
         Inv::of(&a).items_count(CAST_ITEM, -1),
         1,
         "the cancelled channel consumes no more units"
+    );
+}
+
+/// One `SCItemTaskSuccessPacket` body, written by the server's own encoder.
+fn item_task_body(action: u8, tasks: Vec<crate::models::item_task::ItemTask>) -> Vec<u8> {
+    use crate::systems::economy::item_packets::SCItemTaskSuccessPacket;
+    use aaemu_commons::{Marshal, PacketStream};
+    let mut s = PacketStream::new();
+    SCItemTaskSuccessPacket {
+        action,
+        tasks,
+        force_remove: Vec::new(),
+    }
+    .write(&mut s);
+    s.into_bytes()
+}
+
+fn item_task_bodies(frames: &[(u16, Vec<u8>)]) -> Vec<Vec<u8>> {
+    frames
+        .iter()
+        .filter(|(op, _)| *op == crate::opcodes::sc::SCItemTaskSuccessPacket)
+        .map(|(_, body)| body.clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn full_cast_item_removal_precedes_the_product_in_the_same_slot() {
+    use crate::models::item_task::{task_type, ItemTask};
+    use crate::systems::economy::inventory::Inv;
+
+    let (server, mut client, a) = cast_product_fixture();
+    give_test_item(&server, &a, 0x7040, CAST_ITEM, 1);
+    let source = Inv::of(&a)
+        .bag()
+        .lock()
+        .unwrap()
+        .get_item_by_id(0x7040)
+        .expect("source")
+        .clone();
+    client.drain();
+    super::handlers::start_skill(&server, &mut client.conn, cast_item_packet(&a, 0x7040));
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let frames = client.drain();
+    let product = Inv::of(&a)
+        .bag()
+        .lock()
+        .unwrap()
+        .items
+        .iter()
+        .find(|i| i.template_id == CAST_PRODUCT)
+        .expect("product")
+        .clone();
+    assert_eq!(
+        product.slot, source.slot,
+        "the product takes the slot the full consume emptied"
+    );
+    assert_eq!(
+        item_task_bodies(&frames),
+        vec![
+            item_task_body(
+                task_type::SKILL_REAGENTS,
+                vec![ItemTask::remove_slot(&source)]
+            ),
+            item_task_body(
+                task_type::SKILL_EFFECT_GAIN_ITEM,
+                vec![ItemTask::add(&product)]
+            ),
+        ],
+        "the client removes the source before the product add"
+    );
+}
+
+#[tokio::test]
+async fn partial_cast_item_debits_in_place_before_the_product_add() {
+    use crate::models::item_task::{task_type, ItemTask};
+    use crate::systems::economy::inventory::Inv;
+
+    let (server, mut client, a) = cast_product_fixture();
+    give_test_item(&server, &a, 0x7041, CAST_ITEM, 2);
+    let source = Inv::of(&a)
+        .bag()
+        .lock()
+        .unwrap()
+        .get_item_by_id(0x7041)
+        .expect("source")
+        .clone();
+    client.drain();
+    super::handlers::start_skill(&server, &mut client.conn, cast_item_packet(&a, 0x7041));
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let frames = client.drain();
+    let bag = Inv::of(&a).bag();
+    let bag = bag.lock().unwrap();
+    let source_after = bag.get_item_by_id(0x7041).expect("remainder").clone();
+    let product = bag
+        .items
+        .iter()
+        .find(|i| i.template_id == CAST_PRODUCT)
+        .expect("product")
+        .clone();
+    assert_eq!((source_after.slot, source_after.count), (0, 1));
+    assert_ne!(
+        product.slot, source_after.slot,
+        "the product takes a different slot than the kept stack"
+    );
+    assert_eq!(
+        item_task_bodies(&frames),
+        vec![
+            item_task_body(
+                task_type::SKILL_REAGENTS,
+                vec![ItemTask::count_update(&source, -1)]
+            ),
+            item_task_body(
+                task_type::SKILL_EFFECT_GAIN_ITEM,
+                vec![ItemTask::add(&product)]
+            ),
+        ],
+        "the count update precedes the product add"
+    );
+}
+
+const CAST_EQUIP_ITEM: u32 = 6_013;
+
+fn cast_equipped_item_data() -> GameData {
+    use crate::data::items::{EquipTemplate, ItemTemplate, TemplateKind};
+    let mut data = cast_item_data();
+    let mut item = ItemTemplate::plain(CAST_EQUIP_ITEM, 1);
+    item.kind = TemplateKind::Armor(EquipTemplate {
+        slot_type_id: 3,
+        coverage: 10,
+        durability_ratio: 1.0,
+        durability_multiplier: 100,
+        ..EquipTemplate::default()
+    });
+    item.use_skill_id = CAST_ITEM_SKILL;
+    data.items.templates.insert(CAST_EQUIP_ITEM, item);
+    data
+}
+
+#[tokio::test]
+async fn consuming_an_equipped_source_item_runs_the_equip_leave_path() {
+    use crate::models::container::equip_slot;
+    use crate::models::item_task::{task_type, ItemTask};
+    use crate::systems::economy::inventory::Inv;
+    use crate::systems::economy::item_packets::SCUnitEquipmentsChangedPacket;
+    use crate::systems::skills::types::{SkillCastTarget, SkillCaster, SkillObject};
+    use aaemu_commons::{Marshal, PacketStream};
+
+    let server = Arc::new(test_server_with(cast_equipped_item_data()));
+    server.set_self();
+    super::bind(&server);
+    crate::systems::economy::bridges::install(&server);
+    let mut client = TestClient::new(&server, 1, 1);
+    let mut other = TestClient::new(&server, 2, 2);
+    let a = spawn_player(
+        &server,
+        &client,
+        test_character(1, "Caster", 100.0, 100.0),
+        0x100,
+    );
+    let b = spawn_player(
+        &server,
+        &other,
+        test_character(2, "Watcher", 101.0, 100.0),
+        0x101,
+    );
+    client.conn.active_char = Some(a.clone());
+    other.conn.active_char = Some(b.clone());
+    a.data().unit.hp = 500;
+    a.data().unit.max_hp = 1000;
+    let item = server
+        .items
+        .create(
+            CAST_EQUIP_ITEM,
+            1,
+            0,
+            server.config.id,
+            &server.game_data.items,
+            &server.ids.item,
+            0,
+        )
+        .expect("equipped item");
+    let item_id = item.id;
+    let equipment = Inv::of(&a).equipment();
+    equipment
+        .lock()
+        .unwrap()
+        .add_new_item(item, equip_slot::CHEST, &server.game_data.items)
+        .expect("equipped");
+    server.items.add_container(equipment.clone());
+    let equipped = equipment
+        .lock()
+        .unwrap()
+        .get_item_by_id(item_id)
+        .expect("equipped")
+        .clone();
+    client.drain();
+    other.drain();
+    super::handlers::start_skill(
+        &server,
+        &mut client.conn,
+        super::handlers::CSStartSkillPacket {
+            skill_id: CAST_ITEM_SKILL,
+            caster: SkillCaster::Item {
+                obj_id: a.obj_id,
+                item_id,
+                item_template_id: CAST_EQUIP_ITEM,
+                type1: 0,
+                type2: 0,
+            },
+            target: SkillCastTarget::Unit(a.obj_id),
+            flag: 0,
+            skill_object: SkillObject::None,
+        },
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(
+        equipment.lock().unwrap().get_item_by_id(item_id).is_none(),
+        "the equipped item is consumed"
+    );
+    assert_eq!(
+        item_task_bodies(&client.drain()),
+        vec![item_task_body(
+            task_type::SKILL_REAGENTS,
+            vec![ItemTask::remove_slot(&equipped)]
+        )],
+        "the owner sees the equipment-slot removal"
+    );
+    let mut expected = PacketStream::new();
+    SCUnitEquipmentsChangedPacket {
+        obj_id: a.obj_id,
+        items: vec![(equip_slot::CHEST as u8, None)],
+    }
+    .write(&mut expected);
+    let expected = expected.into_bytes();
+    assert!(
+        other.drain().iter().any(|(op, body)| *op
+            == crate::opcodes::sc::SCUnitEquipmentsChangedPacket
+            && *body == expected),
+        "nearby players see the equipped slot empty"
     );
 }

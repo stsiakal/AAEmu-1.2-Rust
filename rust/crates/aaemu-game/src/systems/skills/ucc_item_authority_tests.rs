@@ -260,3 +260,63 @@ async fn cancelled_ucc_cast_refunds_the_debited_source_item_exactly() {
     );
     assert!(!w.a.drain_ops().contains(&sc::SCItemUccDataChangedPacket));
 }
+
+fn item_task_body(action: u8, tasks: Vec<crate::models::item_task::ItemTask>) -> Vec<u8> {
+    use crate::systems::economy::item_packets::SCItemTaskSuccessPacket;
+    use aaemu_commons::{Marshal, PacketStream};
+    let mut s = PacketStream::new();
+    SCItemTaskSuccessPacket {
+        action,
+        tasks,
+        force_remove: Vec::new(),
+    }
+    .write(&mut s);
+    s.into_bytes()
+}
+
+#[tokio::test]
+async fn cancelled_full_ucc_cast_removes_then_restores_the_item_at_its_slot() {
+    use crate::models::item_task::{task_type, ItemTask};
+
+    let mut w = fixture();
+    // One-unit source: the take removes the whole item, so the refund must re-add it.
+    let source = give(&w, &w.pa, slot_type::INVENTORY, 17662, 1, 0);
+    let foreign = give(&w, &w.pb, slot_type::INVENTORY, ARMOR, 1, 1);
+    let before = item_at(&w.pa, slot_type::INVENTORY, 0).expect("ink");
+    w.a.drain();
+    cast(&mut w, 14433, source, 17662, foreign).await;
+    let after = item_at(&w.pa, slot_type::INVENTORY, 0).expect("ink is back");
+    assert_eq!(
+        (
+            after.id,
+            after.slot,
+            after.count,
+            after.template_id,
+            after.ucc_id
+        ),
+        (
+            before.id,
+            before.slot,
+            before.count,
+            before.template_id,
+            before.ucc_id
+        )
+    );
+    let bodies: Vec<Vec<u8>> =
+        w.a.drain()
+            .into_iter()
+            .filter(|(op, _)| *op == sc::SCItemTaskSuccessPacket)
+            .map(|(_, body)| body)
+            .collect();
+    assert_eq!(
+        bodies,
+        vec![
+            item_task_body(
+                task_type::SKILL_REAGENTS,
+                vec![ItemTask::remove_slot(&before)]
+            ),
+            item_task_body(task_type::SKILL_REAGENTS, vec![ItemTask::add(&before)]),
+        ],
+        "the client removes the ink on the debit and gets it back on the refund"
+    );
+}

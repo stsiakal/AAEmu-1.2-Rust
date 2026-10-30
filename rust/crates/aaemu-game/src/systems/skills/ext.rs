@@ -53,8 +53,8 @@ pub struct SummonPlacement {
 }
 
 /// The source item of an `Item` cast, debited before the cast result (reagents, products,
-/// effects) is produced. The item is held out of its container until the cast commits or
-/// refunds it, so no other item operation can move or consume it in between.
+/// effects) is produced. A whole-stack consume removes the item; a partial consume debits its
+/// count in place, so the stack keeps its slot and no product can take it.
 #[derive(Debug, Clone)]
 pub struct TakenCastItem {
     /// The item as it was before the debit (template, count, grade, flags, details).
@@ -65,7 +65,8 @@ pub struct TakenCastItem {
     pub slot: i32,
     /// Units to consume; `0` when the cast only verified the item.
     pub amount: i32,
-    /// The whole item was removed from `container` and is held by this value.
+    /// The whole item was removed from `container` (a full-stack consume, or a partial one
+    /// whose remainder is still in place when false).
     pub removed: bool,
 }
 

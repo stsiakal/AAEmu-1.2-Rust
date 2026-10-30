@@ -1990,7 +1990,7 @@ pub fn apply_effects(server: &GameServer, skill: &SkillRef, ctx: &CastCtx) {
         match items.take_cast_source_item(server, p, item_id, template_id, amount) {
             Some(Ok(taken)) => {
                 source_item = Some(std::sync::Arc::new(taken.item.clone()));
-                source_item_debited = taken.removed;
+                source_item_debited = taken.amount > 0;
                 source_debit = Some(CastSourceDebit {
                     server,
                     taken: Some(taken),
@@ -2195,7 +2195,7 @@ pub fn apply_effects(server: &GameServer, skill: &SkillRef, ctx: &CastCtx) {
                 .skills
                 .ext
                 .quests()
-                .item_use(server, p, item_id);
+                .item_use_template(server, p, item_template_id);
             if items.use_skill_as_reagent(server, item_template_id)
                 && reagents.is_empty()
                 && products.is_empty()
@@ -2227,10 +2227,9 @@ pub fn apply_effects(server: &GameServer, skill: &SkillRef, ctx: &CastCtx) {
     // An effect that cancels itself (invalid UCC/dye target, missing build material) refunds
     // the source item it could not charge for. A client / channel stop that lands while the
     // effects run (no effect cancelled) still pays for the effects that went out.
-    let effect_cancelled = skill.state().effect_cancelled
-        || player
-            .as_ref()
-            .is_some_and(|p| p.data().skill_char.skill_cancelled);
+    // Only this cast's own run state decides the refund: the per-character flag can be left
+    // set by another skill and must not make a successful cast refund its source.
+    let effect_cancelled = skill.state().effect_cancelled;
     if let Some(mut debit) = source_debit {
         if !effect_cancelled {
             debit.commit();

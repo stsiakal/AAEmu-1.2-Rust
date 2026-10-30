@@ -3015,21 +3015,35 @@ cast-time item that left the bag during the cast still granted the products (gra
 effects) and effects, and the final `ConsumeItem` either missed it or took it from another
 container (mail, auction, a trade partner's bag). The Rust port now debits first: right before
 the reagents, products and effects, `ItemSkillHooks::take_cast_source_item` verifies the owner,
-template and count and removes the whole item from the caster's bag or equipment only (never a
-trade, mail, auction, bank or coffer copy) under the economy operation lock. If the item is not
-there the whole result is refused (no reagents, products or effects). The item is held out of
-its container until `commit_cast_source_item` (release id + `Consumed`, or put the unconsumed
-remainder back) or `refund_cast_source_item` (restore the same id, template, count, grade and
-details after an effect cancelled — invalid UCC/dye target, missing build material). Effects that
-read the casting item (UCC imprint/cleanup, dyeing, loot-pack grade, socketing, grading scroll,
-look-convert powder, emblem stamp) use the pre-debit snapshot passed in
-`EffectSource::source_item`. The item reservation map (and its trade / sale / destroy checks) is
-removed: the item is physically absent while the result is decided, so those movers cannot reach
-it. `consume_owned_item` remains only for the plot-only cast's pre-plot ownership check.
+template and count under the economy operation lock. Only the caster's bag or equipment may hold
+the item (never a trade, mail, auction, bank or coffer copy); equipment is a real source (trade
+pack bundles such as item 14513 are equipped and cast their `PutDownBackpack` skill), so a full
+consume pushes the container's `EquipLeave` event. If the item is not there the whole result is
+refused (no reagents, products or effects). A full-stack consume removes the item and sends its
+removal at take time, before a product can take the freed slot; a partial consume decrements the
+count in place and sends a count update at take time, so the kept stack holds its slot.
+`commit_cast_source_item` pushes `Consumed` (the consumed amount) and releases the id for a full
+consume; `refund_cast_source_item` re-adds a full item (its own slot only while free, otherwise a
+free slot, otherwise loose) or increments a partial stack back, sending the matching add / count
+update and saving the item. Effects that read the casting item (UCC imprint/cleanup, dyeing,
+loot-pack grade, socketing, grading scroll, look-convert powder, emblem stamp) use the pre-debit
+snapshot passed in `EffectSource::source_item`, and `Character.ItemUse` quest events are raised
+from that template instead of a live item lookup. Partial consumption also raises `Consumed`, so
+quest collect counters drop. The item reservation map (and its trade / sale / destroy checks) is
+removed: the item is physically absent (or its count already reduced) while the result is
+decided, so those movers cannot reach it. `consume_owned_item` remains only for the plot-only
+cast's pre-plot ownership check.
 Regression tests: `cast_item_with_products_{destroyed,mailed_or_auctioned,traded}_mid_cast_*`,
 `kept_cast_item_grants_its_product_and_effect_and_is_consumed_once`,
+`full_cast_item_removal_precedes_the_product_in_the_same_slot`,
+`partial_cast_item_debits_in_place_before_the_product_add`,
 `cancelled_ucc_cast_refunds_the_debited_source_item_exactly`,
-`channeled_cast_cancelled_after_a_tick_consumes_the_item_once`.
+`cancelled_full_ucc_cast_removes_then_restores_the_item_at_its_slot`,
+`channeled_cast_cancelled_after_a_tick_consumes_the_item_once`,
+`consumable_item_cast_progresses_a_use_item_objective`,
+`partial_consumption_updates_a_collect_objective`,
+`full_refund_on_a_full_bag_keeps_the_item_loose_and_notifies_the_client`,
+`consuming_an_equipped_source_item_runs_the_equip_leave_path`.
 
 ## Lost-experience prayer cast (2026-10-30)
 
