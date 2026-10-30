@@ -435,7 +435,15 @@ fn load_rotations(dir: &Path) -> anyhow::Result<HashMap<String, Arc<Rotation>>> 
         .collect();
     paths.sort();
     for path in paths {
-        let rotation = Arc::new(Rotation::load(&path)?);
+        // One malformed research file must not cost every class its rotation: skip it with a
+        // warning and keep the rest.
+        let rotation = match Rotation::load(&path) {
+            Ok(rotation) => Arc::new(rotation),
+            Err(error) => {
+                tracing::warn!("Bots: skipping rotation {}: {error}", path.display());
+                continue;
+            }
+        };
         let key = rotation.archetype.to_lowercase().replace(' ', "_");
         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
             rotations.insert(stem.to_lowercase(), rotation.clone());
@@ -486,6 +494,30 @@ mod tests {
             r.rules[4].when,
             Condition::AllyDead { ally_dead: true }
         ));
+    }
+
+    /// One malformed rotation file is skipped (with a warning); the other classes keep theirs.
+    #[test]
+    fn a_malformed_rotation_file_does_not_disable_the_others() {
+        let dir = std::env::temp_dir().join(format!(
+            "aaemu-bots-rotation-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("good.json"),
+            r#"{"archetype":"Good","role":"melee_dps","rules":[],"fillers":[{"skill":3}]}"#,
+        )
+        .expect("good rotation");
+        std::fs::write(dir.join("bad.json"), r#"{"archetype":"Bad","#).expect("bad rotation");
+        let rotations = load_rotations(&dir).expect("a bad file is not fatal");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(rotations.contains_key("good"), "{:?}", rotations.keys());
+        assert!(!rotations.contains_key("bad"));
     }
 
     #[test]
