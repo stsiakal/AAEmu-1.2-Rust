@@ -113,9 +113,15 @@ impl BotHost {
             }
         }
         let bot = crate::life::login(server, &self.config, name).await?;
+        self.adopt(server, bot).await
+    }
+
+    /// Puts a bot that is in the world on the roster. It gets the host's plan gate and road
+    /// graphs first: nothing else can reach it before it is on the roster, so no early `goto`
+    /// can pin the server-wide fallback gate (`BotSession::plan_gate`; the first call wins).
+    async fn adopt(&self, server: &GameServer, bot: Arc<BotSession>) -> anyhow::Result<u32> {
         let character_id = bot.character_id;
-        // Before the bot is in the roster (nothing else can reach it yet): it uses this host's
-        // road graphs from its first route on.
+        bot.install_plan_gate(self.plan_gate.clone());
         bot.install_road_cache(self.roads.clone());
         let refusal = {
             let mut roster = self.bots.lock().await;
@@ -136,7 +142,6 @@ impl BotHost {
                 None
             }
         };
-        bot.install_plan_gate(self.plan_gate.clone());
         if let Some(reason) = refusal {
             // Do not leave the loser of the race in the world.
             bot.logout(server).await;
@@ -212,5 +217,43 @@ impl BotHost {
         }
         infos.sort_by(|a, b| a.name.cmp(&b.name));
         infos
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use aaemu_game::net::socketless::SocketlessConnection;
+    use aaemu_game::test_support::{test_character, test_server};
+
+    use super::*;
+    use crate::life;
+
+    /// A bot gets the host's plan gate before it is on the roster. `adopt` is parked at the
+    /// roster insert (the test holds the roster), after whatever it does first; the gate
+    /// asked for now must already be the host's, because an early `goto` that reaches a bot
+    /// without one pins the server-wide fallback gate for good (the first call wins).
+    #[tokio::test]
+    async fn a_bot_gets_the_hosts_gate_before_it_is_on_the_roster() {
+        let server = Arc::new(test_server());
+        server.set_self();
+        let host = Arc::new(BotHost::new(&server, BotsConfig::default()));
+        let conn = SocketlessConnection::new(&server, 1_000_002);
+        let bot = life::enter_loaded(&server, conn, test_character(2, "Walker", 100.0, 100.0))
+            .expect("the bot enters");
+        let roster = host.bots.lock().await;
+        let adopting = tokio::spawn({
+            let (host, server, bot) = (host.clone(), server.clone(), bot.clone());
+            async move { host.adopt(&server, bot).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            Arc::ptr_eq(&bot.plan_gate(), &host.plan_gate),
+            "the bot is not on the roster yet but already has the host's gate"
+        );
+        drop(roster);
+        assert_eq!(adopting.await.expect("task").expect("adopted"), 2);
+        assert!(host.bot("Walker").await.is_some(), "on the roster now");
     }
 }

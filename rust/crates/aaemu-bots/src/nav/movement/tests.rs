@@ -1030,6 +1030,59 @@ async fn fifty_real_plans_respect_the_gate_and_end_at_their_budget() {
     assert_eq!(gate.available(), 4, "every permit came back");
 }
 
+/// A plan that waits for a gate permit and is cancelled leaves the queue: no plan runs for it
+/// and it takes no permit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_plan_cancelled_while_it_waits_for_a_permit_leaves_the_queue() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    let gate = Arc::new(nav::PlanGate::new(1));
+    // The only permit is taken: the plan has to queue.
+    let held = gate.acquire().await;
+    let world = Arc::new(WalledWorld {
+        started: AtomicBool::new(false),
+        active: Arc::new(AtomicUsize::new(0)),
+        peak: Arc::new(AtomicUsize::new(0)),
+    });
+    let cancel = Arc::new(AtomicBool::new(false));
+    let queued_world: Arc<dyn NavWorld + Send + Sync> = world.clone();
+    let queued = tokio::spawn(nav::plan_guarded_with_limits(
+        queued_world,
+        at(250.0, 0.0),
+        at(400.0, 0.0),
+        gate.clone(),
+        nav::PlanCancel::from_flag(cancel.clone()),
+        20_000,
+        2_000,
+    ));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        !queued.is_finished(),
+        "the plan waits behind the held permit"
+    );
+    cancel.store(true, Ordering::SeqCst);
+    let report = tokio::time::timeout(Duration::from_secs(2), queued)
+        .await
+        .expect("the cancelled plan left the queue")
+        .expect("the plan task did not panic");
+    assert!(
+        report.is_none(),
+        "a plan cancelled in the queue has no report"
+    );
+    assert!(
+        !world.started.load(Ordering::SeqCst),
+        "no plan ran: the world was never queried"
+    );
+    assert_eq!(gate.available(), 0, "the held permit is still ours");
+    drop(held);
+    assert_eq!(
+        gate.available(),
+        1,
+        "the cancelled plan took no permit: the gate is whole again"
+    );
+}
+
 /// A fence ahead of every step; the arc sweep calls a jump clear when it is at most `max_clear`
 /// metres long (a long running jump is still rising where it passes the fence, a short one
 /// has cleared it).

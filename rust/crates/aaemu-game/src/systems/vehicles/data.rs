@@ -433,9 +433,19 @@ pub fn is_ground_transfer_model(normal: &str, can_fly: bool, floating_height: f3
         return false;
     }
     let path = normal.to_ascii_lowercase();
-    !["ship", "boat", "ferry", "air", "carpet", "float"]
+    // Model names compound these words (`floatship`, `ferryboat`, `smallboat`, `middleship`),
+    // so they match inside a longer word ...
+    if ["ship", "boat", "ferry", "carpet", "float"]
         .iter()
         .any(|word| path.contains(word))
+    {
+        return false;
+    }
+    // ... but `air` is too short for that (a chair or a stair is no airship): only a word that
+    // starts with it counts (`airship`, `air_balloon`).
+    !path
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .any(|word| word.starts_with("air"))
 }
 
 /// `ShipModelV1` (the members the slave spawning reads; the rest is the physics' data).
@@ -1592,5 +1602,27 @@ mod tests {
             false,
             0.0
         ));
+    }
+
+    /// `air` only counts as a word of its own (or the start of one), not inside a longer word:
+    /// carriages with a chair or a stair in the model path are still ground routes.
+    #[test]
+    fn air_is_a_word_not_a_substring() {
+        for path in [
+            "cgf://objects/Env/06_unit/05_carriage/carriage_chair_a.cgf",
+            "cgf://objects/Env/housing/stair_wood01.cgf",
+            "cgf://objects/Env/06_unit/repair/transfers_cart01.cgf",
+            "cgf://objects\\Env\\hair\\carriage_a.cgf",
+        ] {
+            assert!(is_ground_transfer_model(path, false, 0.0), "{path}");
+        }
+        for path in [
+            "prefab://Prefabs/airship.xml/airship.normal",
+            "cgf://objects/Env/06_unit/air_balloon/balloon_a.cgf",
+            "cgf://objects/Env/06_unit/AirShip/transfers_a.cgf",
+            "cgf://objects\\Env\\air\\carriage_a.cgf",
+        ] {
+            assert!(!is_ground_transfer_model(path, false, 0.0), "{path}");
+        }
     }
 }
