@@ -162,11 +162,8 @@ pub(super) async fn run(
 
     // ---- the casts ----
     let s = r.begin("game.questitem.cast");
-    let saved_timeout = game.timeout;
-    game.timeout = CAST_ANSWER;
-    let cast = casts(game, cfg, orb, &mut quest).await;
-    game.timeout = saved_timeout;
-    let (ok, results) = cast?;
+    // The guard puts the wait limit back after the casts, whatever ends them.
+    let (ok, results) = casts(&mut game.with_timeout(CAST_ANSWER), cfg, orb, &mut quest).await?;
     let q = quest.context("no quest packet carried the objective progress")?;
     ensure!(
         q.status == status::READY
