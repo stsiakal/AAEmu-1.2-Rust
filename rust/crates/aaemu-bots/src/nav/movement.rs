@@ -25,7 +25,7 @@ use aaemu_game::world::{PlayerRef, WorldObject};
 use aaemu_game::GameServer;
 use tokio::sync::oneshot;
 
-use crate::host::BotSession;
+use crate::host::{BotSession, WalkSend};
 
 use super::{
     self as nav, Avoid, MoveStep, NavWorld, OwnedGameNav, PlanCancel, StepAction, StuckTracker,
@@ -533,47 +533,20 @@ async fn walk(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
-        if bot.nav_generation() != generation {
-            return NavOutcome::Failed(NavFailure::Interrupted(bot.interrupt_reason()));
+        if let Some(failure) = interruption(bot, &player, generation, instance_id) {
+            return NavOutcome::Failed(failure);
         }
-        let (hp, online, disabled, parent, now, instance) = {
-            let c = player.data();
-            (
-                c.unit.hp,
-                c.is_online,
-                c.disabled_set_position,
-                c.unit.transform.parent_obj_id,
-                chrono::Utc::now().timestamp_millis(),
-                c.unit.transform.instance_id,
-            )
-        };
+        let now = chrono::Utc::now().timestamp_millis();
         let (run_speed, swim_speed) = speeds(&player);
-        if hp == 0 {
-            return NavOutcome::Failed(NavFailure::Interrupted("the bot died"));
-        }
-        if !online {
-            return NavOutcome::Failed(NavFailure::Interrupted("the bot is offline"));
-        }
-        if disabled {
-            return NavOutcome::Failed(NavFailure::Interrupted(
-                "the server holds the position (teleport / zone load)",
-            ));
-        }
-        if parent != 0 {
-            // Standing on a ship / mate: the ground navigator has no local frame.
-            return NavOutcome::Failed(NavFailure::Interrupted("standing on another object"));
-        }
-        if instance != instance_id {
-            return NavOutcome::Failed(NavFailure::Interrupted("the bot changed instance"));
-        }
         let pos = position(&player);
         if dist3(pos, last_pos) > MAX_TELEPORT_STEP_M {
             return NavOutcome::Failed(NavFailure::Interrupted("the bot was teleported"));
         }
         last_pos = pos;
         if tokio::time::Instant::now() >= deadline {
-            send_stop(bot, server, &player, pos, heading(pos, final_target)).await;
-            return NavOutcome::Failed(NavFailure::Timeout);
+            let outcome = NavOutcome::Failed(NavFailure::Timeout);
+            return stop_and_end(bot, server, &player, generation, pos, final_target, outcome)
+                .await;
         }
         walker.set_speeds(run_speed, swim_speed);
         if let Some(state) = jump.as_mut() {
@@ -581,10 +554,11 @@ async fn walk(
             let at = state.position();
             let (_, _, rotation_z) =
                 roll_pitch_yaw_sbytes_movement(0.0, 0.0, heading(state.from, state.to));
-            send_move(
+            if let Err(failure) = send_move(
                 bot,
                 server,
                 &player,
+                generation,
                 at,
                 state.step_delta(),
                 state.vertical_velocity(),
@@ -595,11 +569,18 @@ async fn walk(
                 state.fall_vel,
                 run_speed,
             )
-            .await;
+            .await
+            {
+                return NavOutcome::Failed(failure);
+            }
             if state.elapsed >= JUMP_AIR_TIME_S {
                 let to = state.to;
                 jump = None;
-                send_stop(bot, server, &player, to, heading(pos, to)).await;
+                if let Err(failure) =
+                    send_stop(bot, server, &player, generation, to, heading(pos, to)).await
+                {
+                    return NavOutcome::Failed(failure);
+                }
             }
             last_pos = position(&player);
             continue;
@@ -614,15 +595,32 @@ async fn walk(
         .await
         .expect("the navigation step task panicked");
         walker = walker_back;
+        #[cfg(test)]
+        bot.pause_before_send().await;
+        // The step task took a while: a cancel, a newer goto or a logout may have come in
+        // meanwhile, and a stale walk sends nothing (the connection re-checks the generation
+        // and the online state under its lock once more).
+        if let Some(failure) = interruption(bot, &player, generation, instance_id) {
+            return NavOutcome::Failed(failure);
+        }
         match action {
             WalkAction::Arrived => {
-                send_stop(bot, server, &player, pos, heading(pos, final_target)).await;
-                return NavOutcome::Arrived;
+                return stop_and_end(
+                    bot,
+                    server,
+                    &player,
+                    generation,
+                    pos,
+                    final_target,
+                    NavOutcome::Arrived,
+                )
+                .await;
             }
             WalkAction::Wait => continue,
             WalkAction::Failed(failure) => {
-                send_stop(bot, server, &player, pos, heading(pos, final_target)).await;
-                return NavOutcome::Failed(failure);
+                let outcome = NavOutcome::Failed(failure);
+                return stop_and_end(bot, server, &player, generation, pos, final_target, outcome)
+                    .await;
             }
             WalkAction::Replan { avoid, reason } => {
                 if let Some(failure) = replan(
@@ -646,10 +644,14 @@ async fn walk(
                     // The drop is a controlled fall, not a stuck episode.
                     walker.reset_stuck();
                 }
-                let sent = send_step(
-                    bot, server, &player, pos, step, &mut jump, run_speed, swim_speed,
+                let sent = match send_step(
+                    bot, server, &player, generation, pos, step, &mut jump, run_speed, swim_speed,
                 )
-                .await;
+                .await
+                {
+                    Ok(sent) => sent,
+                    Err(failure) => return NavOutcome::Failed(failure),
+                };
                 // Where the bot stands after its own packet is the baseline of the next
                 // tick's teleport check (a drop moves it far; that is not a teleport).
                 last_pos = position(&player);
@@ -740,19 +742,21 @@ async fn replan(
     }
 }
 
-/// Sends the packet of one [`MoveStep`]; `true` when a movement packet was sent (a jump starts
-/// its own tick loop instead and returns `false`).
+/// Sends the packet of one [`MoveStep`]: `Ok(true)` when a movement packet was sent (a jump
+/// starts its own tick loop instead and gives `Ok(false)`), `Err` when the walk went stale and
+/// nothing was sent.
 #[allow(clippy::too_many_arguments)]
 async fn send_step(
     bot: &Arc<BotSession>,
     server: &Arc<GameServer>,
     player: &PlayerRef,
+    generation: u64,
     pos: Vec3,
     step: MoveStep,
     jump: &mut Option<JumpState>,
     run_speed: f32,
     swim_speed: f32,
-) -> bool {
+) -> Result<bool, NavFailure> {
     match step.action {
         StepAction::Run => {
             let (_, _, rotation_z) =
@@ -761,6 +765,7 @@ async fn send_step(
                 bot,
                 server,
                 player,
+                generation,
                 step.to,
                 delta2(pos, step.to),
                 0.0,
@@ -773,7 +778,7 @@ async fn send_step(
                 0,
                 run_speed,
             )
-            .await;
+            .await?;
         }
         StepAction::Swim => {
             let (_, _, rotation_z) =
@@ -782,6 +787,7 @@ async fn send_step(
                 bot,
                 server,
                 player,
+                generation,
                 step.to,
                 delta2(pos, step.to),
                 0.0,
@@ -792,7 +798,7 @@ async fn send_step(
                 0,
                 swim_speed,
             )
-            .await;
+            .await?;
         }
         StepAction::Jump(_) => {
             *jump = Some(JumpState {
@@ -801,7 +807,7 @@ async fn send_step(
                 elapsed: 0.0,
                 fall_vel: aaemu_game::systems::ai::nav::fall_velocity((pos.z - step.to.z).max(0.0)),
             });
-            return false;
+            return Ok(false);
         }
         StepAction::Drop(height) => {
             let (_, _, rotation_z) =
@@ -810,6 +816,7 @@ async fn send_step(
                 bot,
                 server,
                 player,
+                generation,
                 step.to,
                 delta2(pos, step.to),
                 0.0,
@@ -820,18 +827,19 @@ async fn send_step(
                 aaemu_game::systems::ai::nav::fall_velocity(height),
                 run_speed,
             )
-            .await;
+            .await?;
         }
     }
-    true
+    Ok(true)
 }
 
-/// `BotSession::dispatch` of one unit movement.
+/// `BotSession::dispatch_walk` of one unit movement of the walk of `generation`.
 #[allow(clippy::too_many_arguments)]
 async fn send_move(
     bot: &BotSession,
     server: &GameServer,
     player: &PlayerRef,
+    generation: u64,
     pos: Vec3,
     (dx, dy): (f32, f32),
     vel_z_mps: f32,
@@ -841,7 +849,7 @@ async fn send_move(
     actor_flags: MoveTypeActorFlags,
     fall_vel: u16,
     max_speed_mps: f32,
-) {
+) -> Result<(), NavFailure> {
     let horizontal = (dx * dx + dy * dy).sqrt();
     // A real client's step is `actual speed * elapsed` (slows / trade packs / buffs included);
     // the verifier sees roughly this speed.
@@ -875,24 +883,27 @@ async fn send_move(
     let mut mt = MoveType::new(MoveKind::Unit(unit));
     mt.flags = flags;
     mt.time = bot.next_move_time_ms();
-    let _ = bot
-        .dispatch(
-            server,
-            CSMoveUnitPacket {
-                obj_id: player.obj_id,
-                move_type: mt,
-            },
-        )
-        .await;
+    bot.dispatch_walk(
+        server,
+        generation,
+        CSMoveUnitPacket {
+            obj_id: player.obj_id,
+            move_type: mt,
+        },
+    )
+    .await
+    .ok(bot)
 }
 
+/// The packet that ends a movement (the `stopping` flag) at `pos`.
 async fn send_stop(
     bot: &BotSession,
     server: &GameServer,
     player: &PlayerRef,
+    generation: u64,
     pos: Vec3,
     rot_z: f32,
-) {
+) -> Result<(), NavFailure> {
     let (_, _, rotation_z) = roll_pitch_yaw_sbytes_movement(0.0, 0.0, rot_z);
     let unit = UnitMove {
         x: pos.x,
@@ -909,15 +920,93 @@ async fn send_stop(
     let mut mt = MoveType::new(MoveKind::Unit(unit));
     mt.flags = MoveTypeFlags::STOPPING;
     mt.time = bot.next_move_time_ms();
-    let _ = bot
-        .dispatch(
-            server,
-            CSMoveUnitPacket {
-                obj_id: player.obj_id,
-                move_type: mt,
-            },
+    bot.dispatch_walk(
+        server,
+        generation,
+        CSMoveUnitPacket {
+            obj_id: player.obj_id,
+            move_type: mt,
+        },
+    )
+    .await
+    .ok(bot)
+}
+
+/// Ends the walk with `outcome` after the bot's closing stop packet. A walk that went stale on
+/// the way (cancelled or replaced, or the bot left) sends nothing and reports that instead.
+async fn stop_and_end(
+    bot: &BotSession,
+    server: &GameServer,
+    player: &PlayerRef,
+    generation: u64,
+    pos: Vec3,
+    final_target: Vec3,
+    outcome: NavOutcome,
+) -> NavOutcome {
+    match send_stop(
+        bot,
+        server,
+        player,
+        generation,
+        pos,
+        heading(pos, final_target),
+    )
+    .await
+    {
+        Ok(()) => outcome,
+        Err(stale) => NavOutcome::Failed(stale),
+    }
+}
+
+impl WalkSend {
+    /// `Ok` when the packet went out, the matching interruption when the walk was stale.
+    fn ok(self, bot: &BotSession) -> Result<(), NavFailure> {
+        match self {
+            WalkSend::Sent => Ok(()),
+            WalkSend::Superseded => Err(NavFailure::Interrupted(bot.interrupt_reason())),
+            WalkSend::Offline => Err(NavFailure::Interrupted("the bot is offline")),
+        }
+    }
+}
+
+/// Why the walk of `generation` must end before it sends another packet, if it must: a cancel
+/// or a newer `goto`, or the bot died, left the world, is held by the server (teleport / zone
+/// load), stands on another object or changed instance. Checked every tick and again after
+/// every await that precedes a packet (the step task), not only at the top of the tick.
+fn interruption(
+    bot: &BotSession,
+    player: &PlayerRef,
+    generation: u64,
+    instance_id: u32,
+) -> Option<NavFailure> {
+    if bot.nav_generation() != generation {
+        return Some(NavFailure::Interrupted(bot.interrupt_reason()));
+    }
+    let (hp, online, disabled, parent, instance) = {
+        let c = player.data();
+        (
+            c.unit.hp,
+            c.is_online,
+            c.disabled_set_position,
+            c.unit.transform.parent_obj_id,
+            c.unit.transform.instance_id,
         )
-        .await;
+    };
+    let reason = if hp == 0 {
+        "the bot died"
+    } else if !online {
+        "the bot is offline"
+    } else if disabled {
+        "the server holds the position (teleport / zone load)"
+    } else if parent != 0 {
+        // Standing on a ship / mate: the ground navigator has no local frame.
+        "standing on another object"
+    } else if instance != instance_id {
+        "the bot changed instance"
+    } else {
+        return None;
+    };
+    Some(NavFailure::Interrupted(reason))
 }
 
 /// Plans `from` -> `to` off the async workers. `spots` are stuck circles to route around (the

@@ -15,8 +15,10 @@ use aaemu_game::test_support::{
     TestClient,
 };
 
+use aaemu_game::world::PlayerRef;
+
 use crate::life;
-use crate::nav::movement::NavOutcome;
+use crate::nav::movement::{Goto, NavFailure, NavOutcome};
 
 const SURFACE: f32 = 100.0;
 
@@ -167,40 +169,116 @@ async fn an_unreachable_target_fails_with_a_reason() {
     );
 }
 
+/// A walk parked between choosing its first step and sending it: the window the blocking step
+/// task leaves open, in which a cancel, a newer goto or a logout can come in.
+async fn walk_parked_mid_step(
+    server: &Arc<aaemu_game::GameServer>,
+    bot: &Arc<crate::host::BotSession>,
+) -> (Goto, Arc<crate::host::StepPause>) {
+    let pause = bot.pause_next_step();
+    let goto = bot.start_goto(server, Vec3::new(400.0, 100.0, SURFACE), 1.0);
+    tokio::time::timeout(Duration::from_secs(10), pause.reached.notified())
+        .await
+        .expect("the walk chose its first step");
+    (goto, pause)
+}
+
+/// `BotHost::remove` cancels the navigation, logs the bot out and disconnects it. A walk that
+/// is mid-step at that moment must not send its step afterwards: the packets are counted on the
+/// bot's connection (the removed bot is out of the world, so an observer sees nothing either way).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_removed_bot_sends_no_movement_after_the_removal() {
     let server = nav_server();
-    let mut observer = TestClient::new(&server, 1, 1000);
-    let observer_obj = server.ids.object.get_next_id().expect("object id");
-    spawn_player(
-        &server,
-        &observer,
-        test_character(1, "Observer", 90.0, 100.0),
-        observer_obj,
-    );
-    observer.drain();
     let bot = bot_at(&server, 2, "Walker", 100.0, 100.0).await;
-    let goto = bot.start_goto(&server, Vec3::new(400.0, 100.0, SURFACE), 1.0);
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (goto, pause) = walk_parked_mid_step(&server, &bot).await;
+    let sent = bot.packets_dispatched();
+    bot.cancel_navigation();
     bot.logout(&server).await;
-    observer.drain();
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    let after = observer.drain();
-    assert!(
-        !after
-            .iter()
-            .any(|(op, _)| *op == sc::SCOneUnitMovementPacket),
-        "the removed bot still sent {} frames",
-        after.len()
+    bot.disconnect(&server).await;
+    pause.resume.notify_one();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), goto.wait())
+        .await
+        .expect("the walk ended after the removal");
+    assert_eq!(
+        outcome,
+        NavOutcome::Failed(NavFailure::Interrupted("navigation cancelled"))
     );
-    let outcome = goto.wait().await;
+    assert_eq!(
+        bot.packets_dispatched(),
+        sent,
+        "the cancelled walk sent a movement packet"
+    );
+}
+
+/// A newer goto replaces the walk while it is mid-step: the replaced walk sends nothing (the
+/// second goto is unreachable, so every packet counted would be the first walk's).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_goto_mid_step_sends_nothing_for_the_replaced_walk() {
+    let server = nav_server();
+    let bot = bot_at(&server, 2, "Walker", 100.0, 100.0).await;
+    let (first, pause) = walk_parked_mid_step(&server, &bot).await;
+    let sent = bot.packets_dispatched();
+    let second = bot.start_goto(&server, Vec3::new(40_000.0, 40_000.0, SURFACE), 1.0);
+    pause.resume.notify_one();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), first.wait())
+        .await
+        .expect("the replaced walk ended");
+    assert_eq!(
+        outcome,
+        NavOutcome::Failed(NavFailure::Interrupted("replaced by a newer goto"))
+    );
+    let second = tokio::time::timeout(Duration::from_secs(10), second.wait())
+        .await
+        .expect("the second goto failed fast");
     assert!(
-        matches!(
+        matches!(second, NavOutcome::Failed(NavFailure::Unreachable(_))),
+        "{second:?}"
+    );
+    assert_eq!(
+        bot.packets_dispatched(),
+        sent,
+        "the replaced walk sent a movement packet"
+    );
+}
+
+/// A logout (the server's own logout timer: no cancel) while the walk is mid-step, a death and
+/// an instance change end it before the step is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bot_that_goes_offline_dies_or_changes_instance_mid_step_sends_nothing() {
+    type Change = fn(&Arc<aaemu_game::GameServer>, &Arc<crate::host::BotSession>, &PlayerRef);
+    let cases: [(&str, Change); 3] = [
+        ("the bot is offline", |_, _, player| {
+            player.data().is_online = false;
+        }),
+        ("the bot died", |_, _, player| {
+            player.data().unit.hp = 0;
+        }),
+        ("the bot changed instance", |_, _, player| {
+            player.data().unit.transform.instance_id = 7;
+        }),
+    ];
+    for (n, (reason, change)) in cases.into_iter().enumerate() {
+        let server = nav_server();
+        let bot = bot_at(&server, 2 + n as u32, "Walker", 100.0, 100.0).await;
+        let player = bot.player().await.expect("player");
+        let (goto, pause) = walk_parked_mid_step(&server, &bot).await;
+        let sent = bot.packets_dispatched();
+        change(&server, &bot, &player);
+        pause.resume.notify_one();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), goto.wait())
+            .await
+            .expect("the walk ended");
+        assert_eq!(
             outcome,
-            NavOutcome::Failed(crate::nav::movement::NavFailure::Interrupted(_))
-        ),
-        "{outcome:?}"
-    );
+            NavOutcome::Failed(NavFailure::Interrupted(reason)),
+            "{reason}"
+        );
+        assert_eq!(
+            bot.packets_dispatched(),
+            sent,
+            "{reason}: a packet was sent"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -308,40 +386,29 @@ async fn a_walk_that_outlasts_its_deadline_times_out() {
 }
 
 /// `BotHost::remove` cancels the navigation before it logs the bot out: the walk ends as
-/// cancelled (not as "replaced by a newer goto") and no movement packet follows.
+/// cancelled (not as "replaced by a newer goto") and no movement packet follows. The packets
+/// are counted on the bot's connection once a dispatch in flight at the cancel has finished.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelling_the_navigation_ends_the_walk_before_the_next_packet() {
     let server = nav_server();
-    let mut observer = TestClient::new(&server, 1, 1000);
-    let observer_obj = server.ids.object.get_next_id().expect("object id");
-    spawn_player(
-        &server,
-        &observer,
-        test_character(1, "Observer", 90.0, 100.0),
-        observer_obj,
-    );
     let bot = bot_at(&server, 2, "Walker", 100.0, 100.0).await;
     let goto = bot.start_goto(&server, Vec3::new(400.0, 100.0, SURFACE), 1.0);
     tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(bot.packets_dispatched() > 0, "the bot was walking");
     bot.cancel_navigation();
+    let sent = bot.packets_dispatched_settled().await;
     let outcome = tokio::time::timeout(Duration::from_secs(3), goto.wait())
         .await
         .expect("the walk ended after the cancel");
     assert_eq!(
         outcome,
-        NavOutcome::Failed(crate::nav::movement::NavFailure::Interrupted(
-            "navigation cancelled"
-        ))
+        NavOutcome::Failed(NavFailure::Interrupted("navigation cancelled"))
     );
-    observer.drain();
     tokio::time::sleep(Duration::from_millis(400)).await;
-    let after = observer.drain();
-    assert!(
-        !after
-            .iter()
-            .any(|(op, _)| *op == sc::SCOneUnitMovementPacket),
-        "the cancelled bot still sent {} frames",
-        after.len()
+    assert_eq!(
+        bot.packets_dispatched(),
+        sent,
+        "the cancelled bot still sent packets"
     );
 }
 

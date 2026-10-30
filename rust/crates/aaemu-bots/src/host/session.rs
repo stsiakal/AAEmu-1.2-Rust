@@ -39,9 +39,34 @@ pub struct BotSession {
     move_clock: (u32, std::time::Instant),
     /// Places the walker got stuck at (routed around by later plans).
     stuck_spots: Mutex<Vec<(f32, f32)>>,
+    /// Client packets dispatched through this bot's connection (all senders).
+    dispatched: AtomicU64,
     /// Test hook: an upper bound (ms) for the overall walk deadline (`0` = none).
     #[cfg(test)]
     walk_deadline_cap_ms: AtomicU64,
+    /// Test hook: parks the next walk step between choosing it and sending it.
+    #[cfg(test)]
+    step_pause: std::sync::Mutex<Option<Arc<StepPause>>>,
+}
+
+/// What became of one packet of a walk ([`BotSession::dispatch_walk`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WalkSend {
+    /// The packet went through the handler.
+    Sent,
+    /// A cancel or a newer `goto` replaced the walk: nothing was sent.
+    Superseded,
+    /// The bot is not in the world any more: nothing was sent.
+    Offline,
+}
+
+/// The test hook of [`BotSession::pause_next_step`]: the walk notifies `reached` when it is
+/// parked and continues once `resume` is notified.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct StepPause {
+    pub reached: tokio::sync::Notify,
+    pub resume: tokio::sync::Notify,
 }
 
 impl BotSession {
@@ -63,8 +88,11 @@ impl BotSession {
                 std::time::Instant::now(),
             ),
             stuck_spots: Mutex::new(Vec::new()),
+            dispatched: AtomicU64::new(0),
             #[cfg(test)]
             walk_deadline_cap_ms: AtomicU64::new(0),
+            #[cfg(test)]
+            step_pause: std::sync::Mutex::new(None),
         }
     }
 
@@ -173,8 +201,69 @@ impl BotSession {
         packet: P,
     ) -> anyhow::Result<()> {
         let mut conn = self.conn.lock().await;
+        self.dispatched.fetch_add(1, Ordering::Relaxed);
         conn.dispatch(server, packet).await?;
         Ok(())
+    }
+
+    /// Dispatches one packet of the walk of `generation`, unless that walk is stale by the time
+    /// the connection is free: a cancel or a newer `goto` (the generation moved on) or a logout
+    /// (the character is offline) stops the packet here, under the connection lock a logout
+    /// also holds, so no movement follows the cancel however long the walk waited for its step,
+    /// the lock or the handler.
+    pub(crate) async fn dispatch_walk<P: ClientPacket + std::fmt::Debug>(
+        &self,
+        server: &GameServer,
+        generation: u64,
+        packet: P,
+    ) -> WalkSend {
+        let mut conn = self.conn.lock().await;
+        if self.nav_generation() != generation {
+            return WalkSend::Superseded;
+        }
+        let online = conn
+            .conn
+            .active_char
+            .as_ref()
+            .is_some_and(|player| player.data().is_online);
+        if !online {
+            return WalkSend::Offline;
+        }
+        self.dispatched.fetch_add(1, Ordering::Relaxed);
+        let _ = conn.dispatch(server, packet).await;
+        WalkSend::Sent
+    }
+
+    /// Client packets dispatched through this bot's connection so far.
+    pub fn packets_dispatched(&self) -> u64 {
+        self.dispatched.load(Ordering::Relaxed)
+    }
+
+    /// [`BotSession::packets_dispatched`] once a dispatch in flight has finished: it waits for
+    /// the connection lock a dispatch holds from its generation check to its count.
+    #[cfg(test)]
+    pub(crate) async fn packets_dispatched_settled(&self) -> u64 {
+        let _conn = self.conn.lock().await;
+        self.packets_dispatched()
+    }
+
+    /// Test hook: the next walk step parks after the walker chose it and before it is sent,
+    /// until the returned handle is released (the window the blocking step task leaves open).
+    #[cfg(test)]
+    pub(crate) fn pause_next_step(&self) -> Arc<StepPause> {
+        let pause = Arc::new(StepPause::default());
+        *self.step_pause.lock().expect("step pause poisoned") = Some(pause.clone());
+        pause
+    }
+
+    /// The park point of [`BotSession::pause_next_step`] (a no-op without a pending pause).
+    #[cfg(test)]
+    pub(crate) async fn pause_before_send(&self) {
+        let pause = self.step_pause.lock().expect("step pause poisoned").take();
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.resume.notified().await;
+        }
     }
 
     /// The S->C frames the server wrote to this bot since the last call (the replies a client

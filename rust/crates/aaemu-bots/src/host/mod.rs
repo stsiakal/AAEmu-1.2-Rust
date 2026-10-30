@@ -17,6 +17,9 @@ use aaemu_game::GameServer;
 use tokio::sync::Mutex;
 
 pub use session::BotSession;
+#[cfg(test)]
+pub(crate) use session::StepPause;
+pub(crate) use session::WalkSend;
 
 use crate::nav::movement::Goto;
 use crate::nav::PlanGate;
