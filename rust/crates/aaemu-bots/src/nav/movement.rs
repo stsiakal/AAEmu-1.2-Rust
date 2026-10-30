@@ -52,8 +52,8 @@ const DETOUR_M: f32 = 8.0;
 const MAX_REPLANS: u32 = 3;
 /// Radius of the circles the repath rung routes around.
 const AVOID_RADIUS_M: f32 = 3.0;
-/// A walk may take this many times what the rest of its route needs at the bot's current speed
-/// ...
+/// The allowance of a walk is this many times what the rest of its route needs at the bot's
+/// current speed ([`WalkClock`]) ...
 const DEADLINE_ROUTE_FACTOR: f32 = 3.0;
 /// ... plus this much slack, in seconds.
 const DEADLINE_SLACK_S: f32 = 30.0;
