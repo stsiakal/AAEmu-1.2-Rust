@@ -3023,9 +3023,11 @@ refused (no reagents, products or effects). A full-stack consume removes the ite
 removal at take time, before a product can take the freed slot; a partial consume decrements the
 count in place and sends a count update at take time, so the kept stack holds its slot.
 `commit_cast_source_item` pushes `Consumed` (the consumed amount) and releases the id for a full
-consume; `refund_cast_source_item` re-adds a full item (its own slot only while free, otherwise a
-free slot, otherwise loose) or increments a partial stack back, sending the matching add / count
-update and saving the item. Effects that read the casting item (UCC imprint/cleanup, dyeing,
+consume; `refund_cast_source_item` re-adds a full item (a bag source to its own slot only while
+free, otherwise a free bag slot; an equipment source only to its own slot, otherwise to the bag;
+neither ever to another equipment slot, so no wrong `EquipEnter`) or increments a partial stack
+back, sending the matching add / count update and saving the item. A full container leaves the
+item loose with no slot-add task (it is in no slot); the next relog places it. Effects that read the casting item (UCC imprint/cleanup, dyeing,
 loot-pack grade, socketing, grading scroll, look-convert powder, emblem stamp) use the pre-debit
 snapshot passed in `EffectSource::source_item`, and `Character.ItemUse` quest events are raised
 from that template instead of a live item lookup. Partial consumption also raises `Consumed`, so

@@ -45,8 +45,10 @@ fn lock(c: &ContainerRef) -> std::sync::MutexGuard<'_, ItemContainer> {
     c.lock().expect("container poisoned")
 }
 
-/// Puts a taken/refunded item back into `container`, preferring `preferred_slot` only while it
-/// is free; a full container keeps the item tracked as loose and still tells the client.
+/// Puts a taken/refunded item back where the server actually placed it. An equipment source
+/// only returns to its own slot while that slot is free; otherwise it goes to the owner's bag
+/// (never into another equipment slot, which would equip it in the wrong slot). A full
+/// container leaves the item loose. The client task reports exactly the container and slot used.
 fn put_restored_item(
     server: &GameServer,
     txn: &mut ItemTxn<'_>,
@@ -57,29 +59,56 @@ fn put_restored_item(
 ) {
     item.dirty = true;
     let mut guard = lock(container);
-    let slot = guard.get_unused_slot(preferred_slot);
-    if slot < 0 {
+    let equipment = guard.is_equipment();
+    let slot = if equipment {
+        // Equipment slots are not interchangeable: a different free slot is a different gear
+        // slot, and `EquipEnter` would announce the item at the wrong one.
+        if guard.get_item_by_slot(preferred_slot).is_none() {
+            preferred_slot
+        } else {
+            -1
+        }
+    } else {
+        guard.get_unused_slot(preferred_slot)
+    };
+    if slot >= 0 {
+        item.slot = slot;
+        item.slot_type = guard.slot_type;
+        guard.items.insert(0, item.clone());
+        guard.update_free_slot_count();
+        guard.notify_enter(&item, &mut txn.env.fx);
         drop(guard);
-        tracing::error!(
-            item_id = item.id,
-            template_id = item.template_id,
-            "cast source could not be placed back into its container"
-        );
-        server.items.add_loose(item.clone());
         txn.env
             .fx
             .tasks(owner, task_type::SKILL_REAGENTS, vec![ItemTask::add(&item)]);
         return;
     }
-    item.slot = slot;
-    item.slot_type = guard.slot_type;
-    guard.items.insert(0, item.clone());
-    guard.update_free_slot_count();
-    guard.notify_enter(&item, &mut txn.env.fx);
     drop(guard);
-    txn.env
-        .fx
-        .tasks(owner, task_type::SKILL_REAGENTS, vec![ItemTask::add(&item)]);
+    if equipment {
+        if let Some(player) = server.world.character_by_id(owner) {
+            let bag = Inv::of(&player).bag();
+            let mut guard = lock(&bag);
+            let slot = guard.get_unused_slot(-1);
+            if slot >= 0 {
+                item.slot = slot;
+                item.slot_type = guard.slot_type;
+                guard.items.insert(0, item.clone());
+                guard.update_free_slot_count();
+                drop(guard);
+                txn.env
+                    .fx
+                    .tasks(owner, task_type::SKILL_REAGENTS, vec![ItemTask::add(&item)]);
+                return;
+            }
+        }
+    }
+    // Not in any container: the server keeps it loose, so no slot-add is reported.
+    tracing::error!(
+        item_id = item.id,
+        template_id = item.template_id,
+        "cast source could not be placed back into a container"
+    );
+    server.items.add_loose(item);
 }
 
 fn task_packet(action: u8, tasks: Vec<ItemTask>) -> SCItemTaskSuccessPacket {

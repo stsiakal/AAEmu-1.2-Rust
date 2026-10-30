@@ -2519,7 +2519,7 @@ async fn fishing_loot_from_a_position_target_gives_the_sea_pack_item() {
 }
 
 #[tokio::test]
-async fn full_refund_on_a_full_bag_keeps_the_item_loose_and_notifies_the_client() {
+async fn full_refund_on_a_full_bag_keeps_the_item_loose_without_a_slot_add() {
     use crate::systems::skills::ext::{ItemSkillHooks, TakenCastItem};
 
     let mut w = world();
@@ -2565,9 +2565,222 @@ async fn full_refund_on_a_full_bag_keeps_the_item_loose_and_notifies_the_client(
             .filter(|(op, _)| *op == sc::SCItemTaskSuccessPacket)
             .map(|(_, body)| body)
             .collect();
+    assert!(
+        bodies.is_empty(),
+        "a loose item is in no slot, so no slot-add is reported"
+    );
+}
+
+fn take_partial(
+    w: &World,
+    item_id: u64,
+    template_id: u32,
+    amount: i32,
+) -> crate::systems::skills::ext::TakenCastItem {
+    use crate::systems::skills::ext::ItemSkillHooks;
+    super::bridges::EconomyForSkills
+        .take_cast_source_item(&w.server, &w.pa, item_id, template_id, amount)
+        .expect("tracked items")
+        .expect("source taken")
+}
+
+fn refund(w: &World, taken: crate::systems::skills::ext::TakenCastItem) {
+    use crate::systems::skills::ext::ItemSkillHooks;
+    super::bridges::EconomyForSkills.refund_cast_source_item(&w.server, taken);
+}
+
+fn only_item_tasks(w: &mut World) -> Vec<Vec<u8>> {
+    w.a.drain()
+        .into_iter()
+        .filter(|(op, _)| *op == sc::SCItemTaskSuccessPacket)
+        .map(|(_, body)| body)
+        .collect()
+}
+
+#[tokio::test]
+async fn partial_refund_adds_back_after_a_merge_into_the_kept_stack() {
+    let mut w = world();
+    let id = give(&w, &w.pa, slot_type::INVENTORY, STACK, 2, 0);
+    let taken = take_partial(&w, id, STACK, 1);
+    {
+        let bag = Inv::of(&w.pa).bag();
+        let mut bag = bag.lock().unwrap();
+        bag.get_item_by_id_mut(id).unwrap().count += 2;
+        bag.update_free_slot_count();
+    }
+    w.a.drain();
+    refund(&w, taken);
+    let after = item_at(&w.pa, slot_type::INVENTORY, 0).expect("kept stack");
+    assert_eq!(after.count, 4, "1 left + 2 merged + 1 refunded");
     assert_eq!(
-        bodies,
-        vec![tasks(task_type::SKILL_REAGENTS, vec![ItemTask::add(&item)])],
-        "the client is told about the restored item even when the bag is full"
+        only_item_tasks(&mut w),
+        vec![tasks(
+            task_type::SKILL_REAGENTS,
+            vec![ItemTask::count_update(&after, 1)]
+        )],
+        "the refund count update names the merged stack and slot"
+    );
+}
+
+#[tokio::test]
+async fn partial_refund_adds_back_after_a_split_from_the_kept_stack() {
+    let mut w = world();
+    let id = give(&w, &w.pa, slot_type::INVENTORY, STACK, 3, 0);
+    let taken = take_partial(&w, id, STACK, 1);
+    {
+        let bag = Inv::of(&w.pa).bag();
+        let mut bag = bag.lock().unwrap();
+        bag.get_item_by_id_mut(id).unwrap().count = 1;
+        bag.update_free_slot_count();
+    }
+    // The split half lives in another slot.
+    let split = give(&w, &w.pa, slot_type::INVENTORY, STACK, 1, 4);
+    w.a.drain();
+    refund(&w, taken);
+    let after = item_at(&w.pa, slot_type::INVENTORY, 0).expect("kept stack");
+    assert_eq!(after.count, 2, "1 left + 1 refunded");
+    assert_eq!(
+        item_at(&w.pa, slot_type::INVENTORY, 4)
+            .expect("split half")
+            .id,
+        split
+    );
+    assert_eq!(
+        only_item_tasks(&mut w),
+        vec![tasks(
+            task_type::SKILL_REAGENTS,
+            vec![ItemTask::count_update(&after, 1)]
+        )]
+    );
+}
+
+#[tokio::test]
+async fn partial_refund_follows_the_kept_stack_to_a_new_slot() {
+    let mut w = world();
+    let id = give(&w, &w.pa, slot_type::INVENTORY, STACK, 2, 0);
+    let taken = take_partial(&w, id, STACK, 1);
+    {
+        let bag = Inv::of(&w.pa).bag();
+        let mut bag = bag.lock().unwrap();
+        bag.get_item_by_id_mut(id).unwrap().slot = 5;
+    }
+    w.a.drain();
+    refund(&w, taken);
+    let after = item_at(&w.pa, slot_type::INVENTORY, 5).expect("moved stack");
+    assert_eq!(after.count, 2);
+    assert_eq!(
+        only_item_tasks(&mut w),
+        vec![tasks(
+            task_type::SKILL_REAGENTS,
+            vec![ItemTask::count_update(&after, 1)]
+        )],
+        "the count update names the slot the stack now holds"
+    );
+}
+
+#[tokio::test]
+async fn partial_refund_recreates_the_debited_units_when_the_remainder_left() {
+    let mut w = world();
+    let id = give(&w, &w.pa, slot_type::INVENTORY, STACK, 2, 0);
+    {
+        let bag = Inv::of(&w.pa).bag();
+        bag.lock().unwrap().get_item_by_id_mut(id).unwrap().ucc_id = 0xABCD;
+    }
+    let taken = take_partial(&w, id, STACK, 1);
+    {
+        let bag = Inv::of(&w.pa).bag();
+        bag.lock().unwrap().items.retain(|i| i.id != id);
+    }
+    w.a.drain();
+    refund(&w, taken);
+    let bag = Inv::of(&w.pa).bag();
+    let bag = bag.lock().unwrap();
+    assert!(bag.get_item_by_id(id).is_none(), "the old stack is gone");
+    let restored = bag
+        .items
+        .iter()
+        .find(|i| i.template_id == STACK && i.id != id)
+        .expect("fresh stack");
+    assert_eq!(restored.count, 1);
+    assert_eq!(restored.ucc_id, 0xABCD, "properties come from the snapshot");
+    assert!(restored.dirty);
+    let restored = restored.clone();
+    drop(bag);
+    assert_eq!(
+        only_item_tasks(&mut w),
+        vec![tasks(
+            task_type::SKILL_REAGENTS,
+            vec![ItemTask::add(&restored)]
+        )]
+    );
+}
+
+#[tokio::test]
+async fn equipped_refund_restores_the_same_slot_with_equip_enter() {
+    use crate::models::container::equip_slot;
+
+    let mut w = world();
+    let id = give(&w, &w.pa, slot_type::EQUIPMENT, ARMOR, 1, equip_slot::CHEST);
+    let taken = take_partial(&w, id, ARMOR, 1);
+    w.a.drain();
+    w.b.drain();
+    refund(&w, taken);
+    let after =
+        item_at(&w.pa, slot_type::EQUIPMENT, equip_slot::CHEST as u8).expect("same equipment slot");
+    assert_eq!(after.id, id);
+    assert!(after.dirty);
+    assert_eq!(
+        only_item_tasks(&mut w),
+        vec![tasks(
+            task_type::SKILL_REAGENTS,
+            vec![ItemTask::add(&after)]
+        )]
+    );
+    let expected = body(&SCUnitEquipmentsChangedPacket {
+        obj_id: w.pa.obj_id,
+        items: vec![(equip_slot::CHEST as u8, Some(after))],
+    });
+    assert!(
+        w.b.drain()
+            .iter()
+            .any(|(op, body)| *op == sc::SCUnitEquipmentsChangedPacket && *body == expected),
+        "nearby players see the item back in its chest slot"
+    );
+}
+
+#[tokio::test]
+async fn equipped_refund_with_its_slot_taken_goes_to_the_bag_without_equip_enter() {
+    use crate::models::container::equip_slot;
+
+    let mut w = world();
+    let id = give(&w, &w.pa, slot_type::EQUIPMENT, ARMOR, 1, equip_slot::CHEST);
+    let taken = take_partial(&w, id, ARMOR, 1);
+    // Another item refilled the chest slot in the meantime.
+    let other = give(&w, &w.pa, slot_type::EQUIPMENT, ARMOR, 1, equip_slot::CHEST);
+    w.a.drain();
+    w.b.drain();
+    refund(&w, taken);
+    assert!(
+        item_at(&w.pa, slot_type::EQUIPMENT, equip_slot::CHEST as u8)
+            .is_some_and(|i| i.id == other),
+        "the refilled equipment slot is untouched"
+    );
+    let bag_item = item_at(&w.pa, slot_type::INVENTORY, 0)
+        .filter(|i| i.id == id)
+        .expect("refunded to the bag");
+    assert_eq!(bag_item.slot_type, slot_type::INVENTORY);
+    assert_eq!(
+        only_item_tasks(&mut w),
+        vec![tasks(
+            task_type::SKILL_REAGENTS,
+            vec![ItemTask::add(&bag_item)]
+        )],
+        "the client is told the item went to the bag"
+    );
+    assert!(
+        !w.b.drain()
+            .iter()
+            .any(|(op, _)| *op == sc::SCUnitEquipmentsChangedPacket),
+        "no equipment change is announced for a bag refund"
     );
 }

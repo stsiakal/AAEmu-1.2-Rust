@@ -2165,6 +2165,10 @@ pub fn apply_effects(server: &GameServer, skill: &SkillRef, ctx: &CastCtx) {
             }
         } else {
             effects::apply(server, kind, template, &args, Some(&mut packets));
+            // Dyeing rejects through the C# `Character.SkillCancelled` flag (the hook has no
+            // `SkillRun` handle). `cast` clears that flag when it accepts the cast, so a true
+            // value seen here was set by one of this cast's own effects; record it in this
+            // run's state instead of consulting the character flag at refund time.
             if player
                 .as_ref()
                 .is_some_and(|p| p.data().skill_char.skill_cancelled)
