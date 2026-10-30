@@ -41,9 +41,12 @@ impl Command for BotCommand {
             match args.first().map(String::as_str) {
                 Some("add") => {
                     let Some(name) = args.get(1) else {
-                        anyhow::bail!("usage: /bot add <name>");
+                        anyhow::bail!("usage: /bot add <name> [archetype]");
                     };
-                    let character_id = self.host.add(server, name).await?;
+                    let character_id = self
+                        .host
+                        .add(server, name, args.get(2).map(String::as_str))
+                        .await?;
                     out.send_message(&format!("[bot] added '{name}' (character {character_id})"));
                 }
                 Some("remove") => {
@@ -83,6 +86,41 @@ impl Command for BotCommand {
                         character.send_message(&format!("[bot] '{name}' goto: {outcome}"));
                     });
                 }
+                Some("fight") => {
+                    let Some(name) = args.get(1) else {
+                        anyhow::bail!("usage: /bot fight <name> [template-id]");
+                    };
+                    let wanted = match args.get(2) {
+                        Some(t) => vec![t
+                            .parse::<u32>()
+                            .map_err(|_| anyhow::anyhow!("template id is not a number: {t}"))?],
+                        None => Vec::new(),
+                    };
+                    self.host.fight(name, wanted, 60.0).await?;
+                    out.send_message(&format!(
+                        "[bot] '{name}' fighting {} within 60 m",
+                        args.get(2)
+                            .map(|t| format!("template {t}"))
+                            .unwrap_or_else(|| "any monster".into())
+                    ));
+                }
+                Some("grind") => {
+                    let (Some(name), Some(radius)) = (args.get(1), args.get(2)) else {
+                        anyhow::bail!("usage: /bot grind <name> <radius>");
+                    };
+                    let radius = radius
+                        .parse::<f32>()
+                        .map_err(|_| anyhow::anyhow!("radius is not a number: {radius}"))?;
+                    self.host.grind(name, radius).await?;
+                    out.send_message(&format!("[bot] '{name}' grinding within {radius:.0} m"));
+                }
+                Some("stop") => {
+                    let Some(name) = args.get(1) else {
+                        anyhow::bail!("usage: /bot stop <name>");
+                    };
+                    self.host.stop(name).await?;
+                    out.send_message(&format!("[bot] '{name}' stopped"));
+                }
                 Some("list") => {
                     let bots = self.host.list().await;
                     if bots.is_empty() {
@@ -105,16 +143,16 @@ impl Command for BotCommand {
     }
 
     fn get_command_line_help(&self) -> String {
-        "add <name> | remove <name> | list | goto <name> <x> <y> <z>".into()
+        "add <name> [archetype] | remove <name> | list | goto <name> <x> <y> <z> | fight <name> [template] | grind <name> <radius> | stop <name>".into()
     }
 
     fn get_command_help_text(&self) -> String {
-        "Server-side player bots: add logs a character in through the normal session path, remove saves and logs it out, goto walks one to a point with the nav planner.".into()
+        "Server-side player bots: add logs a character in through the normal session path, remove saves and logs it out, goto walks one to a point, fight/grind start combat, stop stops it.".into()
     }
 }
 
 fn help() -> String {
-    "[bot] /bot add <name> | /bot remove <name> | /bot list | /bot goto <name> <x> <y> <z>".into()
+    "[bot] /bot add <name> [archetype] | /bot remove <name> | /bot list | /bot goto <name> <x> <y> <z> | /bot fight <name> [template] | /bot grind <name> <radius> | /bot stop <name>".into()
 }
 
 /// Registers `/bot` on the running server (called by [`crate::install`] only when enabled).

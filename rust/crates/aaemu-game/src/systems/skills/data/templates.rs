@@ -9,7 +9,7 @@ use crate::models::unit::{BonusTemplate, DynamicBonusTemplate, UnitAttribute, Un
 use super::effects::EffectKind;
 
 /// `SkillEffect` (skill_effects rows).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct SkillEffect {
     pub effect_id: u32,
     /// `Template` (`None` when the effect type / id has no template).

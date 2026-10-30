@@ -21,8 +21,10 @@ pub use session::BotSession;
 pub(crate) use session::StepPause;
 pub(crate) use session::WalkSend;
 
+use crate::combat::Mode;
 use crate::nav::movement::Goto;
 use crate::nav::{PlanGate, RoadGraphCache};
+use crate::rotation::ClassData;
 
 /// The scheduler tick: connection commands are serviced this often.
 const HOST_TICK: Duration = Duration::from_millis(250);
@@ -44,6 +46,9 @@ pub struct BotHost {
     plan_gate: Arc<PlanGate>,
     /// The road graphs of this host's server, shared by all its bots.
     roads: RoadGraphCache,
+    /// The archetypes and rotations the bots grow and fight with (`None` without class data:
+    /// combat then scores the skill tables only).
+    class: Option<ClassData>,
     bots: Mutex<HashMap<u32, Arc<BotSession>>>,
 }
 
@@ -53,9 +58,15 @@ impl BotHost {
             server: Arc::downgrade(server),
             plan_gate: Arc::new(PlanGate::new(config.plan_concurrency)),
             roads: RoadGraphCache::default(),
+            class: None,
             config,
             bots: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Installs the class data loaded from `Bots.ArchetypesFile` / `Bots.RotationDir`.
+    pub fn install_class_data(&mut self, class: ClassData) {
+        self.class = Some(class);
     }
 
     /// Spawns the one host task (it exits once the server is dropped).
@@ -67,6 +78,7 @@ impl BotHost {
     async fn run(self: Arc<Self>) {
         let mut ticker = tokio::time::interval(HOST_TICK);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last_report = tokio::time::Instant::now();
         loop {
             ticker.tick().await;
             let Some(server) = self.server.upgrade() else {
@@ -90,16 +102,75 @@ impl BotHost {
                     bot.disconnect(&server).await;
                 }
             }
+            if last_report.elapsed() >= Duration::from_secs(60) {
+                last_report = tokio::time::Instant::now();
+                self.report(&server).await;
+            }
         }
     }
 
-    /// `/bot add <name>`: creates the character on the bot account when missing, then logs it in
-    /// through the real select/spawn/notify path. Returns the character id.
-    pub async fn add(&self, server: &GameServer, name: &str) -> anyhow::Result<u32> {
+    /// One INFO line per bot a minute: the counters an unattended run is judged by.
+    async fn report(&self, server: &GameServer) {
+        let bots: Vec<Arc<BotSession>> = self.bots.lock().await.values().cloned().collect();
+        for bot in bots {
+            let state = bot.brain().lock().await;
+            let (x, y, z) = bot.position().await.unwrap_or((0.0, 0.0, 0.0));
+            let (hp, mp, max_hp, max_mp, battle) =
+                bot.player().await.map_or((0, 0, 1, 1, false), |p| {
+                    let c = p.data();
+                    (
+                        c.unit.hp,
+                        c.unit.mp,
+                        c.unit.max_hp.max(1),
+                        c.unit.max_mp.max(1),
+                        c.unit.is_in_battle,
+                    )
+                });
+            tracing::info!(
+                "Bots: '{}' {:?} hp {hp}/{max_hp} mp {mp}/{max_mp} battle {battle} target {:?} resting {} at ({x:.0}, {y:.0}, {z:.0}) kills {} deaths {} casts {} casts/think max {} out-of-range {} cooldown {} refused {} looted {}",
+                bot.name,
+                state.mode,
+                state.target,
+                state.resting,
+                state.kills,
+                state.deaths,
+                state.casts_started,
+                state.max_casts_per_think,
+                state.casts_out_of_range,
+                state.casts_on_cooldown,
+                state.casts_refused,
+                state.looted_items
+            );
+        }
+        let _ = server;
+    }
+
+    /// `/bot add <name> [archetype]`: creates the character (on the archetype's creation tree
+    /// when it is new) on the bot account, then logs it in through the real
+    /// select/spawn/notify path. Returns the character id.
+    pub async fn add(
+        &self,
+        server: &GameServer,
+        name: &str,
+        archetype: Option<&str>,
+    ) -> anyhow::Result<u32> {
         let name = name.trim();
         if name.is_empty() {
-            anyhow::bail!("usage: /bot add <name>");
+            anyhow::bail!("usage: /bot add <name> [archetype]");
         }
+        let creation_ability = match archetype {
+            Some(key) => match self.class.as_ref().and_then(|c| c.get(key)) {
+                Some(a) => Some(a.creation_ability()),
+                None => anyhow::bail!(
+                    "unknown archetype '{key}' (see /bot list or Bots.ArchetypesFile)"
+                ),
+            },
+            None => self
+                .class
+                .as_ref()
+                .and_then(|c| c.default_archetype())
+                .map(|a| a.creation_ability()),
+        };
         {
             let roster = self.bots.lock().await;
             if roster.len() >= self.config.max_bots {
@@ -112,7 +183,7 @@ impl BotHost {
                 anyhow::bail!("'{name}' is already a live bot");
             }
         }
-        let bot = crate::life::login(server, &self.config, name).await?;
+        let bot = crate::life::login(server, &self.config, name, creation_ability).await?;
         self.adopt(server, bot).await
     }
 
@@ -123,6 +194,12 @@ impl BotHost {
         let character_id = bot.character_id;
         bot.install_plan_gate(self.plan_gate.clone());
         bot.install_road_cache(self.roads.clone());
+        bot.configure(
+            self.class.as_ref(),
+            self.config.max_target_level_gap,
+            self.config.brain_tick_ms,
+        )
+        .await;
         let refusal = {
             let mut roster = self.bots.lock().await;
             if roster.len() >= self.config.max_bots {
@@ -202,6 +279,42 @@ impl BotHost {
         Ok(bot.start_goto(server, target, radius))
     }
 
+    /// `/bot fight <name> [template]`: hunt any monster (or only `template`) within `radius`.
+    pub async fn fight(&self, name: &str, wanted: Vec<u32>, radius: f32) -> anyhow::Result<()> {
+        let Some(bot) = self.bot(name.trim()).await else {
+            anyhow::bail!("no live bot named '{}'", name.trim());
+        };
+        bot.set_mode(Mode::Fight { wanted, radius }).await;
+        Ok(())
+    }
+
+    /// `/bot grind <name> <radius>`: kill and loot around the bot's current position.
+    pub async fn grind(&self, name: &str, radius: f32) -> anyhow::Result<()> {
+        let Some(bot) = self.bot(name.trim()).await else {
+            anyhow::bail!("no live bot named '{}'", name.trim());
+        };
+        let (x, y, _) = bot
+            .position()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("'{}' is not in the world", name.trim()))?;
+        bot.set_mode(Mode::Grind {
+            center: (x, y),
+            radius: radius.max(5.0),
+        })
+        .await;
+        Ok(())
+    }
+
+    /// `/bot stop <name>`: stop hunting (the bot stays logged in).
+    pub async fn stop(&self, name: &str) -> anyhow::Result<()> {
+        let Some(bot) = self.bot(name.trim()).await else {
+            anyhow::bail!("no live bot named '{}'", name.trim());
+        };
+        bot.cancel_navigation();
+        bot.set_mode(Mode::Idle).await;
+        Ok(())
+    }
+
     /// `/bot list`.
     pub async fn list(&self) -> Vec<BotInfo> {
         let bots: Vec<Arc<BotSession>> = self.bots.lock().await.values().cloned().collect();
@@ -234,6 +347,26 @@ mod tests {
     /// roster insert (the test holds the roster), after whatever it does first; the gate
     /// asked for now must already be the host's, because an early `goto` that reaches a bot
     /// without one pins the server-wide fallback gate for good (the first call wins).
+    /// A walk that a newer generation replaced (the combat approach cancels one before a cast)
+    /// is not "walking" any more, even while its task is still unrolling; otherwise the bot
+    /// would wait for it forever.
+    #[tokio::test]
+    async fn a_replaced_walk_is_not_walking() {
+        use aaemu_game::net::socketless::SocketlessConnection;
+        use aaemu_game::systems::skills::controllers::Vec3;
+        use aaemu_game::test_support::{test_character, test_server};
+
+        let server = Arc::new(test_server());
+        server.set_self();
+        let conn = SocketlessConnection::new(&server, 1_000_003);
+        let bot = life::enter_loaded(&server, conn, test_character(3, "Walker", 100.0, 100.0))
+            .expect("the bot enters");
+        bot.start_goto(&server, Vec3::new(200.0, 100.0, 100.0), 1.0);
+        assert!(bot.walking(), "the walk started");
+        bot.bump_nav_generation();
+        assert!(!bot.walking(), "a replaced walk is not running");
+    }
+
     #[tokio::test]
     async fn a_bot_gets_the_hosts_gate_before_it_is_on_the_roster() {
         let server = Arc::new(test_server());

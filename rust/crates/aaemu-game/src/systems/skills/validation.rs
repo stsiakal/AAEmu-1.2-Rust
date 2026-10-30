@@ -175,6 +175,28 @@ pub(super) fn check(
     caster: &WorldObject,
     target: &Target,
 ) -> Result<(), (u8, u32)> {
+    check_with(server, skill, caster, target, false)
+}
+
+/// The cast restrictions of [`check`] without the WARN line of a blocked line of sight: what a
+/// server-side bot asks before it casts, so a refusal never has to reach the server (and never
+/// fills the log with a warning the bot already knows about).
+pub fn precheck(
+    server: &GameServer,
+    skill: &SkillRun,
+    caster: &WorldObject,
+    target: &Target,
+) -> Result<(), (u8, u32)> {
+    check_with(server, skill, caster, target, true)
+}
+
+fn check_with(
+    server: &GameServer,
+    skill: &SkillRun,
+    caster: &WorldObject,
+    target: &Target,
+    quiet: bool,
+) -> Result<(), (u8, u32)> {
     let template = &skill.template;
     // Like the other cast restrictions, this also applies to administrators. A GM's
     // cooldown override does not grant permission to use forbidden tags.
@@ -373,6 +395,9 @@ pub(super) fn check(
                 &ignored,
             ) {
                 // NPC AI retries blocked casts, so only player rejections are warnings.
+                if quiet {
+                    return fail("skill_obstacle");
+                }
                 if let Some(player) = caster.as_player() {
                     let character = player.data().unit.name.clone();
                     tracing::warn!(
