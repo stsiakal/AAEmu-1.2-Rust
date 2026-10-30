@@ -15,9 +15,11 @@ use std::time::{Duration, Instant};
 use aaemu_game::opcodes::sc;
 use anyhow::{bail, ensure, Context};
 
-use super::coreloop::{destroy_item, gm_access, item_stacks, labor_change, ItemStack};
+use super::coreloop::{
+    destroy_item, gm_access, item_stacks, labor_change, run_scenario, ItemStack,
+};
 use super::questitem::gm_command;
-use super::{own_skill_response, skill_response_result, Runner};
+use super::{own_skill_response, skill_response_result, BotConfig, Runner};
 use crate::game::{DoodadInfo, GameClient};
 
 /// Doodad 1671 "Iron Vein" and its start func's gathering skill (10 labor, 4.5 s cast, range 4).
@@ -49,16 +51,22 @@ fn own_new_vein(game: &GameClient, before: &[u32]) -> Option<DoodadInfo> {
         .cloned()
 }
 
-pub(super) async fn run(game: &mut GameClient, r: &mut Runner<'_>) -> anyhow::Result<()> {
+pub(super) async fn run(
+    game: &mut GameClient,
+    cfg: &BotConfig,
+    r: &mut Runner<'_>,
+) -> anyhow::Result<()> {
     gm_access(game, r).await?;
     let mut cleanup = Cleanup::default();
-    let result = run_inner(game, r, &mut cleanup).await;
-    let cleanup_result = cleanup_gather(game, r, &mut cleanup).await;
-    let leave = super::coreloop::leave_world(game).await;
-    result?;
-    cleanup_result?;
-    leave?;
-    Ok(())
+    run_scenario(
+        game,
+        r,
+        cfg.scenario_timeout(),
+        &mut cleanup,
+        |game, r, cleanup| Box::pin(run_inner(game, r, cleanup)),
+        |game, r, cleanup| Box::pin(cleanup_gather(game, r, cleanup)),
+    )
+    .await
 }
 
 async fn run_inner(

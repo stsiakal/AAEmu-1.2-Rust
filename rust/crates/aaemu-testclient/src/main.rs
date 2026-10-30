@@ -7,6 +7,7 @@
 //!                         [--npc-return-distance M] [--npc-return-away-secs S]
 //!                         [--revive-method repair|skill|none]   (mate-revive; GM account needed)
 //!                         [--slot N]   (questchain: spawn-grid slot 0..16, one per parallel bot)
+//!                         [--scenario-timeout S]   (housing|mount|questchain|gather: body limit)
 //! aaemu-testclient parity [--config F] --a H:P --b H:P [--a-label cs] [--b-label rs]
 //!                         [--user U] [--scenario full] [--masks masks.json] [--out-dir D]
 //!                         [--rounds N]
@@ -119,6 +120,7 @@ fn bot_config_with(
         ("quest", "quest_id"),
         ("gs", "game_server_id"),
         ("slot", "slot"),
+        ("scenario-timeout", "scenario_timeout_secs"),
     ] {
         if let Some(x) = args.get(flag) {
             obj.insert(key.into(), x.parse::<u64>()?.into());
@@ -355,6 +357,17 @@ mod slot_flag_tests {
         assert_eq!(config(&[("user", "sk1b4")]).unwrap().slot, None);
         assert!(config(&[("slot", "seven")]).is_err());
         assert!(config(&[("slot", "-1")]).is_err());
+    }
+
+    #[test]
+    fn the_scenario_timeout_flag_reaches_the_bot_config() {
+        let cfg = config(&[("user", "sk1b4"), ("scenario-timeout", "225")]).unwrap();
+        assert_eq!(cfg.scenario_timeout_secs, Some(225));
+        assert_eq!(cfg.scenario_timeout(), std::time::Duration::from_secs(225));
+        let cfg = config(&[("user", "sk1b4")]).unwrap();
+        assert_eq!(cfg.scenario_timeout_secs, None);
+        assert_eq!(cfg.scenario_timeout(), std::time::Duration::from_secs(420));
+        assert!(config(&[("scenario-timeout", "soon")]).is_err());
     }
 }
 

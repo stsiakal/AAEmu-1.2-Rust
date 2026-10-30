@@ -14,7 +14,8 @@ use aaemu_game::opcodes::{cs, sc};
 use anyhow::{ensure, Context};
 
 use super::coreloop::{
-    attached, detached, gm_access, item_stacks, removed_ids, self_position, teleport_to, ItemStack,
+    attached, detached, gm_access, item_stacks, removed_ids, run_scenario, self_position,
+    teleport_to, ItemStack,
 };
 use super::questitem::gm_command;
 use super::{summon_mate, BotConfig, Runner};
@@ -42,13 +43,18 @@ pub(super) async fn run(
 ) -> anyhow::Result<()> {
     gm_access(game, r).await?;
     let mut cleanup = Cleanup::default();
-    let result = run_inner(game, cfg, r, &mut cleanup).await;
-    let cleanup_result = cleanup_mount(game, r, &mut cleanup).await;
-    let leave = super::coreloop::leave_world(game).await;
-    result?;
-    cleanup_result?;
-    leave?;
-    Ok(())
+    // The body owns its copy of the settings: a boxed future may not borrow `cfg` for longer
+    // than the runner it is paired with.
+    let owned = cfg.clone();
+    run_scenario(
+        game,
+        r,
+        cfg.scenario_timeout(),
+        &mut cleanup,
+        move |game, r, cleanup| Box::pin(async move { run_inner(game, &owned, r, cleanup).await }),
+        |game, r, cleanup| Box::pin(cleanup_mount(game, r, cleanup)),
+    )
+    .await
 }
 
 async fn run_inner(

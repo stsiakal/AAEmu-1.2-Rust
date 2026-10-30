@@ -1,14 +1,87 @@
 //! Shared helpers of the core-loop scenarios (`housing`, `mount`, `questchain`, `gather`).
 
+use std::any::Any;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 
 use aaemu_commons::PacketStream;
 use aaemu_game::opcodes::sc;
-use anyhow::{ensure, Context};
+use anyhow::{anyhow, ensure, Context};
+use futures::future::BoxFuture;
+use futures::FutureExt;
 
 use super::questitem::{chat_text, gm_command};
 use super::{BotConfig, Runner, QUIET};
 use crate::game::{GameClient, Packet};
+use crate::record::Recorder;
+
+/// The time limit of a core-loop scenario run (the body, not its cleanup) unless
+/// `--scenario-timeout` says otherwise; housing, the longest, takes about three minutes.
+pub(super) const DEFAULT_SCENARIO_TIMEOUT: Duration = Duration::from_secs(420);
+
+/// The text of a panic payload.
+pub(super) fn panic_message(payload: &(dyn Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|m| (*m).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "(no message)".to_string())
+}
+
+/// Runs a scenario body so that it ends in an error, never in a panic or a hang: a panic is
+/// caught and a body still running after `limit` is dropped at its next await point. Both become
+/// an error naming the step they stopped in, which leaves the caller its turn to clean up.
+pub(super) async fn guarded<F>(rec: &Recorder, limit: Duration, body: F) -> anyhow::Result<()>
+where
+    F: Future<Output = anyhow::Result<()>>,
+{
+    match tokio::time::timeout(limit, AssertUnwindSafe(body).catch_unwind()).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(payload)) => Err(anyhow!(
+            "scenario panicked in step {}: {}",
+            rec.current_step(),
+            panic_message(payload.as_ref())
+        )),
+        Err(_) => Err(anyhow!(
+            "scenario timed out after {limit:?} in step {}",
+            rec.current_step()
+        )),
+    }
+}
+
+/// Runs a core-loop scenario after its GM check: the `body`, then `clean_up` and the leave of the
+/// world whatever became of the body (an error, a panic, the time `limit`), and returns the first
+/// error in that order. The three steps share `state`, which is what the cleanup has to undo.
+pub(super) async fn run_scenario<'r, S, Body, Clean>(
+    game: &mut GameClient,
+    r: &mut Runner<'r>,
+    limit: Duration,
+    state: &mut S,
+    body: Body,
+    clean_up: Clean,
+) -> anyhow::Result<()>
+where
+    Body: for<'a> FnOnce(
+        &'a mut GameClient,
+        &'a mut Runner<'r>,
+        &'a mut S,
+    ) -> BoxFuture<'a, anyhow::Result<()>>,
+    Clean: for<'a> FnOnce(
+        &'a mut GameClient,
+        &'a mut Runner<'r>,
+        &'a mut S,
+    ) -> BoxFuture<'a, anyhow::Result<()>>,
+{
+    let rec = r.rec;
+    let result = guarded(rec, limit, body(game, r, state)).await;
+    let cleanup_result = clean_up(game, r, state).await;
+    let leave = leave_world(game).await;
+    result?;
+    cleanup_result?;
+    leave?;
+    Ok(())
+}
 
 /// Assert that the bot's account may run GM setup commands.
 pub(super) async fn gm_access(game: &mut GameClient, r: &mut Runner<'_>) -> anyhow::Result<()> {
@@ -409,6 +482,7 @@ pub(super) mod tests {
     use aaemu_game::models::item_task::ItemTask;
     use aaemu_game::opcodes::cs;
     use aaemu_game::systems::economy::item_packets::SCItemTaskSuccessPacket;
+    use futures::future::BoxFuture;
     use futures::{SinkExt, StreamExt};
     use tokio::io::DuplexStream;
     use tokio_util::codec::Framed;
@@ -732,5 +806,173 @@ pub(super) mod tests {
             ),
             (7, 900, 172, 42, 2, 1, "house")
         );
+    }
+
+    // ---- the driver: cleanup and leave follow a failed, panicked or overdue body ----
+
+    type Log = Vec<&'static str>;
+
+    async fn finishes(log: &mut Log) -> anyhow::Result<()> {
+        log.push("body");
+        Ok(())
+    }
+
+    async fn fails(log: &mut Log) -> anyhow::Result<()> {
+        log.push("body");
+        anyhow::bail!("the body failed")
+    }
+
+    async fn panics(log: &mut Log) -> anyhow::Result<()> {
+        log.push("body");
+        panic!("boom {}", 7)
+    }
+
+    async fn hangs(log: &mut Log) -> anyhow::Result<()> {
+        log.push("body");
+        std::future::pending().await
+    }
+
+    async fn cleans(log: &mut Log) -> anyhow::Result<()> {
+        log.push("cleanup");
+        Ok(())
+    }
+
+    async fn cleanup_fails(log: &mut Log) -> anyhow::Result<()> {
+        log.push("cleanup");
+        anyhow::bail!("the cleanup failed")
+    }
+
+    /// The server's answer to the leave that ends every run.
+    async fn serve_leave(mut peer: Peer) -> Peer {
+        peer.expect(cs::CSLeaveWorldPacket).await;
+        peer.send(sc::SCPrepareLeaveWorldPacket, &prepare_body(10_000))
+            .await;
+        peer.send(sc::SCLeaveWorldGrantedPacket, &[0]).await;
+        peer
+    }
+
+    /// Runs a scripted scenario of `body` then `clean_up` and returns what it did, its error and
+    /// whether the client left the world at the end.
+    async fn drive<B, C>(limit: Duration, body: B, clean_up: C) -> (Log, anyhow::Result<()>, bool)
+    where
+        B: for<'a> Fn(&'a mut Log) -> BoxFuture<'a, anyhow::Result<()>>,
+        C: for<'a> Fn(&'a mut Log) -> BoxFuture<'a, anyhow::Result<()>>,
+    {
+        let (mut game, peer) = scripted_game();
+        let server = tokio::spawn(serve_leave(peer));
+        let rec = Recorder::new(false);
+        let mut r = Runner {
+            rec: &rec,
+            out: Default::default(),
+        };
+        let _ = r.begin("game.test.build");
+        let mut log = Log::new();
+        let result = run_scenario(
+            &mut game,
+            &mut r,
+            limit,
+            &mut log,
+            |_game, _r, log| body(log),
+            |_game, _r, log| clean_up(log),
+        )
+        .await;
+        let left = server.await.unwrap().received == [cs::CSLeaveWorldPacket];
+        (log, result, left)
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_run_does_its_cleanup_and_leaves() {
+        let (log, result, left) = drive(
+            Duration::from_secs(5),
+            |log| Box::pin(finishes(log)),
+            |log| Box::pin(cleans(log)),
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(log, ["body", "cleanup"]);
+        assert!(left);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_body_ends_in_an_error_after_its_cleanup_and_the_leave() {
+        let (log, result, left) = drive(
+            Duration::from_secs(5),
+            |log| Box::pin(panics(log)),
+            |log| Box::pin(cleans(log)),
+        )
+        .await;
+        assert_eq!(log, ["body", "cleanup"]);
+        let text = format!("{:#}", result.unwrap_err());
+        assert!(
+            text.contains("scenario panicked in step game.test.build: boom 7"),
+            "{text}"
+        );
+        assert!(left, "the client must leave the world after the cleanup");
+    }
+
+    #[tokio::test]
+    async fn a_body_that_runs_out_of_time_is_dropped_and_its_cleanup_still_runs() {
+        let started = std::time::Instant::now();
+        let (log, result, left) = drive(
+            Duration::from_millis(200),
+            |log| Box::pin(hangs(log)),
+            |log| Box::pin(cleans(log)),
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(log, ["body", "cleanup"]);
+        let text = format!("{:#}", result.unwrap_err());
+        assert!(
+            text.contains("scenario timed out after 200ms in step game.test.build"),
+            "{text}"
+        );
+        assert!(left);
+    }
+
+    #[tokio::test]
+    async fn the_first_error_wins_but_everything_still_runs() {
+        let (log, result, left) = drive(
+            Duration::from_secs(5),
+            |log| Box::pin(fails(log)),
+            |log| Box::pin(cleanup_fails(log)),
+        )
+        .await;
+        assert_eq!(log, ["body", "cleanup"]);
+        assert_eq!(result.unwrap_err().to_string(), "the body failed");
+        assert!(left);
+
+        let (log, result, left) = drive(
+            Duration::from_secs(5),
+            |log| Box::pin(finishes(log)),
+            |log| Box::pin(cleanup_fails(log)),
+        )
+        .await;
+        assert_eq!(log, ["body", "cleanup"]);
+        assert_eq!(result.unwrap_err().to_string(), "the cleanup failed");
+        assert!(left);
+    }
+
+    #[tokio::test]
+    async fn guarded_passes_a_result_through_untouched() {
+        let rec = Recorder::new(false);
+        guarded(&rec, Duration::from_secs(5), async { Ok(()) })
+            .await
+            .unwrap();
+        let error = guarded(&rec, Duration::from_secs(5), async {
+            anyhow::bail!("plain failure")
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), "plain failure");
+    }
+
+    #[test]
+    fn panic_messages_are_read_from_both_payload_kinds() {
+        let literal = std::panic::catch_unwind(|| panic!("literal")).unwrap_err();
+        assert_eq!(panic_message(literal.as_ref()), "literal");
+        let formatted = std::panic::catch_unwind(|| panic!("number {}", 3)).unwrap_err();
+        assert_eq!(panic_message(formatted.as_ref()), "number 3");
+        let other = std::panic::catch_unwind(|| std::panic::panic_any(5u8)).unwrap_err();
+        assert_eq!(panic_message(other.as_ref()), "(no message)");
     }
 }

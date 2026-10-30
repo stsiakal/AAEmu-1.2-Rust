@@ -16,10 +16,10 @@ use anyhow::{bail, ensure, Context};
 
 use super::coreloop::{
     added_stack, await_leave, destroy_item, floor_height, gm_access, house_view, item_stacks,
-    teleport_to, HouseView, ItemStack,
+    run_scenario, teleport_to, HouseView, ItemStack,
 };
 use super::questitem::gm_command;
-use super::{own_skill_response, skill_response_result, Runner};
+use super::{own_skill_response, skill_response_result, BotConfig, Runner};
 use crate::game::{GameClient, GameState, Packet};
 
 /// Design 172 "cozy Nuian house" and its design item.
@@ -151,16 +151,22 @@ fn construction_certificates(total: i32) -> i32 {
         / i64::from(COPPER_PER_CERTIFICATE)) as i32
 }
 
-pub(super) async fn run(game: &mut GameClient, r: &mut Runner<'_>) -> anyhow::Result<()> {
+pub(super) async fn run(
+    game: &mut GameClient,
+    cfg: &BotConfig,
+    r: &mut Runner<'_>,
+) -> anyhow::Result<()> {
     gm_access(game, r).await?;
     let mut cleanup = Cleanup::default();
-    let result = run_inner(game, r, &mut cleanup).await;
-    let cleanup_result = cleanup_house(game, r, &mut cleanup).await;
-    let leave = super::coreloop::leave_world(game).await;
-    result?;
-    cleanup_result?;
-    leave?;
-    Ok(())
+    run_scenario(
+        game,
+        r,
+        cfg.scenario_timeout(),
+        &mut cleanup,
+        |game, r, cleanup| Box::pin(run_inner(game, r, cleanup)),
+        |game, r, cleanup| Box::pin(cleanup_house(game, r, cleanup)),
+    )
+    .await
 }
 
 async fn run_inner(

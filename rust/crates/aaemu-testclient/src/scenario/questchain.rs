@@ -21,8 +21,8 @@ use aaemu_game::systems::skills::types::skill_result;
 use anyhow::{bail, ensure, Context};
 
 use super::coreloop::{
-    bot_slot, destroy_item, gm_access, item_stacks, item_stacks_any, slot_offset, spawn_point,
-    teleport_to, ItemStack, SPAWN_TOLERANCE,
+    bot_slot, destroy_item, gm_access, item_stacks, item_stacks_any, run_scenario, slot_offset,
+    spawn_point, teleport_to, ItemStack, SPAWN_TOLERANCE,
 };
 use super::questitem::{chat_text, gm_command, last_quest_state};
 use super::{
@@ -94,13 +94,16 @@ pub(super) async fn run(
 ) -> anyhow::Result<()> {
     gm_access(game, r).await?;
     let mut cleanup = Cleanup::default();
-    let result = run_inner(game, bot_slot(cfg), r, &mut cleanup).await;
-    let cleanup_result = cleanup_quest(game, r, &mut cleanup).await;
-    let leave = super::coreloop::leave_world(game).await;
-    result?;
-    cleanup_result?;
-    leave?;
-    Ok(())
+    let slot = bot_slot(cfg);
+    run_scenario(
+        game,
+        r,
+        cfg.scenario_timeout(),
+        &mut cleanup,
+        |game, r, cleanup| Box::pin(run_inner(game, slot, r, cleanup)),
+        |game, r, cleanup| Box::pin(cleanup_quest(game, r, cleanup)),
+    )
+    .await
 }
 
 async fn run_inner(

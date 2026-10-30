@@ -322,6 +322,12 @@ once. The GM spawn makes the spawner the doodad's owner and the bot only mines t
 object, so bots in parallel at the same spot each mine their own. The ore and the GM-placed vein are removed
 afterwards.
 
+`housing`, `mount`, `questchain` and `gather` end in a failed outcome instead of a dead or hanging client: a panic in
+the scenario body is caught, and a body still running after `--scenario-timeout S` seconds (default 420; the soak
+runner passes its attempt timeout minus 75 s) is dropped at its next await. In both cases the scenario's cleanup
+(demolish, dismount, destroy the items, ...) and the leave of the world still run, and the error names the step the
+body stopped in (`scenario panicked in step ...` / `scenario timed out after ... in step ...`).
+
 `m*` script commands (`aaemu-testclient/src/scenario/music.rs`, used by `rust/verify/musicrun1.vtest` /
 `musicrun2.vtest`) replay the 1.2 client's music wire sequence and fail on a missing callback:
 `mcompose` (item cast 22215, CS122 only after the received own `SCSkillFired`), `mrequest` (CS123 cold /
