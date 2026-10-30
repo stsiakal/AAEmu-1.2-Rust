@@ -470,14 +470,35 @@ impl RouteWalker {
     }
 }
 
+/// The `fallVel` a landing of `height` metres reports: the fall velocity of the zone's curve, or
+/// nothing while it stays below the damage-free speed (`pl_fallDamage_SpeedSafe`, 20 m/s).
+///
+/// The zone forwards a client's fall velocity only above that speed, so a real client's report
+/// below it has no effect. This port forwards it unchanged where its own fall check does not run
+/// (a landing in water, a server without `Physics.FallDamageZoneCap`), and there a safe landing
+/// would hurt a bot above 17 m/s and *heal* it below (the damage curve is negative under
+/// `fallVel` 8600): on the live start area a 9 m drop into the shallow river cost 55 hp and a
+/// jump landing there gave 237 back. The bot's falls are safe by construction, so it reports
+/// none unless a limit changes.
+fn reported_fall_vel(height: f32) -> u16 {
+    use aaemu_game::systems::ai::collision::fall::{height_velocity, SPEED_SAFE};
+
+    if height_velocity(height) >= SPEED_SAFE {
+        aaemu_game::systems::ai::nav::fall_velocity(height)
+    } else {
+        0
+    }
+}
+
 /// One jump in flight: airborne samples, then the landing.
 struct JumpState {
     from: Vec3,
     to: Vec3,
     elapsed: f32,
     /// The `fallVel` of the landing packet: the fall from the jump's apex to the landing
-    /// ([`nav::jump_fall_height`]; a jump rises before it falls). Like a real client, the walker
-    /// reports it in the packet of the touchdown only, never while the bot is still in the air.
+    /// ([`nav::jump_fall_height`]; a jump rises before it falls), `0` while it is damage-free
+    /// ([`reported_fall_vel`]). Like a real client, the walker reports it in the packet of the
+    /// touchdown only, never while the bot is still in the air.
     landing_fall_vel: u16,
 }
 
@@ -500,9 +521,7 @@ impl JumpState {
             from,
             to,
             elapsed: 0.0,
-            landing_fall_vel: aaemu_game::systems::ai::nav::fall_velocity(nav::jump_fall_height(
-                from.z, to.z,
-            )),
+            landing_fall_vel: reported_fall_vel(nav::jump_fall_height(from.z, to.z)),
         }
     }
 
@@ -948,7 +967,7 @@ async fn send_step(
                 GameStanceType::COMBAT,
                 MoveTypeFlags::MOVING,
                 MoveTypeActorFlags(MoveTypeActorFlags::FLAG8.0 | MoveTypeActorFlags::FLAG2.0),
-                aaemu_game::systems::ai::nav::fall_velocity(height),
+                reported_fall_vel(height),
                 run_speed,
             )
             .await?;

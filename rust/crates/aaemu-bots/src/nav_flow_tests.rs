@@ -362,6 +362,31 @@ async fn a_nine_metre_safe_drop_does_not_end_the_walk() {
     );
 }
 
+/// The same drop onto the test world's sea level (z = 100): a landing in water skips the zone's
+/// fall check, which forwards the client's fall velocity unchanged, so a bot that reported its
+/// (safe) 9 m fall there would lose hp (it lost 66 of 1000 before the bot stopped reporting
+/// damage-free falls).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_nine_metre_drop_into_the_sea_takes_no_damage() {
+    let server = nav_server();
+    let bot = bot_at(&server, 2, "Walker", 100.0, 100.0).await;
+    let player = bot.player().await.expect("player");
+    aaemu_game::world::WorldObject::from(player.clone())
+        .with_transform(|t| t.set_xyz(100.0, 100.0, SURFACE + 9.0));
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(25),
+        bot.goto(&server, Vec3::new(130.0, 100.0, SURFACE), 1.0),
+    )
+    .await
+    .expect("the walk finished in time");
+    assert_eq!(outcome, NavOutcome::Arrived);
+    assert_eq!(
+        player.data().unit.hp,
+        1000,
+        "a safe fall into water neither hurts nor heals"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_walk_that_outlasts_its_deadline_times_out() {
     let server = nav_server();

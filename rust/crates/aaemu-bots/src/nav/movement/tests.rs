@@ -1238,24 +1238,39 @@ fn a_jump_reports_its_fall_velocity_on_the_landing_only() {
     use aaemu_game::systems::ai::nav::fall_velocity;
 
     // A flat jump: six airborne samples (no fall velocity in any of them: `JumpTick::Air`
-    // has none), then the touchdown, which falls from the 1.3 m apex.
+    // has none), then the touchdown. It falls only 1.3 m from the apex: damage-free, nothing
+    // to report (the zone would drop it, and in water this port would apply it).
     let (airborne, landing) = fly(Vec3::new(0.0, 0.0, 100.0), Vec3::new(3.0, 0.0, 100.0));
     assert_eq!(airborne, 6);
-    assert_eq!(landing, fall_velocity(nav::JUMP_HEIGHT_M));
-    assert!(landing > 0);
-    // Onto a ledge 1.0 m up: the fall from the apex is 0.3 m.
-    let (_, up) = fly(Vec3::new(0.0, 0.0, 100.0), Vec3::new(2.0, 0.0, 101.0));
-    assert_eq!(up, fall_velocity(0.3));
-    // Down 8 m: 9.3 m from the apex, still below the damage-free 10 m (about 19.3 m/s).
-    let (_, down) = fly(Vec3::new(0.0, 0.0, 100.0), Vec3::new(2.0, 0.0, 92.0));
-    assert_eq!(down, fall_velocity(9.3));
-    assert!(
-        f32::from(down) < 20.0 * aaemu_game::systems::ai::collision::fall::FALL_VEL_UNITS_PER_MPS,
-        "{down}"
+    assert_eq!(landing, 0);
+    // So are a jump onto a ledge and one 8 m down (9.3 m from the apex, below the 10 m).
+    assert_eq!(
+        fly(Vec3::new(0.0, 0.0, 100.0), Vec3::new(2.0, 0.0, 101.0)).1,
+        0
     );
-    // A landing at the apex or above has no fall at all.
-    let (_, none) = fly(Vec3::new(0.0, 0.0, 100.0), Vec3::new(2.0, 0.0, 101.3));
-    assert_eq!(none, 0);
+    assert_eq!(
+        fly(Vec3::new(0.0, 0.0, 100.0), Vec3::new(2.0, 0.0, 92.0)).1,
+        0
+    );
+    // A jump the planner never makes, 12 m down, falls 13.3 m from the apex: the touchdown
+    // reports the apex based velocity, the airborne samples nothing.
+    let (airborne, landing) = fly(Vec3::new(0.0, 0.0, 100.0), Vec3::new(2.0, 0.0, 88.0));
+    assert!(airborne >= 1);
+    assert_eq!(landing, fall_velocity(13.3));
+    assert!(landing > 0);
+}
+
+#[test]
+fn a_safe_fall_reports_no_velocity_and_a_damaging_one_does() {
+    use aaemu_game::systems::ai::nav::fall_velocity;
+
+    // 10 m is where the zone's curve reaches the damage-free 20 m/s.
+    assert_eq!(super::reported_fall_vel(0.0), 0);
+    assert_eq!(super::reported_fall_vel(nav::MAX_SAFE_DROP_M), 0);
+    assert_eq!(super::reported_fall_vel(9.99), 0);
+    assert_eq!(super::reported_fall_vel(10.0), fall_velocity(10.0));
+    assert_eq!(super::reported_fall_vel(25.0), fall_velocity(25.0));
+    assert!(super::reported_fall_vel(10.0) > 0);
 }
 
 #[test]
