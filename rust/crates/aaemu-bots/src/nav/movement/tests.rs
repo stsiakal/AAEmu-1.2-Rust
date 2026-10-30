@@ -1,6 +1,8 @@
 //! Unit tests for the walk state machine, the recovery ladder and the planners; the
 //! server-side flow tests live in `flow_tests.rs`.
 
+use std::sync::Arc;
+
 use aaemu_game::systems::skills::controllers::Vec3;
 
 use super::*;
@@ -26,8 +28,8 @@ fn at(x: f32, y: f32) -> Vec3 {
 /// and a `Replan` request is answered with the height-grid planner (the repath rung with the
 /// avoid circles, a plain replan without them).
 fn drive(
-    walker: &mut RouteWalker<'_>,
-    world: &dyn NavWorld,
+    walker: &mut RouteWalker,
+    world: &Arc<dyn NavWorld + Send + Sync>,
     mut pos: Vec3,
     target: Vec3,
     ticks: usize,
@@ -52,7 +54,7 @@ fn drive(
                 let plan = match avoid {
                     Some(spot) => grid_route(
                         &Avoid {
-                            world,
+                            world: world.clone(),
                             spots: vec![spot],
                             radius: 3.0,
                         },
@@ -61,7 +63,7 @@ fn drive(
                         2.0,
                         100.0,
                     ),
-                    None => grid_route(world, pos, target, 2.0, 100.0),
+                    None => grid_route(world.as_ref(), pos, target, 2.0, 100.0),
                 };
                 walker.set_plan(plan.unwrap_or_else(|| vec![target]), avoid.is_some());
             }
@@ -72,18 +74,18 @@ fn drive(
 
 #[test]
 fn a_flat_route_is_followed_to_the_target() {
-    let world = Flat;
+    let world: Arc<dyn NavWorld + Send + Sync> = Arc::new(Flat);
     let target = at(120.0, 100.0);
-    let mut walker = RouteWalker::new(&world, vec![target], target, 0.5);
+    let mut walker = RouteWalker::new(world.clone(), vec![target], target, 0.5);
     let outcome = drive(&mut walker, &world, at(100.0, 100.0), target, 200);
     assert_eq!(outcome, NavOutcome::Arrived);
 }
 
 #[test]
 fn a_server_refused_leg_replans_and_the_route_still_arrives() {
-    let world = Flat;
+    let world: Arc<dyn NavWorld + Send + Sync> = Arc::new(Flat);
     let target = at(120.0, 100.0);
-    let mut walker = RouteWalker::new(&world, vec![target], target, 0.5);
+    let mut walker = RouteWalker::new(world.clone(), vec![target], target, 0.5);
     let mut now = 0i64;
     let mut action = None;
     // Four blocked steps at the same spot: the first rung is the repath.
@@ -119,9 +121,9 @@ impl NavWorld for Pocket {
 
 #[test]
 fn stuck_goes_through_the_recovery_ladder_to_success() {
-    let world = Pocket;
+    let world: Arc<dyn NavWorld + Send + Sync> = Arc::new(Pocket);
     let target = at(140.0, 100.0);
-    let mut walker = RouteWalker::new(&world, vec![target], target, 0.5);
+    let mut walker = RouteWalker::new(world.clone(), vec![target], target, 0.5);
     // 30 s: 3 blocked steps, the failed repath, then the 5 s rung windows.
     let outcome = drive(&mut walker, &world, at(100.0, 100.0), target, 900);
     assert_eq!(outcome, NavOutcome::Arrived);
@@ -405,4 +407,272 @@ async fn two_plans_run_concurrently() {
     let (a, b) = tokio::join!(a, b);
     assert!(a.expect("plan a"), "the first plan returned no route");
     assert!(b.expect("plan b"), "the second plan returned no route");
+}
+
+#[test]
+fn a_swim_step_is_as_long_as_the_units_swim_speed() {
+    struct Lake;
+    impl NavWorld for Lake {
+        fn height(&self, _x: f32, _y: f32) -> Option<f32> {
+            Some(100.0)
+        }
+        fn water_depth(&self, x: f32, _y: f32, _ground: f32) -> f32 {
+            if x >= 101.0 {
+                3.0
+            } else {
+                0.0
+            }
+        }
+    }
+    let from = Vec3::new(101.0, 100.0, 100.0);
+    let step =
+        nav::next_step_with_speeds(&Lake, from, at(120.0, 100.0), 5.4, 1.5).expect("swim step");
+    assert_eq!(step.action, StepAction::Swim);
+    let horizontal = ((step.to.x - from.x).powi(2) + (step.to.y - from.y).powi(2)).sqrt();
+    assert!((horizontal - 0.15).abs() < 0.01, "{step:?}");
+    let run = nav::next_step_with_speeds(&Lake, at(100.0, 100.0), at(120.0, 100.0), 5.4, 1.5)
+        .expect("run step");
+    assert!((run.to.x - 100.54).abs() < 0.01, "{run:?}");
+}
+
+struct Ledge;
+impl NavWorld for Ledge {
+    fn height(&self, x: f32, _y: f32) -> Option<f32> {
+        Some(if x >= 105.0 { 101.0 } else { 100.0 })
+    }
+}
+
+#[test]
+fn a_jump_onto_a_ledge_never_samples_under_the_terrain() {
+    let from = Vec3::new(104.8, 100.0, 100.0);
+    let step =
+        nav::next_step_with_speeds(&Ledge, from, at(107.0, 100.0), 5.4, 3.0).expect("jump step");
+    assert!(matches!(step.action, StepAction::Jump(_)), "{step:?}");
+    assert!(
+        (step.to.z - 101.0).abs() < 0.01,
+        "lands on the ledge: {step:?}"
+    );
+    for i in 0..=64 {
+        let t = i as f32 / 64.0 * nav::JUMP_AIR_TIME_S;
+        let p = nav::jump_arc(from, step.to, t);
+        let ground = Ledge.height(p.x, p.y).unwrap();
+        assert!(
+            p.z >= ground - 0.1,
+            "sample {t:.3}s at ({:.2}, {:.2}) z={:.2} is under ground {ground:.2}",
+            p.x,
+            p.y,
+            p.z
+        );
+    }
+}
+
+#[test]
+fn a_jump_toward_a_cliff_edge_does_not_land_in_the_air() {
+    struct Deep;
+    impl NavWorld for Deep {
+        fn height(&self, x: f32, _y: f32) -> Option<f32> {
+            Some(if x >= 105.0 { 80.0 } else { 100.0 })
+        }
+    }
+    assert!(
+        nav::next_step_with_speeds(
+            &Deep,
+            Vec3::new(104.8, 100.0, 100.0),
+            at(107.0, 100.0),
+            5.4,
+            3.0
+        )
+        .is_none(),
+        "a 20 m drop must not become a jump"
+    );
+    struct Shallow;
+    impl NavWorld for Shallow {
+        fn height(&self, x: f32, _y: f32) -> Option<f32> {
+            Some(if x >= 105.0 { 97.0 } else { 100.0 })
+        }
+    }
+    let step = nav::next_step_with_speeds(
+        &Shallow,
+        Vec3::new(104.8, 100.0, 100.0),
+        at(107.0, 100.0),
+        5.4,
+        3.0,
+    )
+    .expect("safe drop step");
+    assert!(
+        matches!(step.action, StepAction::Drop(h) if (h - 3.0).abs() < 0.01),
+        "{step:?}"
+    );
+    assert!((step.to.z - 97.0).abs() < 0.01, "lands on the lower ground");
+}
+
+#[test]
+fn a_jump_blocked_by_a_wall_is_rejected_by_the_arc_sweep() {
+    struct Fence;
+    impl NavWorld for Fence {
+        fn height(&self, _x: f32, _y: f32) -> Option<f32> {
+            Some(100.0)
+        }
+        fn obstacle(&self, from: Vec3, to: Vec3) -> Option<Obstacle> {
+            ((from.x < 105.0 && to.x >= 105.0) || (from.x > 106.0 && to.x <= 106.0))
+                .then_some(Obstacle::Low(1.1))
+        }
+        fn jump_clear(&self, _from: Vec3, _to: Vec3) -> Option<bool> {
+            Some(false)
+        }
+    }
+    assert!(
+        nav::next_step(&Fence, at(104.5, 100.0), at(107.0, 100.0)).is_none(),
+        "a blocked arc must not produce a jump"
+    );
+}
+
+#[test]
+fn drop_resets_keep_the_total_and_hit_the_rung_cap() {
+    let mut tracker = nav::StuckTracker::default();
+    let mut now = 0i64;
+    let pos = (100.0, 100.0);
+    let mut labels = Vec::new();
+    for _ in 0..200 {
+        for _ in 0..4 {
+            now += 100;
+            if tracker.blocked(pos, now) {
+                if let Some(label) = tracker.rung(pos, now) {
+                    labels.push(label);
+                }
+            }
+        }
+        tracker.reset();
+    }
+    let abandon = labels
+        .iter()
+        .position(|label| *label == "recovery:abandon")
+        .unwrap_or_else(|| panic!("the total rung cap must survive drop resets: {labels:?}"));
+    assert!(
+        abandon <= nav::MAX_TOTAL_RUNGS as usize,
+        "abandon came after {abandon} rungs: {labels:?}"
+    );
+}
+
+#[test]
+fn a_long_walk_gets_a_route_scaled_deadline() {
+    let now = tokio::time::Instant::now();
+    let short = super::walk_deadline(&[], at(0.0, 0.0), 5.4);
+    assert!(short > now && short <= now + std::time::Duration::from_secs(31));
+    let long = super::walk_deadline(&[at(0.0, 0.0), at(100_000.0, 0.0)], at(0.0, 0.0), 5.4);
+    assert!(long <= now + std::time::Duration::from_secs(1_801));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fifty_plans_respect_the_plan_gate() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let gate = Arc::new(nav::PlanGate::new(4));
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let mut tasks = Vec::new();
+    for _ in 0..50 {
+        let gate = gate.clone();
+        let active = active.clone();
+        let peak = peak.clone();
+        tasks.push(tokio::spawn(async move {
+            let _permit = gate.acquire().await;
+            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            active.fetch_sub(1, Ordering::SeqCst);
+        }));
+    }
+    for task in tasks {
+        task.await.expect("a plan task panicked");
+    }
+    assert!(
+        peak.load(Ordering::SeqCst) <= 4,
+        "the gate admitted {} plans",
+        peak.load(Ordering::SeqCst)
+    );
+}
+
+struct BlockingWorld {
+    started: Arc<std::sync::atomic::AtomicBool>,
+    release: Arc<std::sync::atomic::AtomicBool>,
+}
+impl NavWorld for BlockingWorld {
+    fn height(&self, _x: f32, _y: f32) -> Option<f32> {
+        use std::sync::atomic::Ordering;
+        self.started.store(true, Ordering::SeqCst);
+        while !self.release.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        Some(100.0)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_plan_stops_within_the_budget() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let flag = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let world: Arc<dyn NavWorld + Send + Sync> = Arc::new(BlockingWorld {
+        started: started.clone(),
+        release: release.clone(),
+    });
+    let handle = tokio::spawn(nav::plan_guarded(
+        world,
+        at(0.0, 0.0),
+        at(600.0, 40.0),
+        Arc::new(nav::PlanGate::new(1)),
+        nav::PlanCancel::from_flag(flag.clone()),
+    ));
+    while !started.load(Ordering::SeqCst) {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    flag.store(true, Ordering::SeqCst);
+    release.store(true, Ordering::SeqCst);
+    let report = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+        .await
+        .expect("the cancelled plan stopped in time")
+        .expect("the plan task panicked")
+        .expect("the plan gate returned no report");
+    assert!(report.plan.is_none(), "{report:?}");
+}
+
+struct BlockedRoadWorld;
+impl NavWorld for BlockedRoadWorld {
+    fn height(&self, _x: f32, _y: f32) -> Option<f32> {
+        Some(100.0)
+    }
+    fn nav_route(&self, from: Vec3, to: Vec3) -> Option<Vec<Vec3>> {
+        (((to.x - from.x).powi(2) + (to.y - from.y).powi(2)).sqrt() <= nav::NAV_DIRECT_MAX_M)
+            .then_some(vec![to])
+    }
+    fn road_route(&self, _from: Vec3, _to: Vec3) -> Option<Vec<Vec3>> {
+        Some(vec![at(10.0, 0.0), at(500.0, 0.0), at(990.0, 0.0)])
+    }
+    fn obstacle(&self, from: Vec3, to: Vec3) -> Option<Obstacle> {
+        ((from.x < 500.0 && to.x >= 500.0) || (from.x > 500.0 && to.x <= 500.0))
+            .then_some(Obstacle::High(3.0))
+    }
+}
+
+#[test]
+fn a_road_route_through_a_wall_is_rejected() {
+    let report = nav::plan_explain(&BlockedRoadWorld, at(10.0, 5.0), at(990.0, 5.0));
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.contains("roads: segment rejected")),
+        "{:?}",
+        report.notes
+    );
+    assert_ne!(report.planner(), "roads");
+}
+
+#[test]
+fn a_road_further_than_the_access_limit_is_not_used() {
+    let graph = nav::RoadGraph::from_roads([vec![at(0.0, 0.0), at(100.0, 0.0)]]);
+    assert!(graph.route(at(0.0, 200.0), at(100.0, 0.0)).is_none());
 }

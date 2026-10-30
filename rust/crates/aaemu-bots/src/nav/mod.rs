@@ -24,6 +24,8 @@ pub mod movement;
 pub mod roads;
 
 use std::collections::BinaryHeap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use aaemu_game::server::GameServer;
 use aaemu_game::systems::ai::nav::NavView;
@@ -65,14 +67,70 @@ pub const GOAL_TOLERANCE_M: f32 = 3.5;
 const SNAP_CELLS: i32 = 8;
 pub const STOP_DISTANCE: f32 = 0.35;
 
-/// Node expansions one plan may spend (the height grid A* is the expensive planner).
-pub const PLAN_MAX_NODES: usize = 500_000;
+/// Work units one plan may spend (the height grid prefill, A* expansions and collision queries
+/// all count). The height grid A* is the expensive planner.
+pub const PLAN_MAX_NODES: usize = 1_000_000;
 /// Wall clock one plan may spend, in milliseconds.
 pub const PLAN_MAX_MS: u64 = 5_000;
+/// Cells one height grid may allocate (`heights`, water cache, g / parent / closed): about 7 MB
+/// per plan at 400k cells, so four concurrent plans stay small.
+pub const MAX_GRID_CELLS: usize = 400_000;
+/// Concurrent plans allowed by default (configurable through `Bots.PlanConcurrency`).
+pub const DEFAULT_PLAN_CONCURRENCY: usize = 4;
 
-/// The work limit of one plan: a bounded node count and a deadline. Every A* created by
-/// [`plan_explain`] shares one budget, so a route with several attempted planners cannot stall
-/// a blocking worker indefinitely.
+/// Cancels the plan of a walk that a newer `goto` replaced (or a bot that left the world).
+#[derive(Debug, Clone, Default)]
+pub struct PlanCancel {
+    flag: Option<Arc<AtomicBool>>,
+    generation: Option<(Arc<AtomicU64>, u64)>,
+}
+
+impl PlanCancel {
+    /// A token that never cancels.
+    pub fn never() -> Self {
+        Self::default()
+    }
+
+    /// A token from a plain flag (tests).
+    pub fn from_flag(flag: Arc<AtomicBool>) -> Self {
+        Self {
+            flag: Some(flag),
+            generation: None,
+        }
+    }
+
+    /// A token that is cancelled once `counter` no longer equals `expected`.
+    pub fn generation(counter: Arc<AtomicU64>, expected: u64) -> Self {
+        Self {
+            flag: None,
+            generation: Some((counter, expected)),
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        if self
+            .flag
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::Relaxed))
+        {
+            return true;
+        }
+        self.generation
+            .as_ref()
+            .is_some_and(|(counter, expected)| counter.load(Ordering::Relaxed) != *expected)
+    }
+
+    /// Waits (bounded polling) until the token is cancelled.
+    pub async fn cancelled(&self) {
+        while !self.is_cancelled() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+}
+
+/// The work limit of one plan: a bounded work count, a deadline and a cancellation token.
+/// Every A* and every collision query of [`plan_explain`] shares one budget, so a route with
+/// several attempted planners cannot stall a blocking worker indefinitely.
 #[derive(Debug)]
 pub struct PlanBudget {
     max_nodes: usize,
@@ -80,6 +138,7 @@ pub struct PlanBudget {
     deadline: std::time::Instant,
     max_ms: u64,
     stopped: bool,
+    cancel: PlanCancel,
 }
 
 impl PlanBudget {
@@ -94,20 +153,55 @@ impl PlanBudget {
             deadline: std::time::Instant::now() + std::time::Duration::from_millis(max_ms),
             max_ms,
             stopped: false,
+            cancel: PlanCancel::never(),
         }
     }
 
-    /// Counts one expanded node; `false` when the plan must stop.
+    /// The same budget with a cancellation token.
+    pub fn with_cancel(mut self, cancel: PlanCancel) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
+    /// Counts one unit of work (an expanded node, a grid cell, a collision query); `false`
+    /// when the plan must stop.
     pub fn tick(&mut self) -> bool {
-        self.expanded += 1;
+        self.charge(1)
+    }
+
+    /// Counts `units` units of work at once (the height grid prefill); `false` when the plan
+    /// must stop.
+    pub fn charge(&mut self, units: usize) -> bool {
+        if self.stopped {
+            return false;
+        }
+        if self.cancel.is_cancelled() {
+            self.stopped = true;
+            return false;
+        }
+        self.expanded = self.expanded.saturating_add(units);
         if self.expanded > self.max_nodes {
             self.stopped = true;
             return false;
         }
-        // Checking the clock every step is needlessly expensive in the inner loop.
-        if self.expanded.is_multiple_of(256)
-            && self.deadline.elapsed().as_millis() as u64 > self.max_ms
-        {
+        // The clock is read in batches; the node cap above is exact, and a batch is small
+        // enough that the wall-clock limit is effectively hard.
+        if self.expanded.is_multiple_of(64) {
+            std::thread::yield_now();
+            if self.deadline.elapsed().as_millis() as u64 > self.max_ms {
+                self.stopped = true;
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Checks cancellation / the deadline without spending work.
+    pub fn poll(&mut self) -> bool {
+        if self.stopped {
+            return false;
+        }
+        if self.cancel.is_cancelled() || self.deadline.elapsed().as_millis() as u64 > self.max_ms {
             self.stopped = true;
             return false;
         }
@@ -118,7 +212,7 @@ impl PlanBudget {
         self.expanded
     }
 
-    /// Did a search hit the node or time limit?
+    /// Did a search hit the work, time or cancellation limit?
     pub fn stopped(&self) -> bool {
         self.stopped
     }
@@ -128,6 +222,49 @@ impl Default for PlanBudget {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The semaphore that bounds concurrent plans across the server. A plan is a blocking worker
+/// doing terrain / collision queries; without the gate a `/bot goto` burst could occupy every
+/// blocking thread and starve the collision lock.
+#[derive(Debug)]
+pub struct PlanGate {
+    sem: Arc<tokio::sync::Semaphore>,
+    max: usize,
+}
+
+impl PlanGate {
+    pub fn new(max: usize) -> Self {
+        let max = max.max(1);
+        Self {
+            sem: Arc::new(tokio::sync::Semaphore::new(max)),
+            max,
+        }
+    }
+
+    pub fn max(&self) -> usize {
+        self.max
+    }
+
+    pub fn available(&self) -> usize {
+        self.sem.available_permits()
+    }
+
+    pub async fn acquire(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.sem
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("the plan gate is never closed")
+    }
+}
+
+/// The server-wide gate used by bots whose host did not install its configured one (tests,
+/// direct `BotSession` use).
+pub fn global_plan_gate() -> Arc<PlanGate> {
+    static GATE: OnceLock<Arc<PlanGate>> = OnceLock::new();
+    GATE.get_or_init(|| Arc::new(PlanGate::new(DEFAULT_PLAN_CONCURRENCY)))
+        .clone()
 }
 
 /// A static obstacle between two points.
@@ -159,8 +296,26 @@ pub trait NavWorld: Send + Sync {
         let _ = (from, to);
         None
     }
+    /// [`NavWorld::road_route`] charged against the plan budget (the road A* is bounded).
+    fn road_route_budget(
+        &self,
+        from: Vec3,
+        to: Vec3,
+        budget: &mut PlanBudget,
+    ) -> Option<Vec<Vec3>> {
+        if !budget.tick() {
+            return None;
+        }
+        self.road_route(from, to)
+    }
     /// The static obstacle crossed by the straight segment, if any.
     fn obstacle(&self, from: Vec3, to: Vec3) -> Option<Obstacle> {
+        let _ = (from, to);
+        None
+    }
+    /// Is the whole jump arc `from` -> `to` free of static geometry? `None` when the world has
+    /// no collision service (the caller then accepts the jump, as the pure tests do).
+    fn jump_clear(&self, from: Vec3, to: Vec3) -> Option<bool> {
         let _ = (from, to);
         None
     }
@@ -181,13 +336,13 @@ pub struct Plan {
 /// A world view that refuses to cross small circles (the recovery ladder's first rung and the
 /// spots a bot got stuck at earlier). A segment that starts inside a circle may leave it, so a
 /// bot standing in the very spot it avoids can still walk out.
-pub struct Avoid<'a> {
-    pub world: &'a dyn NavWorld,
+pub struct Avoid {
+    pub world: Arc<dyn NavWorld + Send + Sync>,
     pub spots: Vec<(f32, f32)>,
     pub radius: f32,
 }
 
-impl NavWorld for Avoid<'_> {
+impl NavWorld for Avoid {
     fn height(&self, x: f32, y: f32) -> Option<f32> {
         self.world.height(x, y)
     }
@@ -204,6 +359,15 @@ impl NavWorld for Avoid<'_> {
         self.world.road_route(from, to)
     }
 
+    fn road_route_budget(
+        &self,
+        from: Vec3,
+        to: Vec3,
+        budget: &mut PlanBudget,
+    ) -> Option<Vec<Vec3>> {
+        self.world.road_route_budget(from, to, budget)
+    }
+
     fn obstacle(&self, from: Vec3, to: Vec3) -> Option<Obstacle> {
         for spot in &self.spots {
             if !segment_near((from.x, from.y), (to.x, to.y), *spot, self.radius) {
@@ -216,6 +380,10 @@ impl NavWorld for Avoid<'_> {
             }
         }
         self.world.obstacle(from, to)
+    }
+
+    fn jump_clear(&self, from: Vec3, to: Vec3) -> Option<bool> {
+        self.world.jump_clear(from, to)
     }
 
     fn zone_at(&self, x: f32, y: f32) -> Option<u32> {
@@ -238,6 +406,19 @@ impl NavWorld for Retrace<'_> {
 
     fn road_route(&self, from: Vec3, to: Vec3) -> Option<Vec<Vec3>> {
         self.0.road_route(from, to)
+    }
+
+    fn road_route_budget(
+        &self,
+        from: Vec3,
+        to: Vec3,
+        budget: &mut PlanBudget,
+    ) -> Option<Vec<Vec3>> {
+        self.0.road_route_budget(from, to, budget)
+    }
+
+    fn jump_clear(&self, from: Vec3, to: Vec3) -> Option<bool> {
+        self.0.jump_clear(from, to)
     }
 
     fn zone_at(&self, x: f32, y: f32) -> Option<u32> {
@@ -305,10 +486,47 @@ pub fn plan(world: &dyn NavWorld, from: Vec3, to: Vec3) -> Option<Plan> {
 
 /// [`plan`] with the reasons each rejected planner gave.
 pub fn plan_explain(world: &dyn NavWorld, from: Vec3, to: Vec3) -> PlanReport {
+    plan_explain_budget(world, from, to, PlanBudget::new())
+}
+
+/// [`plan_explain`] sharing an existing budget (the walk's cancellation token and limits).
+pub fn plan_explain_budget(
+    world: &dyn NavWorld,
+    from: Vec3,
+    to: Vec3,
+    mut budget: PlanBudget,
+) -> PlanReport {
     let mut notes = Vec::new();
-    let mut budget = PlanBudget::new();
     let plan = plan_inner(world, from, to, &mut budget, &mut notes);
+    if plan.is_none() && budget.stopped() {
+        notes.push("plan budget exhausted (time / work / cancelled)".into());
+    }
     PlanReport { plan, notes }
+}
+
+/// Runs `plan_explain` under the concurrent-plan gate; `None` when the walk was cancelled
+/// before or while waiting for a permit.
+pub async fn plan_guarded(
+    world: Arc<dyn NavWorld + Send + Sync>,
+    from: Vec3,
+    to: Vec3,
+    gate: Arc<PlanGate>,
+    cancel: PlanCancel,
+) -> Option<PlanReport> {
+    if cancel.is_cancelled() {
+        return None;
+    }
+    let permit = tokio::select! {
+        permit = gate.acquire() => permit,
+        _ = cancel.cancelled() => return None,
+    };
+    let report = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        plan_explain_budget(&*world, from, to, PlanBudget::new().with_cancel(cancel))
+    })
+    .await
+    .ok()?;
+    Some(report)
 }
 
 fn plan_inner(
@@ -319,9 +537,12 @@ fn plan_inner(
     notes: &mut Vec<String>,
 ) -> Option<Plan> {
     let dist = dist2(from, to);
+    if !budget.poll() {
+        return None;
+    }
     // Beyond the navmesh range the transfer-road graph gives the long middle of the route.
     if dist > NAV_DIRECT_MAX_M {
-        if let Some(roads) = world.road_route(from, to) {
+        if let Some(roads) = world.road_route_budget(from, to, budget) {
             match plan_road_route(world, from, to, &roads, budget) {
                 Ok(plan) => return Some(plan),
                 Err(why) => notes.push(why),
@@ -329,12 +550,21 @@ fn plan_inner(
         }
     }
     if dist <= NAV_DIRECT_MAX_M {
+        if !budget.tick() {
+            return None;
+        }
         match world.nav_route(from, to) {
             Some(nav) if !nav.is_empty() => {
+                if !budget.charge(nav.len()) {
+                    return None;
+                }
                 let mut prev = from;
                 let mut rejected = None;
                 for p in &nav {
-                    if let Err(why) = segment_check(world, prev, *p) {
+                    if let Err(why) = segment_check(world, prev, *p, budget) {
+                        if budget.stopped() {
+                            return None;
+                        }
                         rejected = Some(format!(
                             "navmesh: segment ({:.1}, {:.1}) -> ({:.1}, {:.1}) rejected: {why}",
                             prev.x, prev.y, p.x, p.y
@@ -359,27 +589,39 @@ fn plan_inner(
     } else {
         notes.push(format!("navmesh: skipped (distance {dist:.0} m)"));
     }
+    // The fine grid stays inside a box around the two points; a route that must go round a
+    // cliff far outside it is found by the coarse corridor below. Its diagnostics come from
+    // the same search, so a failed route does not pay for a second full grid run.
+    let mut fine_note = None;
     if dist <= 700.0 {
-        if let Some(points) = grid_route_budget(world, from, to, 2.0, 200.0, budget) {
+        let stats = std::cell::RefCell::new(GridStats::default());
+        if let Some(points) = grid_search(
+            world,
+            from,
+            to,
+            2.0,
+            200.0,
+            GridMode::Fine,
+            Some(&stats),
+            budget,
+        ) {
             return Some(Plan {
                 points,
                 source: "heightmap",
             });
         }
-        // The fine grid stays inside a box around the two points; a route that must go round
-        // a cliff far outside it is found by the coarse corridor below.
-        notes.push(format!(
-            "heightmap: {}",
-            grid_failure(world, from, to, budget)
+        fine_note = Some(format!(
+            "heightmap: no route: every candidate path is blocked; {}",
+            stats.borrow().describe((to.x, to.y))
         ));
     }
     let Some(coarse) = coarse_route(world, from, to, budget) else {
-        notes.push(format!(
-            "heightmap: {}",
-            grid_failure(world, from, to, budget)
-        ));
+        notes.push(fine_note.unwrap_or_else(|| "heightmap: no route".into()));
         return None;
     };
+    if let Some(note) = fine_note {
+        notes.push(note);
+    }
     // Chain legs of about NAV_LEG_M along the coarse corridor. Each leg is walked on the best
     // planner that can do it: the navmesh, else the coarse segment when it passes the walker's
     // terrain / obstacle rules, else a fine 2 m terrain A* confined to the leg.
@@ -402,14 +644,23 @@ fn plan_inner(
     for end in anchors {
         let leg_to = coarse[end];
         let coarse_leg = &coarse[leg_start..=end];
+        if !budget.tick() {
+            return None;
+        }
         let nav_leg = world.nav_route(leg_from, leg_to).filter(|points| {
+            if !budget.charge(points.len()) {
+                return false;
+            }
             let mut prev = leg_from;
             points.iter().all(|p| {
-                let ok = segment_check(world, prev, *p).is_ok();
+                let ok = segment_check(world, prev, *p, budget).is_ok();
                 prev = *p;
                 ok
             })
         });
+        if budget.stopped() {
+            return None;
+        }
         if let Some(points) = nav_leg {
             route.extend(points);
             legs_nav += 1;
@@ -417,10 +668,13 @@ fn plan_inner(
             legs_grid += 1;
             let mut prev = leg_from;
             let coarse_ok = coarse_leg.iter().all(|p| {
-                let ok = segment_check(world, prev, *p).is_ok();
+                let ok = segment_check(world, prev, *p, budget).is_ok();
                 prev = *p;
                 ok
             });
+            if budget.stopped() {
+                return None;
+            }
             if coarse_ok {
                 route.extend(coarse_leg.iter().copied());
             } else if let Some(fine) = grid_route_budget(world, leg_from, leg_to, 2.0, 60.0, budget)
@@ -464,6 +718,33 @@ fn plan_road_route(
     let (Some(&first), Some(&last)) = (roads.first(), roads.last()) else {
         return Err("roads: empty route".into());
     };
+    // Both ends must be close to the network and the road itself must not be a long detour
+    // compared with walking straight (a 1 km snap made "roads" win over every other planner).
+    let access = dist2(from, first) + dist2(last, to);
+    if dist2(from, first) > roads::MAX_SNAP_M || dist2(last, to) > roads::MAX_SNAP_M {
+        return Err(format!(
+            "roads: access legs too long ({:.0} m / {:.0} m)",
+            dist2(from, first),
+            dist2(last, to)
+        ));
+    }
+    let mut road_len = 0.0f32;
+    let mut prev = first;
+    for p in roads.iter().skip(1) {
+        segment_check_coarse(world, prev, *p, budget)
+            .map_err(|why| format!("roads: segment rejected: {why}"))?;
+        road_len += dist3(prev, *p);
+        prev = *p;
+    }
+    let straight = dist3(from, to).max(1.0);
+    if road_len > 1.5 * straight + access {
+        return Err(format!(
+            "roads: detour {road_len:.0} m for a {straight:.0} m trip"
+        ));
+    }
+    if budget.stopped() {
+        return Err("roads: plan budget exhausted".into());
+    }
     let head = plan_leg(world, from, first, budget)
         .ok_or_else(|| "roads: no first leg to the road network".to_string())?;
     let tail = plan_leg(world, last, to, budget)
@@ -493,14 +774,20 @@ fn plan_leg(
         return Some(vec![to]);
     }
     if dist <= NAV_DIRECT_MAX_M + NAV_LEG_M {
+        if !budget.tick() {
+            return None;
+        }
         if let Some(nav) = world.nav_route(from, to) {
+            if !budget.charge(nav.len()) {
+                return None;
+            }
             let mut prev = from;
             let checked = nav.iter().all(|p| {
-                let ok = segment_check(world, prev, *p).is_ok();
+                let ok = segment_check(world, prev, *p, budget).is_ok();
                 prev = *p;
                 ok
             });
-            if checked && !nav.is_empty() {
+            if checked && !nav.is_empty() && !budget.stopped() {
                 return Some(nav);
             }
         }
@@ -520,9 +807,12 @@ fn coarse_route(
     let dist = dist2(from, to);
     let margin = (dist * 0.2).clamp(500.0, 1500.0);
     for step in [2.0f32, 4.0, 6.0, 8.0, 12.0, 16.0] {
+        if !budget.poll() {
+            return None;
+        }
         let w = ((to.x - from.x).abs() + 2.0 * margin) / step + 2.0;
         let h = ((to.y - from.y).abs() + 2.0 * margin) / step + 2.0;
-        if w * h <= 850_000.0 {
+        if w * h <= MAX_GRID_CELLS as f32 {
             // Keep off cells beside a cliff first (the corridor then runs down the middle of
             // a pass instead of hugging its wall), then accept them.
             for mode in [GridMode::CoarseKeepOff, GridMode::Coarse] {
@@ -658,7 +948,6 @@ fn grid_search(
     budget: &mut PlanBudget,
 ) -> Option<Vec<Vec3>> {
     let coarse = mode != GridMode::Fine;
-    const MAX_NODES: usize = 900_000;
     let (min_x, min_y) = (from.x.min(to.x) - margin, from.y.min(to.y) - margin);
     let (max_x, max_y) = (from.x.max(to.x) + margin, from.y.max(to.y) + margin);
     let min_x = min_x.max(0.0);
@@ -666,16 +955,32 @@ fn grid_search(
     let w = (((max_x - min_x) / step).ceil() as i32 + 1).max(2);
     let h = (((max_y - min_y) / step).ceil() as i32 + 1).max(2);
     let n = w as usize * h as usize;
-    if n > MAX_NODES {
+    if n > MAX_GRID_CELLS {
+        return None;
+    }
+    // The height prefill is the dominant cost of a coarse corridor: count every cell and stop
+    // as soon as the plan budget or the walk's cancellation token says so.
+    if !budget.charge(n) {
+        if let Some(st) = stats {
+            st.borrow_mut().budget_exhausted = true;
+        }
         return None;
     }
     let idx = |ix: i32, iy: i32| (ix * h + iy) as usize;
     let pos = |ix: i32, iy: i32| Vec3::new(min_x + ix as f32 * step, min_y + iy as f32 * step, 0.0);
     let mut heights = vec![f32::NAN; n];
+    let mut prefilled = 0usize;
     for ix in 0..w {
         for iy in 0..h {
             let (x, y) = (pos(ix, iy).x, pos(ix, iy).y);
             heights[idx(ix, iy)] = world.height(x, y).unwrap_or(f32::NAN);
+            prefilled += 1;
+            if prefilled.is_multiple_of(4096) && !budget.poll() {
+                if let Some(st) = stats {
+                    st.borrow_mut().budget_exhausted = true;
+                }
+                return None;
+            }
         }
     }
     let goal = (
@@ -751,14 +1056,42 @@ fn grid_search(
     // Water depth per cell, asked once (the collision water query is the expensive part of a
     // coarse corridor over hundreds of thousands of cells).
     let water_cache = std::cell::RefCell::new(vec![f32::NAN; n]);
+    // Every collision query the plan spends is counted after the expansion; the water cache
+    // avoids asking the same cell twice, the small direct-mapped obstacle cache avoids the
+    // repeated capsule sweeps of neighbouring expansions.
+    let queries = std::cell::Cell::new(0usize);
     let water_at = |i: usize, x: f32, y: f32, ground: f32| -> f32 {
         let cached = water_cache.borrow()[i];
         if !cached.is_nan() {
             return cached;
         }
+        queries.set(queries.get() + 1);
         let depth = world.water_depth(x, y, ground);
         water_cache.borrow_mut()[i] = depth;
         depth
+    };
+    const OBSTACLE_CACHE: usize = 1 << 14;
+    let obstacle_cache = std::cell::RefCell::new(vec![(u64::MAX, 0u8); OBSTACLE_CACHE]);
+    let obstacle_at = |a: usize, b: usize, a3: Vec3, b3: Vec3| -> Option<Obstacle> {
+        let key = ((a as u64) << 32) | b as u64;
+        let slot = (key.wrapping_mul(0x9E37_79B1_9E37_79B1) >> 50) as usize & (OBSTACLE_CACHE - 1);
+        let (cached_key, cached) = obstacle_cache.borrow()[slot];
+        if cached_key == key && cached != 0 {
+            return match cached {
+                1 => None,
+                2 => Some(Obstacle::Low(0.0)),
+                _ => Some(Obstacle::High(JUMP_HEIGHT_M + 0.1)),
+            };
+        }
+        queries.set(queries.get() + 1);
+        let obstacle = world.obstacle(a3, b3);
+        let value = match obstacle {
+            None => 1,
+            Some(Obstacle::Low(_)) => 2,
+            Some(Obstacle::High(_)) => 3,
+        };
+        obstacle_cache.borrow_mut()[slot] = (key, value);
+        obstacle
     };
     let cost = |a: usize, b: usize, d: f32| -> Option<f32> {
         let (ha, hb) = (heights[a], heights[b]);
@@ -787,7 +1120,7 @@ fn grid_search(
         let obstacle = if a == start_i {
             None
         } else {
-            world.obstacle(a3, b3)
+            obstacle_at(a, b, a3, b3)
         };
         if let Some(obstacle) = obstacle {
             // A fence is jumped, but a "low obstacle" the sweep reports on a steep hillside is
@@ -916,6 +1249,13 @@ fn grid_search(
             parent[ni] = current as i32;
             open.push((std::cmp::Reverse(((ng + heuristic(ni)) * 100.0) as u64), ni));
         }
+        let spent = queries.replace(0);
+        if !budget.charge(spent) {
+            if let Some(st) = stats {
+                st.borrow_mut().budget_exhausted = true;
+            }
+            return None;
+        }
     }
     let mut goal_i = goal_i;
     let mut reached_goal = true;
@@ -997,13 +1337,55 @@ fn terrain_step_ok(d: f32, dz: f32) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// The jump arc at `t` seconds: a straight interpolation from `from` to the landing `to`
+/// plus the vertical jump parabola. At `t = JUMP_AIR_TIME_S` it ends exactly at `to.z` (a
+/// ledge up to `JUMP_HEIGHT_M` above, or a safe drop below), never at the take-off height.
+pub fn jump_arc(from: Vec3, to: Vec3, t: f32) -> Vec3 {
+    let t = t.clamp(0.0, JUMP_AIR_TIME_S);
+    let k = if JUMP_AIR_TIME_S > 0.0 {
+        t / JUMP_AIR_TIME_S
+    } else {
+        1.0
+    };
+    Vec3::new(
+        from.x + (to.x - from.x) * k,
+        from.y + (to.y - from.y) * k,
+        from.z + (to.z - from.z) * k + JUMP_SPEED_MPS * t - 0.5 * JUMP_GRAVITY * t * t,
+    )
+}
+
 /// Walks the straight segment in 2 m samples and applies the same terrain / obstacle rules
 /// the step executor and the grid planner use, so a long navmesh leg that gently climbs a
 /// few metres is not mistaken for one impossible step.
-fn segment_check(world: &dyn NavWorld, from: Vec3, to: Vec3) -> Result<(), String> {
-    const SAMPLE_M: f32 = 2.0;
+fn segment_check(
+    world: &dyn NavWorld,
+    from: Vec3,
+    to: Vec3,
+    budget: &mut PlanBudget,
+) -> Result<(), String> {
+    segment_check_step(world, from, to, 2.0, budget)
+}
+
+/// [`segment_check`] at a coarser sampling (the road graph's long edges): every sample is a
+/// collision query and counts against the plan budget.
+fn segment_check_coarse(
+    world: &dyn NavWorld,
+    from: Vec3,
+    to: Vec3,
+    budget: &mut PlanBudget,
+) -> Result<(), String> {
+    segment_check_step(world, from, to, 16.0, budget)
+}
+
+fn segment_check_step(
+    world: &dyn NavWorld,
+    from: Vec3,
+    to: Vec3,
+    sample_m: f32,
+    budget: &mut PlanBudget,
+) -> Result<(), String> {
     let d = dist2(from, to);
-    let n = (d / SAMPLE_M).ceil().max(1.0) as usize;
+    let n = (d / sample_m).ceil().max(1.0) as usize;
     // The walker stands on the surface: use its height, not a possibly off-by-a-bit `from.z`.
     let mut prev = Vec3::new(
         from.x,
@@ -1011,6 +1393,9 @@ fn segment_check(world: &dyn NavWorld, from: Vec3, to: Vec3) -> Result<(), Strin
         world.height(from.x, from.y).unwrap_or(from.z),
     );
     for i in 1..=n {
+        if !budget.tick() {
+            return Err("plan budget exhausted".into());
+        }
         let t = i as f32 / n as f32;
         let (x, y) = (from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t);
         let Some(h) = world.height(x, y) else {
@@ -1040,41 +1425,12 @@ fn segment_check(world: &dyn NavWorld, from: Vec3, to: Vec3) -> Result<(), Strin
     Ok(())
 }
 
-/// Why the fine [`grid_route`] found nothing (for the trace).
-fn grid_failure(world: &dyn NavWorld, from: Vec3, to: Vec3, budget: &mut PlanBudget) -> String {
-    let start = world.height(from.x, from.y);
-    let goal = world.height(to.x, to.y);
-    match (start, goal) {
-        (None, _) => format!(
-            "no route: start ({:.1}, {:.1}) is off the height data",
-            from.x, from.y
-        ),
-        (_, None) => format!(
-            "no route: goal ({:.1}, {:.1}) is off the height data",
-            to.x, to.y
-        ),
-        _ => {
-            let stats = std::cell::RefCell::new(GridStats::default());
-            let _ = grid_search(
-                world,
-                from,
-                to,
-                2.0,
-                200.0,
-                GridMode::Fine,
-                Some(&stats),
-                budget,
-            );
-            format!(
-                "no route: every candidate path is blocked; {}",
-                stats.borrow().describe((to.x, to.y))
-            )
-        }
-    }
-}
-
 fn dist2(a: Vec3, b: Vec3) -> f32 {
     ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt()
+}
+
+fn dist3(a: Vec3, b: Vec3) -> f32 {
+    (dist2(a, b).powi(2) + (a.z - b.z).powi(2)).sqrt()
 }
 
 /// The live navmesh / heightmap / collision view of one world instance (through the
@@ -1136,6 +1492,18 @@ impl NavWorld for GameNav<'_> {
         graph.route(from, to)
     }
 
+    fn road_route_budget(
+        &self,
+        from: Vec3,
+        to: Vec3,
+        budget: &mut PlanBudget,
+    ) -> Option<Vec<Vec3>> {
+        let graph = self
+            .roads?
+            .get(self.view.server(), self.view.template_id())?;
+        graph.route_budget(from, to, budget)
+    }
+
     fn obstacle(&self, from: Vec3, to: Vec3) -> Option<Obstacle> {
         // The capsule's lowest point is `STEP_HEIGHT_M` above the feet (anything lower is
         // stepped over), so a bot standing on the ground never overlaps the terrain it sweeps
@@ -1163,8 +1531,105 @@ impl NavWorld for GameNav<'_> {
         })
     }
 
+    fn jump_clear(&self, from: Vec3, to: Vec3) -> Option<bool> {
+        // Sweep the whole arc the walker will send, not just the first ground step. The
+        // capsule's bottom starts a hair above the feet so the take-off ground is not a hit.
+        let horizontal = dist2(from, to);
+        let samples = ((horizontal / 0.5).ceil() as usize).clamp(4, 16);
+        let mut prev = from;
+        for i in 1..=samples {
+            let t = i as f32 / samples as f32 * JUMP_AIR_TIME_S;
+            let here = jump_arc(from, to, t);
+            let (a, b) = (
+                [prev.x, prev.y, prev.z + CAPSULE_HEIGHT / 2.0 + 0.05],
+                [here.x, here.y, here.z + CAPSULE_HEIGHT / 2.0 + 0.05],
+            );
+            match self.view.sweep_capsule(
+                a,
+                b,
+                CAPSULE_RADIUS,
+                CAPSULE_HEIGHT / 2.0 - CAPSULE_RADIUS,
+            ) {
+                None => return None,
+                Some(Some(_)) => return Some(false),
+                Some(None) => {}
+            }
+            prev = here;
+        }
+        Some(true)
+    }
+
     fn zone_at(&self, x: f32, y: f32) -> Option<u32> {
         self.view.zone_at(x, y)
+    }
+}
+
+/// The owned [`GameNav`]: the walker and the planner move it into `spawn_blocking`, so the
+/// geometry-loading collision queries never run on a tokio worker.
+#[derive(Clone)]
+pub struct OwnedGameNav {
+    server: Arc<GameServer>,
+    player: PlayerRef,
+    roads: RoadGraphCache,
+}
+
+impl OwnedGameNav {
+    pub fn of_player(
+        server: Arc<GameServer>,
+        player: PlayerRef,
+        roads: RoadGraphCache,
+    ) -> Option<Self> {
+        NavView::of_object(&server, &WorldObject::from(player.clone()))?;
+        Some(Self {
+            server,
+            player,
+            roads,
+        })
+    }
+
+    fn view(&self) -> Option<NavView<'_>> {
+        NavView::of_object(&self.server, &WorldObject::from(self.player.clone()))
+    }
+}
+
+impl NavWorld for OwnedGameNav {
+    fn height(&self, x: f32, y: f32) -> Option<f32> {
+        self.view()?.height(x, y)
+    }
+
+    fn water_depth(&self, x: f32, y: f32, ground: f32) -> f32 {
+        self.view()
+            .map_or(0.0, |view| view.water_depth(x, y, ground))
+    }
+
+    fn nav_route(&self, from: Vec3, to: Vec3) -> Option<Vec<Vec3>> {
+        GameNav::of_player(&self.server, &self.player, Some(&self.roads))?.nav_route(from, to)
+    }
+
+    fn road_route(&self, from: Vec3, to: Vec3) -> Option<Vec<Vec3>> {
+        GameNav::of_player(&self.server, &self.player, Some(&self.roads))?.road_route(from, to)
+    }
+
+    fn road_route_budget(
+        &self,
+        from: Vec3,
+        to: Vec3,
+        budget: &mut PlanBudget,
+    ) -> Option<Vec<Vec3>> {
+        GameNav::of_player(&self.server, &self.player, Some(&self.roads))?
+            .road_route_budget(from, to, budget)
+    }
+
+    fn obstacle(&self, from: Vec3, to: Vec3) -> Option<Obstacle> {
+        GameNav::of_player(&self.server, &self.player, Some(&self.roads))?.obstacle(from, to)
+    }
+
+    fn jump_clear(&self, from: Vec3, to: Vec3) -> Option<bool> {
+        GameNav::of_player(&self.server, &self.player, Some(&self.roads))?.jump_clear(from, to)
+    }
+
+    fn zone_at(&self, x: f32, y: f32) -> Option<u32> {
+        self.view()?.zone_at(x, y)
     }
 }
 
@@ -1261,8 +1726,15 @@ impl StuckTracker {
     /// The next recovery rung as a trace label; call after `observe` / `blocked` returned `true`.
     pub fn rung(&mut self, pos: (f32, f32), now_ms: i64) -> Option<&'static str> {
         self.total += 1;
-        if self.total > MAX_TOTAL_RUNGS && self.delivered < ABANDON_RUNG - 1 {
-            self.delivered = ABANDON_RUNG - 1;
+        if self.total > MAX_TOTAL_RUNGS {
+            // A drop / jump resets the episode but not `total`: the cap is absolute.
+            if self.delivered > ABANDON_RUNG {
+                return None;
+            }
+            self.delivered = ABANDON_RUNG + 1;
+            self.rung_ms = now_ms;
+            self.rung_pos = pos;
+            return LADDER.get(usize::from(ABANDON_RUNG)).copied();
         }
         let label = *LADDER.get(usize::from(self.delivered))?;
         self.delivered += 1;
@@ -1271,13 +1743,29 @@ impl StuckTracker {
         Some(label)
     }
 
+    /// Starts a new stuck episode (a drop / jump ended it) but keeps the total rung count:
+    /// otherwise a bot that alternates drops and blocks bypasses [`MAX_TOTAL_RUNGS`].
     pub fn reset(&mut self) {
+        let total = self.total;
         *self = Self::default();
+        self.total = total;
     }
 }
 
-/// The next step of a plan, with obstacle checks.
+/// The next step of a plan, with obstacle checks and the default speeds.
 pub fn next_step(world: &dyn NavWorld, from: Vec3, target: Vec3) -> Option<MoveStep> {
+    next_step_with_speeds(world, from, target, RUN_SPEED_MPS, SWIM_SPEED_MPS)
+}
+
+/// [`next_step`] with the unit's actual run / swim speed (slows, trade packs, buffs): a swim
+/// step is `swim_speed * STEP_MS` long, exactly like a real client's.
+pub fn next_step_with_speeds(
+    world: &dyn NavWorld,
+    from: Vec3,
+    target: Vec3,
+    run_speed: f32,
+    swim_speed: f32,
+) -> Option<MoveStep> {
     let dist = dist2(from, target);
     if dist <= STOP_DISTANCE {
         return Some(MoveStep {
@@ -1285,7 +1773,10 @@ pub fn next_step(world: &dyn NavWorld, from: Vec3, target: Vec3) -> Option<MoveS
             action: StepAction::Run,
         });
     }
-    let step_len = (RUN_SPEED_MPS * STEP_MS as f32 / 1000.0).min(dist);
+    let ground = world.height(from.x, from.y).unwrap_or(from.z);
+    let in_water = world.water_depth(from.x, from.y, ground) > SWIM_DEPTH_M;
+    let speed = if in_water { swim_speed } else { run_speed };
+    let step_len = (speed * STEP_MS as f32 / 1000.0).min(dist);
     let nx = from.x + (target.x - from.x) / dist * step_len;
     let ny = from.y + (target.y - from.y) / dist * step_len;
     let nz = world
@@ -1297,16 +1788,10 @@ pub fn next_step(world: &dyn NavWorld, from: Vec3, target: Vec3) -> Option<MoveS
     if let Some(obstacle) = world.obstacle(from, to) {
         return match obstacle {
             Obstacle::Low(h) if h <= JUMP_HEIGHT_M => {
-                let jump_len = JUMP_DISTANCE_M.min(dist);
+                let jump_len = (run_speed * JUMP_AIR_TIME_S).min(dist);
                 let jx = from.x + (target.x - from.x) / dist * jump_len;
                 let jy = from.y + (target.y - from.y) / dist * jump_len;
-                let jz = world
-                    .height(jx, jy)
-                    .unwrap_or_else(|| from.z + (target.z - from.z) * (jump_len / dist));
-                Some(MoveStep {
-                    to: Vec3::new(jx, jy, jz),
-                    action: StepAction::Jump(h),
-                })
+                jump_step(world, from, Vec3::new(jx, jy, 0.0), h)
             }
             _ => None,
         };
@@ -1320,11 +1805,8 @@ pub fn next_step(world: &dyn NavWorld, from: Vec3, target: Vec3) -> Option<MoveS
         });
     }
     if dy > STEP_HEIGHT_M {
-        if dy <= JUMP_HEIGHT_M && horizontal <= JUMP_DISTANCE_M {
-            return Some(MoveStep {
-                to,
-                action: StepAction::Jump(dy),
-            });
+        if dy <= JUMP_HEIGHT_M && horizontal <= run_speed * JUMP_AIR_TIME_S {
+            return jump_step(world, from, to, dy);
         }
         return None;
     }
@@ -1343,9 +1825,30 @@ pub fn next_step(world: &dyn NavWorld, from: Vec3, target: Vec3) -> Option<MoveS
     })
 }
 
+/// A jump step only when the landing has ground, is not deep water, is not a drop beyond the
+/// safe fall and the whole arc is free. The landing height is the terrain at the landing
+/// point (the arc interpolates to it, so it never ends at the take-off height).
+fn jump_step(world: &dyn NavWorld, from: Vec3, landing: Vec3, height: f32) -> Option<MoveStep> {
+    let jz = world.height(landing.x, landing.y)?;
+    let to = Vec3::new(landing.x, landing.y, jz);
+    if from.z - jz > MAX_SAFE_DROP_M {
+        return None;
+    }
+    if world.water_depth(to.x, to.y, to.z) > SWIM_DEPTH_M {
+        return None;
+    }
+    if world.jump_clear(from, to) == Some(false) {
+        return None;
+    }
+    Some(MoveStep {
+        to,
+        action: StepAction::Jump(height),
+    })
+}
+
 /// Heading offsets (degrees) a walker tries, in order, when the straight way is blocked: it
 /// slides around a trunk, a rock or a corner like a player steering past it.
-const STEER_DEGREES: [f32; 8] = [25.0, -25.0, 50.0, -50.0, 80.0, -80.0, 120.0, -120.0];
+const STEER_DEGREES: [f32; 4] = [30.0, -30.0, 70.0, -70.0];
 
 /// [`next_step`], and when the way straight to `target` is blocked the first step that works
 /// at a different heading (`bias` = last successful side, `1` or `-1`, tried first).
@@ -1354,8 +1857,10 @@ pub fn next_step_steered(
     from: Vec3,
     target: Vec3,
     bias: &mut i8,
+    run_speed: f32,
+    swim_speed: f32,
 ) -> Option<MoveStep> {
-    if let Some(step) = next_step(world, from, target) {
+    if let Some(step) = next_step_with_speeds(world, from, target, run_speed, swim_speed) {
         return Some(step);
     }
     let dist = dist2(from, target);
@@ -1363,13 +1868,15 @@ pub fn next_step_steered(
         return None;
     }
     let base = (target.y - from.y).atan2(target.x - from.x);
-    let reach = dist.min(JUMP_DISTANCE_M);
+    let reach = dist.min(run_speed * JUMP_AIR_TIME_S);
     for degrees in STEER_DEGREES {
         let signed = degrees * f32::from(*bias);
         let a = base + signed.to_radians();
         let (x, y) = (from.x + reach * a.cos(), from.y + reach * a.sin());
         let z = world.height(x, y).unwrap_or(from.z);
-        if let Some(step) = next_step(world, from, Vec3::new(x, y, z)) {
+        if let Some(step) =
+            next_step_with_speeds(world, from, Vec3::new(x, y, z), run_speed, swim_speed)
+        {
             *bias = if signed >= 0.0 { 1 } else { -1 };
             return Some(step);
         }

@@ -1,6 +1,7 @@
 //! One live bot: its socketless connection, the replies it can read, and its think schedule.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use aaemu_game::net::registry::ClientPacket;
@@ -11,7 +12,7 @@ use aaemu_game::GameServer;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
-use crate::nav::RoadGraphCache;
+use crate::nav::{PlanCancel, PlanGate, RoadGraphCache, STEP_MS};
 
 /// Idle cadence of a bot between thinks (the cadence table / governor comes in P2/P3).
 const IDLE_THINK: Duration = Duration::from_millis(1_000);
@@ -26,7 +27,12 @@ pub struct BotSession {
     /// The long-range road graph of this bot's world (built on the first route that needs it).
     pub(crate) roads: RoadGraphCache,
     /// Generation of the running navigation task: a `goto` bumps it and earlier walkers stop.
-    nav_generation: AtomicU64,
+    nav_generation: Arc<AtomicU64>,
+    /// The host's concurrent-plan gate (defaults to the server-wide gate in tests).
+    plan_gate: OnceLock<Arc<PlanGate>>,
+    /// Monotonic movement-packet time: `ms_of_day` wraps at UTC midnight and the verifier
+    /// would see time go backwards.
+    move_time_ms: AtomicU32,
     /// Places the walker got stuck at (routed around by later plans).
     stuck_spots: Mutex<Vec<(f32, f32)>>,
 }
@@ -41,8 +47,10 @@ impl BotSession {
             conn: Mutex::new(conn),
             next_think: Mutex::new(Instant::now() + jitter),
             disconnected: AtomicBool::new(false),
-            roads: RoadGraphCache::default(),
-            nav_generation: AtomicU64::new(0),
+            roads: RoadGraphCache,
+            nav_generation: Arc::new(AtomicU64::new(0)),
+            plan_gate: OnceLock::new(),
+            move_time_ms: AtomicU32::new(aaemu_game::systems::ai::npc::ms_of_day()),
             stuck_spots: Mutex::new(Vec::new()),
         }
     }
@@ -68,6 +76,30 @@ impl BotSession {
     /// Starts a new navigation generation; any older walker notices and stops.
     pub(crate) fn bump_nav_generation(&self) -> u64 {
         self.nav_generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// A token that cancels the plan of `generation` once a newer `goto` replaces it.
+    pub(crate) fn nav_cancel(&self, generation: u64) -> PlanCancel {
+        PlanCancel::generation(self.nav_generation.clone(), generation)
+    }
+
+    /// The host's plan gate (or the server-wide default when the bot was built directly).
+    pub(crate) fn plan_gate(&self) -> Arc<PlanGate> {
+        self.plan_gate
+            .get_or_init(crate::nav::global_plan_gate)
+            .clone()
+    }
+
+    /// Installs the host's configured gate (first call wins).
+    pub fn install_plan_gate(&self, gate: Arc<PlanGate>) {
+        let _ = self.plan_gate.set(gate);
+    }
+
+    /// The next movement-packet time: a monotonic per-session clock (100 ms per step), not the
+    /// UTC day clock.
+    pub(crate) fn next_move_time_ms(&self) -> u32 {
+        self.move_time_ms
+            .fetch_add(STEP_MS as u32, Ordering::Relaxed)
     }
 
     /// Places the walker got stuck at (bounded; the oldest fall off).

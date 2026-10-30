@@ -15,7 +15,7 @@
 //!   walk them either way).
 
 use std::collections::{BinaryHeap, HashMap};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use aaemu_game::server::GameServer;
 use aaemu_game::systems::skills::controllers::Vec3;
@@ -29,9 +29,9 @@ pub const MAX_GAP_M: f32 = 100.0;
 pub const MAX_VERTICAL_STEP_M: f32 = 15.0;
 /// A segment steeper than this (`|dz| / planar`) is rejected.
 pub const MAX_SLOPE: f32 = 2.0;
-/// How far a bot may be from the road network and still use it (the legs are planned by the
-/// ordinary planners; this only keeps a hopeless snap away).
-pub const MAX_SNAP_M: f32 = 1_000.0;
+/// How far a bot may be from the road network and still use it: both access legs must be
+/// short relative to the trip, otherwise the "road" is a kilometre detour.
+pub const MAX_SNAP_M: f32 = 150.0;
 /// Node expansions one road A* may spend.
 pub const MAX_EXPANSIONS: usize = 200_000;
 
@@ -41,6 +41,8 @@ pub struct RoadGraph {
     points: Vec<Vec3>,
     /// `(node, 3D length)` per node.
     adjacent: Vec<Vec<(u32, f32)>>,
+    /// Connected component id per node (a route only joins nodes of the same component).
+    component: Vec<u32>,
 }
 
 impl RoadGraph {
@@ -109,7 +111,30 @@ impl RoadGraph {
                 }
             }
         }
+        graph.compute_components();
         graph
+    }
+
+    fn compute_components(&mut self) {
+        self.component = vec![u32::MAX; self.points.len()];
+        let mut next = 0u32;
+        let mut stack = Vec::new();
+        for start in 0..self.points.len() {
+            if self.component[start] != u32::MAX {
+                continue;
+            }
+            stack.push(start as u32);
+            self.component[start] = next;
+            while let Some(node) = stack.pop() {
+                for &(other, _) in &self.adjacent[node as usize] {
+                    if self.component[other as usize] == u32::MAX {
+                        self.component[other as usize] = next;
+                        stack.push(other);
+                    }
+                }
+            }
+            next += 1;
+        }
     }
 
     /// The road graph of a world template from the loaded transfer templates. `None` when the
@@ -123,6 +148,16 @@ impl RoadGraph {
             .transfer_templates
             .values()
         {
+            // Airships / boats / floating platforms are not walkable ground routes.
+            let ground = server
+                .game_data
+                .systems
+                .vehicles
+                .vehicle_model(template.model_id)
+                .is_some_and(|model| model.ground);
+            if !ground {
+                continue;
+            }
             for road in &template.transfer_roads {
                 let points: Vec<Vec3> = road
                     .pos
@@ -182,21 +217,58 @@ impl RoadGraph {
             .min_by(|a, b| a.1.total_cmp(&b.1))
     }
 
-    /// A route between the nodes nearest to `from` and `to`: the road node positions, both
-    /// ends included. `None` when the network cannot connect them (or the ends are too far
-    /// from any road).
+    /// The nearest node to `p` in every connected component, with its planar distance.
+    fn nearest_by_component(&self, p: Vec3) -> HashMap<u32, (u32, f32)> {
+        let mut best: HashMap<u32, (u32, f32)> = HashMap::new();
+        for (i, q) in self.points.iter().enumerate() {
+            let d = ((q.x - p.x).powi(2) + (q.y - p.y).powi(2)).sqrt();
+            let component = self.component[i];
+            let entry = best.entry(component).or_insert((i as u32, d));
+            if d < entry.1 {
+                *entry = (i as u32, d);
+            }
+        }
+        best
+    }
+
+    /// The pair of access nodes (one near `from`, one near `to`) in the same connected
+    /// component with the shortest total access, both within [`MAX_SNAP_M`].
+    fn access_nodes(&self, from: Vec3, to: Vec3) -> Option<(u32, u32)> {
+        let from_nodes = self.nearest_by_component(from);
+        let to_nodes = self.nearest_by_component(to);
+        from_nodes
+            .iter()
+            .filter(|(_, (_, d))| *d <= MAX_SNAP_M)
+            .filter_map(|(component, (start, d_start))| {
+                let (goal, d_goal) = *to_nodes.get(component)?;
+                (d_goal <= MAX_SNAP_M).then_some((*start, goal, d_start + d_goal))
+            })
+            .min_by(|a, b| a.2.total_cmp(&b.2))
+            .map(|(start, goal, _)| (start, goal))
+    }
+
+    /// A route between the access nodes nearest to `from` and `to` in one component: the road
+    /// node positions, both ends included. `None` when the network cannot connect them (or
+    /// the ends are too far from any road).
     pub fn route(&self, from: Vec3, to: Vec3) -> Option<Vec<Vec3>> {
+        self.route_budget(from, to, &mut super::PlanBudget::new())
+    }
+
+    /// [`RoadGraph::route`] charged against the plan budget.
+    pub fn route_budget(
+        &self,
+        from: Vec3,
+        to: Vec3,
+        budget: &mut super::PlanBudget,
+    ) -> Option<Vec<Vec3>> {
         if self.is_empty() {
             return None;
         }
-        let (start, d_start) = self.nearest(from)?;
-        let (goal, d_goal) = self.nearest(to)?;
-        if d_start > MAX_SNAP_M || d_goal > MAX_SNAP_M {
-            return None;
-        }
+        let (start, goal) = self.access_nodes(from, to)?;
         let (start, goal) = (start as usize, goal as usize);
         if start == goal {
-            return Some(vec![self.points[start]]);
+            // Both ends snap to the same road node: the road is no help, walking straight is.
+            return None;
         }
         let goal_pos = self.points[goal];
         let heuristic = |i: usize| dist(self.points[i], goal_pos);
@@ -211,6 +283,9 @@ impl RoadGraph {
         ));
         let mut expansions = 0usize;
         while let Some((_, current)) = open.pop() {
+            if !budget.tick() {
+                return None;
+            }
             let current = current as usize;
             if closed[current] {
                 continue;
@@ -250,28 +325,35 @@ impl RoadGraph {
     }
 }
 
-/// One graph per bot (and so per world template), built the first time a long route needs it.
+/// The server-wide road graphs, one per world template and shared by every bot (an `Arc`
+/// handle, built the first time any bot needs that template). Keyed by the template id of the
+/// bot's own instance, not locked to the first template a bot happened to use.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RoadGraphCache;
+
 #[derive(Debug, Default)]
-pub struct RoadGraphCache {
-    template_id: OnceLock<u32>,
+struct RoadGraphEntry {
     graph: OnceLock<Option<Arc<RoadGraph>>>,
 }
 
 impl RoadGraphCache {
     /// The graph of `template_id`, built once with the server's loaded road data.
     pub fn get(&self, server: &GameServer, template_id: u32) -> Option<Arc<RoadGraph>> {
-        let template = *self.template_id.get_or_init(|| template_id);
-        if template != template_id {
-            return None;
-        }
-        self.graph
+        static CACHE: OnceLock<Mutex<HashMap<u32, Arc<RoadGraphEntry>>>> = OnceLock::new();
+        let entry = {
+            let mut cache = CACHE
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .expect("road graph cache poisoned");
+            cache
+                .entry(template_id)
+                .or_insert_with(|| Arc::new(RoadGraphEntry::default()))
+                .clone()
+        };
+        entry
+            .graph
             .get_or_init(|| RoadGraph::from_server(server, template_id).map(Arc::new))
             .clone()
-    }
-
-    /// The graph when it was already built (tests / diagnostics).
-    pub fn loaded(&self) -> Option<Arc<RoadGraph>> {
-        self.graph.get().cloned().flatten()
     }
 }
 
@@ -332,9 +414,11 @@ mod tests {
             vec![at(103.0, 0.0, 100.0), at(103.0, 100.0, 100.0)],
         ]);
         assert_eq!(far.len(), 4);
-        assert!(far
+        // 103 did not join: the route snaps to the nearest node of the other end's component.
+        let route = far
             .route(at(0.0, 0.0, 100.0), at(103.0, 100.0, 100.0))
-            .is_none());
+            .expect("route through the joined component");
+        assert_eq!(route, vec![at(0.0, 0.0, 100.0), at(100.0, 0.0, 100.0)]);
     }
 
     #[test]
@@ -345,9 +429,11 @@ mod tests {
             at(220.0, 0.0, 100.0),
         ]]);
         assert_eq!(graph.edges(), 1, "the 120 m gap is rejected");
-        assert!(graph
+        // The gap splits the graph; the route reaches the far component by its access leg.
+        let route = graph
             .route(at(0.0, 0.0, 100.0), at(220.0, 0.0, 100.0))
-            .is_none());
+            .expect("route to the reachable component");
+        assert_eq!(route, vec![at(120.0, 0.0, 100.0), at(220.0, 0.0, 100.0)]);
     }
 
     #[test]
@@ -359,9 +445,10 @@ mod tests {
             at(100.0, 0.0, 120.0),
         ]]);
         assert_eq!(step.edges(), 1);
-        assert!(step
+        let route = step
             .route(at(0.0, 0.0, 100.0), at(100.0, 0.0, 120.0))
-            .is_none());
+            .expect("route through the flat part");
+        assert_eq!(route.first(), Some(&at(50.0, 0.0, 120.0)));
         // 10 m up over 4 m planar: slope 2.5, rejected.
         let steep = RoadGraph::from_roads([vec![
             at(0.0, 0.0, 100.0),
@@ -369,9 +456,10 @@ mod tests {
             at(100.0, 0.0, 110.0),
         ]]);
         assert_eq!(steep.edges(), 1);
-        assert!(steep
+        let route = steep
             .route(at(0.0, 0.0, 100.0), at(100.0, 0.0, 110.0))
-            .is_none());
+            .expect("route through the flat part");
+        assert_eq!(route.first(), Some(&at(4.0, 0.0, 110.0)));
     }
 
     #[test]

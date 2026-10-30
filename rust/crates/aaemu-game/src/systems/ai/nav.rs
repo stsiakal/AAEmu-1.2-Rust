@@ -14,12 +14,13 @@ use std::sync::Arc;
 
 use crate::data::world_templates::WorldTemplate;
 use crate::data::world_templates::REGION_SIZE;
+use crate::models::unit::UnitAttribute;
 use crate::server::GameServer;
 use crate::systems::ai::collision;
 use crate::systems::ai::geodata::astar::PathNode;
 use crate::systems::ai::geodata::graph::DEFAULT_AGENT_RADIUS;
 use crate::systems::skills::controllers::Vec3;
-use crate::world::WorldObject;
+use crate::world::{now_ms, WorldObject};
 
 /// The navigation view of one world instance for a player-sized mover.
 ///
@@ -185,6 +186,23 @@ impl<'a> NavView<'a> {
         let reduced = geo.reduce_path(&points, 10).ok()?;
         Some(reduced.into_iter().collect())
     }
+}
+
+/// The unit's current `MoveSpeedMul` (`CalculateWithBonuses(1000, MoveSpeedMul) / 1000`):
+/// slows, trade packs and buffs included.
+pub fn movement_speed_mul(obj: &WorldObject) -> f32 {
+    speed_mul(obj, UnitAttribute::MoveSpeedMul)
+}
+
+/// The unit's current `SwimSpeedMul` (`CalculateWithBonuses(1000, SwimSpeedMul) / 1000`).
+pub fn swim_speed_mul(obj: &WorldObject) -> f32 {
+    speed_mul(obj, UnitAttribute::SwimSpeedMul)
+}
+
+fn speed_mul(obj: &WorldObject, attribute: UnitAttribute) -> f32 {
+    let now = now_ms();
+    obj.with_unit(|u| (u.unit().calculate_with_bonuses(1000.0, attribute, now) as f32) / 1000.0)
+        .unwrap_or(1.0)
 }
 
 /// The client `fallVel` (u16) of a drop of `height` metres, as the zone's `ZWUnitFell`

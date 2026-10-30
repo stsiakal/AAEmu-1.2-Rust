@@ -19,6 +19,7 @@ use tokio::sync::Mutex;
 pub use session::BotSession;
 
 use crate::nav::movement::Goto;
+use crate::nav::PlanGate;
 
 /// The scheduler tick: connection commands are serviced this often.
 const HOST_TICK: Duration = Duration::from_millis(250);
@@ -37,6 +38,7 @@ pub struct BotInfo {
 pub struct BotHost {
     server: Weak<GameServer>,
     config: BotsConfig,
+    plan_gate: Arc<PlanGate>,
     bots: Mutex<HashMap<u32, Arc<BotSession>>>,
 }
 
@@ -44,6 +46,7 @@ impl BotHost {
     pub fn new(server: &Arc<GameServer>, config: BotsConfig) -> Self {
         Self {
             server: Arc::downgrade(server),
+            plan_gate: Arc::new(PlanGate::new(config.plan_concurrency)),
             config,
             bots: Mutex::new(HashMap::new()),
         }
@@ -77,6 +80,7 @@ impl BotHost {
                         roster.remove(&bot.character_id);
                     }
                     drop(roster);
+                    bot.cancel_navigation();
                     bot.disconnect(&server).await;
                 }
             }
@@ -123,6 +127,7 @@ impl BotHost {
                 None
             }
         };
+        bot.install_plan_gate(self.plan_gate.clone());
         if let Some(reason) = refusal {
             // Do not leave the loser of the race in the world.
             bot.logout(server).await;
@@ -146,6 +151,9 @@ impl BotHost {
         let Some(bot) = bot else {
             anyhow::bail!("no live bot named '{name}'");
         };
+        // Stop the walk before the character leaves the world: no packet may be sent after the
+        // logout removed it.
+        bot.cancel_navigation();
         bot.logout(server).await;
         bot.disconnect(server).await;
         tracing::info!(

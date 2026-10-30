@@ -420,6 +420,22 @@ pub struct VehicleModel {
     pub wheeled_vehicle_gear_speed_ratio_1: f32,
     pub wheeled_vehicle_gear_speed_ratio_2: f32,
     pub wheeled_vehicle_gear_speed_ratio_3: f32,
+    /// Ground carriage / cart / tram (not an airship, boat or floating platform). The bot
+    /// road graph only uses these routes.
+    pub ground: bool,
+}
+
+/// A transfer model is a ground route only when it neither flies nor floats and its model
+/// path is not a ship / boat / airship / carpet (the 1.2 `VehicleModel` type alone does not
+/// separate carriages from airships).
+pub fn is_ground_transfer_model(normal: &str, can_fly: bool, floating_height: f32) -> bool {
+    if can_fly || floating_height > 0.0 {
+        return false;
+    }
+    let path = normal.to_ascii_lowercase();
+    !["ship", "boat", "ferry", "air", "carpet", "float"]
+        .iter()
+        .any(|word| path.contains(word))
 }
 
 /// `ShipModelV1` (the members the slave spawning reads; the rest is the physics' data).
@@ -1074,6 +1090,11 @@ impl VehiclesData {
                 wheeled_vehicle_gear_speed_ratio_1: r.f32("wheeled_vehicle_gear_speed_ratio_1")?,
                 wheeled_vehicle_gear_speed_ratio_2: r.f32("wheeled_vehicle_gear_speed_ratio_2")?,
                 wheeled_vehicle_gear_speed_ratio_3: r.f32("wheeled_vehicle_gear_speed_ratio_3")?,
+                ground: is_ground_transfer_model(
+                    &r.string("normal")?,
+                    r.string("can_fly")?.eq_ignore_ascii_case("t"),
+                    r.f32("floating_height")?,
+                ),
             };
             self.vehicle_models.entry(m.id).or_insert(m);
             Ok(())
@@ -1495,5 +1516,39 @@ mod tests {
         assert_eq!(t.transfer_roads.len(), 1);
         assert_eq!(t.transfer_roads[0].zone_id, 0);
         assert_eq!(t.transfer_roads[0].pos.len(), 2);
+    }
+
+    #[test]
+    fn only_carriages_are_ground_transfer_models() {
+        assert!(is_ground_transfer_model(
+            "cgf://objects/Env/06_unit/05_carriage/transfers_carriageb01.cgf",
+            false,
+            0.0
+        ));
+        assert!(is_ground_transfer_model(
+            "cgf://cart/mine_tub.cgf",
+            false,
+            0.0
+        ));
+        assert!(!is_ground_transfer_model(
+            "prefab://Prefabs/airship.xml/airship.normal",
+            true,
+            0.0
+        ));
+        assert!(!is_ground_transfer_model(
+            "cgf://Objects/.../ferryboat_b.cgf",
+            true,
+            0.0
+        ));
+        assert!(!is_ground_transfer_model(
+            "cgf://.../transfers_floatship01.chr",
+            false,
+            0.0
+        ));
+        assert!(!is_ground_transfer_model(
+            "cgf://.../housing_carpet01.cgf",
+            false,
+            0.0
+        ));
     }
 }
