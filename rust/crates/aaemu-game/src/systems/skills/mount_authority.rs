@@ -75,18 +75,58 @@ pub(super) fn may_use_slave(
             .is_some_and(|bearer| summoned_by(&bearer, player, character_id))
 }
 
-/// Who may a `Mount` caster packet of `player` name as the caster: the player itself, a mate
-/// the player may use, or a slave the player owns or is attached to. Any other object (NPC,
-/// doodad, another player, a foreign slave) is refused.
+/// Who may a `Mount` caster packet of `player` name as the caster: a mate the player may use or
+/// a slave the player owns or is attached to. Any other object (the player itself, an NPC, a
+/// doodad, another player, a foreign slave) is refused: a "mount" cast is a vehicle bar skill,
+/// never a way to cast a player skill without its ability checks.
 pub(super) fn may_cast_as(
     server: &crate::server::GameServer,
     player: &PlayerRef,
     caster: &WorldObject,
 ) -> bool {
     match caster {
-        WorldObject::Player(p) => p.obj_id == player.obj_id,
         WorldObject::Mate(mate) => may_use_mate(player, mate),
         WorldObject::Slave(slave) => may_use_slave(server, player, slave),
         _ => false,
     }
+}
+
+/// Whether `skill_id` is on the mount / slave bar of `caster`: the mate's `skills` entries and
+/// the slave template's `slave_mount_skills`, each a `mount_skills.id` that maps to the skill the
+/// client casts, plus the entries `buff_mount_skills` grants through the vehicle's active buffs.
+/// The bar also decides the rider / operator skill through `mount_attached_skills`.
+pub(super) fn may_use_vehicle_skill(
+    server: &crate::server::GameServer,
+    caster: &WorldObject,
+    skill_id: u32,
+) -> bool {
+    let data = &server.game_data.systems.vehicles;
+    let mut mount_ids = Vec::new();
+    match caster {
+        WorldObject::Mate(mate) => mount_ids.extend(mate.data().skills.iter().copied()),
+        WorldObject::Slave(slave) => {
+            mount_ids.extend(data.slave_mount_skill_list(slave.data().unit.template_id))
+        }
+        _ => return false,
+    }
+    if mount_ids
+        .iter()
+        .any(|id| data.mount_skill_skill_id(*id) == skill_id)
+    {
+        return true;
+    }
+    let buffs: Vec<u32> = caster
+        .with_unit(|u| {
+            u.unit()
+                .buffs
+                .effects
+                .iter()
+                .map(|b| b.template.id)
+                .collect()
+        })
+        .unwrap_or_default();
+    buffs.iter().any(|buff_id| {
+        data.buff_mount_skill_ids(*buff_id)
+            .any(|id| data.mount_skill_skill_id(id) == skill_id)
+    })
 }

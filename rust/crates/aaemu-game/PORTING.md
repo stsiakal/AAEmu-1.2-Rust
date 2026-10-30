@@ -2967,6 +2967,30 @@ two bots before the fix (a foreign `Mount` caster, an NPC-only skill and a far d
   narrow by type id, not by effect class). The effect still requires the Memory Ink reagent
   (`skill_reagents`) and only renames the caster's own portal.
 
+### Item, vehicle bar and SavePortal hardening (2026-10-30)
+
+- **Item template from the owned item.** The `CSStartSkill` `SkillCaster::Item` branch resolves
+  the template from `ItemManager` and rewrites the caster before `Skill.Use`, so the client's
+  `ItemTemplateId` never decides the use skill, the reagent or the consumed template. Item-only
+  skills require `skill_id ==` the owned template's `UseSkillId` (the bind-on-pickup exception no
+  longer authorizes them). Consumption goes through `ItemSkillHooks::consume_owned_item`, which
+  checks the item id and template and consumes it under one container lock (amount 0 only
+  verifies). An item that leaves the bag during a cast time is refused by the cast-time item
+  check; a cancelled effect consumes nothing.
+- **SavePortal creation.** `SpecialEffect` 30 `SavePortal` only records a new book entry when the
+  casting skill pays a reagent (`skill_reagents` or an effect-level `consume_item_id` /
+  `consume_source_item`). Skill 16841 "Editing Location in Teleport Book..." has no reagent and
+  may only rename an existing portal of the character; 11215 and the doodad version 16387 pay
+  Memory Ink and may record. No portal-book cap exists in the C# `PortalManager` /
+  `CharacterPortals` or in the 1.2 data (the client UI pages the list by `COUNT_PER_PAGE`); none
+  is invented here.
+- **Vehicle bar caster.** A `Mount` caster must be a mate the player may use or a slave the
+  player owns / is attached to; the player itself is no longer accepted. The skill id must be on
+  the vehicle bar: the mate's `Mate.skills` mount-skill ids, the slave template's
+  `slave_mount_skills`, or a `buff_mount_skills` entry of an active vehicle buff, each mapped
+  through `mount_skills.skill_id`. This closes the NPC / boss / GM skill bypass; the rider /
+  operator skill still runs as the player through `mount_attached_skills`.
+
 ## Ship repair timer and destroyed-vehicle HP (2026-10-20)
 
 Deviations from the 1.2 C# `Slave.DoDie` / `SlaveManager.Create` (the check already existed, but

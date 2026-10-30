@@ -65,8 +65,25 @@ fn mate_cast_data() -> GameData {
         remove_on_start_skill: true,
         ..Default::default()
     });
-    // No learned/static mount skill relation: actor authority must not silently
-    // prohibit existing temporary skill grants or impose an unproven allowlist.
+    // The vehicle bar: mount skill 77 casts 20001, both as a mate bar entry
+    // (`Mate.skills`) and as a slave template entry (`slave_mount_skills`).
+    data.systems
+        .vehicles
+        .mount_skills
+        .push(crate::systems::vehicles::data::MountSkills {
+            id: 77,
+            name: "Test".into(),
+            skill_id: 20001,
+        });
+    data.systems
+        .vehicles
+        .npc_mount_skills
+        .push(crate::systems::vehicles::data::NpcMountSkills {
+            id: 1,
+            npc_id: 1,
+            mount_skill_id: 77,
+        });
+    data.systems.vehicles.slave_mount_skills.push((1, 1, 77));
     data
 }
 
@@ -105,6 +122,7 @@ async fn mate_skill_packet_rejects_foreign_actor_before_costs_and_allows_unmount
     foreign.conn.active_char = Some(a);
     owner.conn.active_char = Some(b.clone());
     let mut data = Mate::new(1, 1);
+    data.skills = vec![77];
     data.owner_obj_id = b.obj_id;
     data.unit.hp = 500;
     data.unit.mp = 100;
@@ -158,6 +176,14 @@ async fn mate_skill_packet_requires_real_passenger_attachment_and_keeps_unlisted
             ..Default::default()
         },
     );
+    data.systems
+        .vehicles
+        .npc_mount_skills
+        .push(crate::systems::vehicles::data::NpcMountSkills {
+            id: 2,
+            npc_id: 900,
+            mount_skill_id: 77,
+        });
     data.items.templates.insert(
         5000,
         ItemTemplate {
@@ -231,7 +257,7 @@ async fn mate_skill_packet_requires_real_passenger_attachment_and_keeps_unlisted
         .obj_id = 0;
     mates::mount_mate(&server, &player, tl_id, attach_point::PASSENGER0, 0);
     assert_eq!(player.data().unit.transform.parent_obj_id, mate.obj_id);
-    assert!(mate.data().skills.is_empty());
+    assert_eq!(mate.data().skills, vec![77]);
     mate_cast_packet(mate.obj_id)
         .handle(&server, &mut client.conn)
         .await
@@ -495,8 +521,8 @@ fn started_result(client: &mut TestClient, skill: u32) -> Option<u8> {
     client
         .drain()
         .into_iter()
-        .find_map(|(op, body)| (op == crate::opcodes::sc::SCSkillStartedPacket).then_some(body))
-        .and_then(|body| {
+        .filter(|(op, _)| *op == crate::opcodes::sc::SCSkillStartedPacket)
+        .find_map(|(_, body)| {
             let mut s = PacketStream::from_bytes(body);
             if s.read_u32().ok() != Some(skill) {
                 return None;
@@ -511,7 +537,45 @@ fn started_result(client: &mut TestClient, skill: u32) -> Option<u8> {
             let _ = s.read_u16();
             let _ = s.read_u8();
             let flags = s.read_u8().ok()?;
-            (flags & 1 != 0).then(|| s.read_u8().ok()).flatten()
+            if flags & 1 == 0 {
+                return None;
+            }
+            s.read_u8().ok()
+        })
+}
+
+/// Like [`started_result`] for a packet whose caster is an `Item` and whose target is a unit.
+fn item_started_result(client: &mut TestClient, skill: u32) -> Option<u8> {
+    client
+        .drain()
+        .into_iter()
+        .filter(|(op, _)| *op == crate::opcodes::sc::SCSkillStartedPacket)
+        .find_map(|(_, body)| {
+            let mut s = PacketStream::from_bytes(body);
+            if s.read_u32().ok() != Some(skill) {
+                return None;
+            }
+            let _ = s.read_u16();
+            let caster_type = s.read_u8().ok()?;
+            if caster_type != super::types::caster_type::ITEM {
+                return None;
+            }
+            let _ = s.read_bc();
+            let _ = s.read_u64();
+            let _ = s.read_u32();
+            let _ = s.read_u8();
+            let _ = s.read_u32();
+            let _ = s.read_u8();
+            let _ = s.read_bc();
+            let _ = s.read_u8();
+            let _ = s.read_u16();
+            let _ = s.read_u16();
+            let _ = s.read_u8();
+            let flags = s.read_u8().ok()?;
+            if flags & 1 == 0 {
+                return None;
+            }
+            s.read_u8().ok()
         })
 }
 
@@ -593,7 +657,8 @@ async fn item_only_skill_is_refused_as_a_plain_cast_and_consumed_on_an_item_cast
         caster: SkillCaster::Item {
             obj_id: a.obj_id,
             item_id: 0x7001,
-            item_template_id: SCROLL,
+            // The client's hint is wrong on purpose: the server must use 6001.
+            item_template_id: 0,
             type1: 0,
             type2: 0,
         },
@@ -604,6 +669,156 @@ async fn item_only_skill_is_refused_as_a_plain_cast_and_consumed_on_an_item_cast
     super::handlers::start_skill(&server, &mut client.conn, packet);
     assert_eq!(a.data().unit.hp, 650);
     assert_eq!(Inv::of(&a).items_count(SCROLL, -1), 1);
+    // A second cast uses the last scroll; a third without a scroll is refused.
+    let mut packet = cast_packet_as(caster_type::UNIT, a.obj_id, a.obj_id);
+    packet.skill_id = ITEM_ONLY;
+    packet.caster = SkillCaster::Item {
+        obj_id: a.obj_id,
+        item_id: 0x7001,
+        item_template_id: 0,
+        type1: 0,
+        type2: 0,
+    };
+    super::handlers::start_skill(&server, &mut client.conn, packet);
+    assert_eq!(a.data().unit.hp, 800);
+    assert_eq!(Inv::of(&a).items_count(SCROLL, -1), 0);
+    let mut packet = cast_packet_as(caster_type::UNIT, a.obj_id, a.obj_id);
+    packet.skill_id = ITEM_ONLY;
+    packet.caster = SkillCaster::Item {
+        obj_id: a.obj_id,
+        item_id: 0x7001,
+        item_template_id: 0,
+        type1: 0,
+        type2: 0,
+    };
+    super::handlers::start_skill(&server, &mut client.conn, packet);
+    assert_eq!(a.data().unit.hp, 800);
+}
+
+/// A bind-on-pickup item cannot authorize an item-only skill other than its own use skill.
+#[tokio::test]
+async fn bind_on_pickup_item_does_not_authorize_another_item_only_skill() {
+    use super::types::{SkillCastTarget, SkillCaster, SkillObject};
+    use crate::data::items::{bind_type, ItemTemplate};
+
+    const ITEM_ONLY: u32 = 20_003;
+    const OTHER_ITEM_ONLY: u32 = 20_004;
+    const BOP_ITEM: u32 = 6_002;
+    let mut data = mate_cast_data();
+    let mut skill = super::tests::skill_template(ITEM_ONLY);
+    skill.target_type = 0;
+    skill.damage_type_id = 0;
+    skill.effects.push(super::tests::skill_effect(
+        900_001,
+        super::data::EffectKind::HealEffect,
+        1,
+    ));
+    data.systems.skills.add_skill(skill);
+    let mut item = ItemTemplate::plain(BOP_ITEM, 10);
+    item.bind_type = bind_type::BIND_ON_PICKUP;
+    item.use_skill_id = OTHER_ITEM_ONLY;
+    item.use_skill_as_reagent = true;
+    data.items.templates.insert(BOP_ITEM, item);
+    data.skills = loaded_skill_sources(&format!(
+        "INSERT INTO items (id, use_skill_id) VALUES              ({BOP_ITEM}, {OTHER_ITEM_ONLY}), (6_001, {ITEM_ONLY});"
+    ));
+    let server = Arc::new(test_server_with(data));
+    server.set_self();
+    super::bind(&server);
+    crate::systems::economy::bridges::install(&server);
+    let mut client = TestClient::new(&server, 1, 1);
+    let a = spawn_player(
+        &server,
+        &client,
+        test_character(1, "Caster", 100.0, 100.0),
+        0x100,
+    );
+    client.conn.active_char = Some(a.clone());
+    a.data().unit.hp = 500;
+    a.data().unit.max_hp = 1000;
+    give_test_item(&server, &a, 0x7003, BOP_ITEM, 1);
+    let packet = super::handlers::CSStartSkillPacket {
+        skill_id: ITEM_ONLY,
+        caster: SkillCaster::Item {
+            obj_id: a.obj_id,
+            item_id: 0x7003,
+            item_template_id: 0,
+            type1: 0,
+            type2: 0,
+        },
+        target: SkillCastTarget::Unit(a.obj_id),
+        flag: 0,
+        skill_object: SkillObject::None,
+    };
+    super::handlers::start_skill(&server, &mut client.conn, packet);
+    assert_eq!(a.data().unit.hp, 500);
+    assert_eq!(
+        item_started_result(&mut client, ITEM_ONLY),
+        Some(super::types::skill_result::NO_PERM)
+    );
+}
+
+/// An item that leaves the bag during a cast time refuses the effect at consumption.
+#[tokio::test]
+async fn item_removed_during_the_cast_time_refuses_the_effect() {
+    use super::types::{SkillCastTarget, SkillCaster, SkillObject};
+    use crate::data::items::ItemTemplate;
+    use crate::systems::economy::inventory::Inv;
+
+    const DELAYED: u32 = 20_005;
+    const SCROLL: u32 = 6_003;
+    let mut data = mate_cast_data();
+    let mut skill = super::tests::skill_template(DELAYED);
+    skill.target_type = 0;
+    skill.damage_type_id = 0;
+    skill.casting_time = 50;
+    let mut effect = super::tests::skill_effect(900_001, super::data::EffectKind::HealEffect, 1);
+    effect.consume_item_count = 1;
+    skill.effects.push(effect);
+    data.systems.skills.add_skill(skill);
+    let mut item = ItemTemplate::plain(SCROLL, 10);
+    item.use_skill_id = DELAYED;
+    item.use_skill_as_reagent = true;
+    data.items.templates.insert(SCROLL, item);
+    data.skills = loaded_skill_sources(&format!(
+        "INSERT INTO items (id, use_skill_id) VALUES ({SCROLL}, {DELAYED});"
+    ));
+    let server = Arc::new(test_server_with(data));
+    server.set_self();
+    super::bind(&server);
+    crate::systems::economy::bridges::install(&server);
+    let mut client = TestClient::new(&server, 1, 1);
+    let a = spawn_player(
+        &server,
+        &client,
+        test_character(1, "Caster", 100.0, 100.0),
+        0x100,
+    );
+    client.conn.active_char = Some(a.clone());
+    a.data().unit.hp = 500;
+    a.data().unit.max_hp = 1000;
+    give_test_item(&server, &a, 0x7004, SCROLL, 1);
+    let packet = super::handlers::CSStartSkillPacket {
+        skill_id: DELAYED,
+        caster: SkillCaster::Item {
+            obj_id: a.obj_id,
+            item_id: 0x7004,
+            item_template_id: 0,
+            type1: 0,
+            type2: 0,
+        },
+        target: SkillCastTarget::Unit(a.obj_id),
+        flag: 0,
+        skill_object: SkillObject::None,
+    };
+    super::handlers::start_skill(&server, &mut client.conn, packet);
+    assert_eq!(a.data().unit.hp, 500);
+    // The scroll leaves the bag before the cast completes.
+    Inv::of(&a).bag().lock().unwrap().items.clear();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    // The cast-time re-check stops the cast: no heal and no consumption.
+    assert_eq!(a.data().unit.hp, 500);
+    assert_eq!(Inv::of(&a).items_count(SCROLL, -1), 0);
 }
 
 /// A skill named by an item table and by another client source keeps its plain cast.
@@ -642,6 +857,7 @@ async fn item_and_doodad_skill_still_casts_as_a_plain_unit_skill() {
 }
 
 const SAVE_PORTAL_SKILL: u32 = 11_215;
+const RENAME_PORTAL_SKILL: u32 = 16_841;
 const MEMORY_INK: u32 = 4_053;
 const SAVE_PORTAL_EFFECT: u32 = 900;
 
@@ -662,18 +878,20 @@ fn save_portal_data() -> GameData {
         }),
         SAVE_PORTAL_EFFECT,
     );
-    d.systems.skills.add_skill(SkillTemplate {
-        id: SAVE_PORTAL_SKILL,
-        target_type: 0,
-        damage_type_id: 0,
-        casting_time: 0,
-        effects: vec![super::tests::skill_effect(
-            SAVE_PORTAL_EFFECT,
-            EffectKind::SpecialEffect,
-            SAVE_PORTAL_EFFECT,
-        )],
-        ..super::tests::skill_template(SAVE_PORTAL_SKILL)
-    });
+    for skill_id in [SAVE_PORTAL_SKILL, RENAME_PORTAL_SKILL] {
+        d.systems.skills.add_skill(SkillTemplate {
+            id: skill_id,
+            target_type: 0,
+            damage_type_id: 0,
+            casting_time: 0,
+            effects: vec![super::tests::skill_effect(
+                SAVE_PORTAL_EFFECT,
+                EffectKind::SpecialEffect,
+                SAVE_PORTAL_EFFECT,
+            )],
+            ..super::tests::skill_template(skill_id)
+        });
+    }
     d.items.templates.insert(
         MEMORY_INK,
         crate::data::items::ItemTemplate::plain(MEMORY_INK, 10),
@@ -688,11 +906,13 @@ fn save_portal_data() -> GameData {
         "INSERT INTO effects (id, actual_type, actual_id) \
              VALUES ({SAVE_PORTAL_EFFECT}, 'SpecialEffect', {SAVE_PORTAL_EFFECT});
          INSERT INTO skill_effects (skill_id, effect_id) \
-             VALUES ({SAVE_PORTAL_SKILL}, {SAVE_PORTAL_EFFECT});
+             VALUES ({SAVE_PORTAL_SKILL}, {SAVE_PORTAL_EFFECT}),
+                    ({RENAME_PORTAL_SKILL}, {SAVE_PORTAL_EFFECT});
          INSERT INTO special_effects (id, special_effect_type_id) \
              VALUES ({SAVE_PORTAL_EFFECT}, 30);"
     ));
     assert!(d.skills.is_client_sourced_skill(SAVE_PORTAL_SKILL));
+    assert!(d.skills.is_client_sourced_skill(RENAME_PORTAL_SKILL));
     d
 }
 
@@ -759,4 +979,136 @@ async fn teleport_book_record_without_memory_ink_is_refused_by_the_reagent_check
         started_result(&mut client, SAVE_PORTAL_SKILL),
         Some(super::types::skill_result::NEED_REAGENT)
     );
+}
+
+/// 16841 has no reagent: it may rename a book entry but must never create one.
+#[tokio::test]
+async fn rename_portal_skill_cannot_record_a_location_and_renames_an_existing_one() {
+    let server = Arc::new(test_server_with(save_portal_data()));
+    server.set_self();
+    super::bind(&server);
+    crate::systems::economy::bridges::install(&server);
+    crate::systems::npcs::bridges::install(&server);
+    let mut client = TestClient::new(&server, 1, 1);
+    let a = spawn_player(
+        &server,
+        &client,
+        test_character(1, "Traveller", 100.0, 100.0),
+        0x100,
+    );
+    client.conn.active_char = Some(a.clone());
+    let rename = |id: i32, name: &str| {
+        let mut packet = save_portal_packet(&a);
+        packet.skill_id = RENAME_PORTAL_SKILL;
+        packet.skill_object = super::types::SkillObject::SavePortalInfo {
+            id,
+            name: name.into(),
+        };
+        packet
+    };
+    // No ink and no reagent on 16841: nothing may be recorded.
+    super::handlers::start_skill(&server, &mut client.conn, rename(0, "Free"));
+    assert!(a.data().portals.private_portals.is_empty());
+    // A real record, then rename it through 16841.
+    give_test_item(&server, &a, 0x7005, MEMORY_INK, 1);
+    super::handlers::start_skill(&server, &mut client.conn, save_portal_packet(&a));
+    let portals = a.data().portals.private_portals.clone();
+    assert_eq!(portals.len(), 1);
+    super::handlers::start_skill(
+        &server,
+        &mut client.conn,
+        rename(portals[0].id as i32, "Barn"),
+    );
+    let portals = a.data().portals.private_portals.clone();
+    assert_eq!(portals.len(), 1);
+    assert_eq!(portals[0].name, "Barn");
+}
+
+/// Real 1.2 vehicle bars: mate skill 21172 is `mount_skills` 209 (npc_mount_skills) and slave
+/// skill 13350 is `mount_skills` 34 (`slave_mount_skills`). Only bar ids may be cast.
+#[tokio::test]
+async fn vehicle_bar_accepts_real_mount_and_slave_skills_and_refuses_other_ids() {
+    use super::types::{caster_type, SkillObject};
+    use crate::models::mate::Mate;
+    use crate::systems::vehicles::data::MountSkills;
+
+    const MOUNT_ID: u32 = 209;
+    const MOUNT_SKILL: u32 = 21_172;
+    const SLAVE_ID: u32 = 34;
+    const SLAVE_SKILL: u32 = 13_350;
+    const NPC_SKILL: u32 = 300_001;
+    let mut data = mate_cast_data();
+    for id in [MOUNT_SKILL, SLAVE_SKILL, NPC_SKILL] {
+        let mut skill = super::tests::skill_template(id);
+        skill.target_type = 0;
+        skill.damage_type_id = 0;
+        skill.mana_cost = 25;
+        skill.effects.push(super::tests::skill_effect(
+            900_001,
+            super::data::EffectKind::HealEffect,
+            1,
+        ));
+        data.systems.skills.add_skill(skill);
+    }
+    data.systems.vehicles.mount_skills.push(MountSkills {
+        id: MOUNT_ID,
+        name: "Mount".into(),
+        skill_id: MOUNT_SKILL,
+    });
+    data.systems.vehicles.mount_skills.push(MountSkills {
+        id: SLAVE_ID,
+        name: "Slave".into(),
+        skill_id: SLAVE_SKILL,
+    });
+    // Slave template 1 (the fixture's) mounts 34 -> 13350.
+    data.systems
+        .vehicles
+        .slave_mount_skills
+        .push((2, 1, SLAVE_ID));
+    let server = Arc::new(test_server_with(data));
+    server.set_self();
+    super::bind(&server);
+    let mut client = TestClient::new(&server, 1, 1);
+    let a = spawn_player(
+        &server,
+        &client,
+        test_character(1, "Rider", 100.0, 100.0),
+        0x100,
+    );
+    client.conn.active_char = Some(a.clone());
+    a.data().unit.hp = 500;
+    a.data().unit.max_hp = 1000;
+    a.data().unit.mp = 100;
+    let world = server.world.world(0).unwrap();
+    let mut mate_data = Mate::new(1, 1);
+    mate_data.skills = vec![MOUNT_ID];
+    mate_data.owner_obj_id = a.obj_id;
+    mate_data.unit.hp = 500;
+    mate_data.unit.max_hp = 1000;
+    mate_data.unit.mp = 100;
+    let mate = Entity::new(0x201, mate_data);
+    world.spawn(&mate, &server.view_ctx());
+    let mut slave_data = Slave::new(0x300, 1);
+    slave_data.summoner_obj_id = a.obj_id;
+    slave_data.summoner_id = a.character_id;
+    slave_data.unit.hp = 500;
+    slave_data.unit.max_hp = 1000;
+    slave_data.unit.mp = 100;
+    let slave = Entity::new(0x300, slave_data);
+    world.spawn(&slave, &server.view_ctx());
+    let mut cast = |obj_id: u32, skill: u32| {
+        let mut packet = cast_packet_as(caster_type::MOUNT, obj_id, obj_id);
+        packet.skill_id = skill;
+        packet.skill_object = SkillObject::None;
+        super::handlers::start_skill(&server, &mut client.conn, packet);
+    };
+    cast(mate.obj_id, MOUNT_SKILL);
+    assert_eq!(mate.data().unit.hp, 650);
+    cast(slave.obj_id, SLAVE_SKILL);
+    assert_eq!(slave.data().unit.mp, 75);
+    // The player is not its own mount, and a vehicle bar does not authorize other skill ids.
+    cast(a.obj_id, NPC_SKILL);
+    assert_eq!(a.data().unit.hp, 500);
+    cast(mate.obj_id, NPC_SKILL);
+    assert_eq!(mate.data().unit.hp, 650);
 }

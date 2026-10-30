@@ -272,6 +272,20 @@ pub(crate) fn transfer_gender(server: &GameServer, player: &crate::world::Player
     true
 }
 
+/// Whether the cast of `args` pays an item: a `skill_reagents` row or an effect-level
+/// `consume_item_id` / `consume_source_item`. Only such a cast may record a new book entry.
+fn save_portal_costs_reagent(server: &GameServer, args: &EffectArgs<'_>) -> bool {
+    let Some(skill) = args.source.skill() else {
+        return false;
+    };
+    let data = &server.game_data.systems.skills;
+    !data.reagents_for(skill.template.id).is_empty()
+        || skill.template.effects.iter().any(|effect| {
+            effect.consume_source_item
+                || (effect.consume_item_id != 0 && effect.consume_item_count > 0)
+        })
+}
+
 /// `SavePortal`: a new private portal at the character's position (`SkillObjectSavePortalInfo`
 /// id 0) or a rename of portal `id`.
 pub fn save_portal(server: &GameServer, args: &EffectArgs<'_>, v: [i32; 4]) {
@@ -287,6 +301,16 @@ pub fn save_portal(server: &GameServer, args: &EffectArgs<'_>, v: [i32; 4]) {
     };
     let npcs = server.systems.skills.ext.npcs();
     if *id == 0 {
+        // Only a cast that pays a reagent may record a new location. 16841 (rename) has no
+        // reagent and must never create a book entry, whatever the skill object says.
+        if !save_portal_costs_reagent(server, args) {
+            tracing::warn!(
+                buff = args.source.buff.as_ref().map(|b| b.id),
+                skill = args.source.skill().map(|s| s.template.id).unwrap_or(0),
+                "SavePortal refused to create a location for a skill without a reagent"
+            );
+            return;
+        }
         let pos = world_pos(server, &Target::Obj(caster.clone()));
         let zone_id = p.data().unit.transform.zone_id;
         npcs.add_private_portal(server, p, pos.x, pos.y, pos.z, pos.rot_z, zone_id, name);

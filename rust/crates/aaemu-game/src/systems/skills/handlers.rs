@@ -83,7 +83,7 @@ fn template_skill(server: &GameServer, id: u32) -> Option<SkillRef> {
 }
 
 /// `CSStartSkillPacket.Read` behaviour.
-pub fn start_skill(server: &GameServer, conn: &mut GameConnection, p: CSStartSkillPacket) {
+pub fn start_skill(server: &GameServer, conn: &mut GameConnection, mut p: CSStartSkillPacket) {
     let Some(player) = conn.active_char.clone() else {
         return;
     };
@@ -125,13 +125,25 @@ pub fn start_skill(server: &GameServer, conn: &mut GameConnection, p: CSStartSki
             return;
         };
         if !super::mount_authority::may_cast_as(server, &player, &caster) {
-            // Mount / slave skills are cast as the player, a mate the player may use, or a
-            // slave the player owns or is attached to; anything else is a forged packet.
+            // Mount / slave skills are cast as a mate the player may use or a slave the player
+            // owns or is attached to; anything else is a forged packet.
             tracing::warn!(
                 character = %player.data().unit.name,
                 skill_id,
                 caster = p.caster.obj_id(),
                 "Client cast as an object it does not own or ride refused"
+            );
+            send_cast_refused(&player, skill_id, p.caster, target, p.skill_object);
+            return;
+        }
+        if !super::mount_authority::may_use_vehicle_skill(server, &caster, skill_id) {
+            // A vehicle caster authorizes only the skills on its own bar (and those its buffs
+            // grant); any other id, such as an NPC / boss / GM skill, is not a mount cast.
+            tracing::warn!(
+                character = %player.data().unit.name,
+                skill_id,
+                caster = p.caster.obj_id(),
+                "Client cast of a skill outside the vehicle's bar refused"
             );
             send_cast_refused(&player, skill_id, p.caster, target, p.skill_object);
             return;
@@ -214,13 +226,21 @@ pub fn start_skill(server: &GameServer, conn: &mut GameConnection, p: CSStartSki
         }
     } else if let SkillCaster::Item { item_id, .. } = p.caster {
         let items = server.systems.skills.ext.items();
+        // Resolve the template from the owned item: the wire template id is a client hint and
+        // must never decide the use skill, the reagent or the consumed template.
         let Some((template_id, _)) = items.owned_item(server, &player, item_id) else {
             return;
         };
         let Some((use_skill_id, bind_on_pickup)) = items.item_use_skill(server, template_id) else {
             return;
         };
-        if skill_id != use_skill_id && !bind_on_pickup {
+        if data.skills.is_item_only_skill(skill_id) {
+            // An item-only skill cannot borrow the legacy bind-on-pickup exception.
+            if skill_id != use_skill_id {
+                send_cast_refused(&player, skill_id, p.caster, target, p.skill_object);
+                return;
+            }
+        } else if skill_id != use_skill_id && !bind_on_pickup {
             return;
         }
         let Some(skill) = template_skill(server, skill_id) else {
@@ -244,6 +264,24 @@ pub fn start_skill(server: &GameServer, conn: &mut GameConnection, p: CSStartSki
         {
             return;
         }
+        // Continue with the server-resolved template: `skill::use_skill` validates and consumes
+        // through it (item id, template and count), never through the client's hint.
+        p.caster = match p.caster {
+            SkillCaster::Item {
+                obj_id,
+                item_id,
+                type1,
+                type2,
+                ..
+            } => SkillCaster::Item {
+                obj_id,
+                item_id,
+                item_template_id: template_id,
+                type1,
+                type2,
+            },
+            caster => caster,
+        };
         let (r, v) = skill::use_skill(
             server,
             &skill,

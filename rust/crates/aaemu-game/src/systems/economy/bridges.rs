@@ -913,6 +913,40 @@ impl ItemSkillHooks for EconomyForSkills {
         })
     }
 
+    fn consume_owned_item(
+        &self,
+        server: &GameServer,
+        _player: &PlayerRef,
+        item_id: u64,
+        expected_template_id: u32,
+        amount: i32,
+    ) -> Option<bool> {
+        let Some(container) = server.items.holding_container(item_id) else {
+            return Some(false);
+        };
+        let mut txn = ItemTxn::begin(server);
+        let mut guard = lock(&container);
+        let matches = guard
+            .get_item_by_id(item_id)
+            .is_some_and(|item| item.template_id == expected_template_id);
+        if !matches {
+            return Some(false);
+        }
+        if amount > 0 {
+            let consumed = guard.consume_item(
+                task_type::SKILL_REAGENTS,
+                expected_template_id,
+                amount,
+                Some(item_id),
+                &mut txn.env,
+            );
+            if consumed != amount {
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+
     fn consume_item_by_id(
         &self,
         server: &GameServer,

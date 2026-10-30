@@ -1863,6 +1863,7 @@ pub fn apply_effects(server: &GameServer, skill: &SkillRef, ctx: &CastCtx) {
                     crate::systems::housing::is_building_effect(server, template)
                 })
     };
+    let mut owned_item_use: Option<(u64, u32, i32)> = None;
     if let Some(last) = last_applied {
         // Deviation: C# looked at the last applied effect only. Skills with mixed flags (a
         // consuming GainItem followed by an Interaction effect) never consumed the item, so the
@@ -1872,20 +1873,23 @@ pub fn apply_effects(server: &GameServer, skill: &SkillRef, ctx: &CastCtx) {
         let template_effect = applied()
             .rev()
             .find(|e| e.consume_item_id != 0 && e.consume_item_count > 0);
-        if let (
-            SkillCaster::Item {
-                item_id,
-                item_template_id,
-                ..
-            },
-            Some(_),
-        ) = (ctx.caster_caster, &player)
+        if let SkillCaster::Item {
+            item_id,
+            item_template_id,
+            ..
+        } = ctx.caster_caster
         {
-            if let Some(e) = source_effect {
-                consumed_items.push((item_id, e.consume_item_count));
+            // The cast item is the source of the skill: consume it (or only re-verify it when
+            // the skill consumes nothing) right before the effects run, so an item that left the
+            // bag during a cast time refuses the cast instead of firing for free.
+            let amount = if let Some(e) = source_effect {
+                e.consume_item_count
             } else if items.use_skill_as_reagent(server, item_template_id) {
-                consumed_items.push((item_id, last.consume_item_count));
-            }
+                last.consume_item_count
+            } else {
+                0
+            };
+            owned_item_use = Some((item_id, item_template_id, amount));
         }
         if let Some(p) = &player {
             if let Some(e) = template_effect.filter(|e| {
@@ -1930,6 +1934,24 @@ pub fn apply_effects(server: &GameServer, skill: &SkillRef, ctx: &CastCtx) {
             for prod in &products {
                 items.acquire_item(server, p, prod.item_id, i32::from(prod.amount));
             }
+        }
+    }
+
+    // An item that left the bag during the cast time refuses the effect before it runs. The
+    // pre-check resolves the template from the item itself; the consumption below repeats the
+    // check atomically, so a concurrent move cannot slip between them.
+    if let (Some((item_id, _, _)), Some(p)) = (owned_item_use, &player) {
+        let still_owned = items
+            .owned_item(server, p, item_id)
+            .is_some_and(|(template_id, _)| {
+                items.consume_owned_item(server, p, item_id, template_id, 0) == Some(true)
+            });
+        if !still_owned {
+            // The 1.2 server stopped the item skill without a result packet; the client sees
+            // the casting-stopped packet. The effects never run.
+            skill.state().cancelled = true;
+            stop(server, skill, caster, 0);
+            return;
         }
     }
 
@@ -2107,6 +2129,21 @@ pub fn apply_effects(server: &GameServer, skill: &SkillRef, ctx: &CastCtx) {
         }
     }
     if !skill.cancelled() {
+        if let (Some((item_id, template_id, amount)), Some(p)) = (owned_item_use, &player) {
+            if amount > 0 {
+                // Atomic check + consume: only the owned item with the validated template is
+                // taken, even if another task moved or used it since the cast began.
+                match items.consume_owned_item(server, p, item_id, template_id, amount) {
+                    Some(true) => {}
+                    Some(false) => tracing::warn!(
+                        item_id,
+                        template_id,
+                        "SkillItem changed or left the bag before its consumption"
+                    ),
+                    None => consumed_items.push((item_id, amount)),
+                }
+            }
+        }
         if let Some(p) = &player {
             for (item, amount) in consumed_items {
                 items.consume_item_by_id(server, p, item, amount);

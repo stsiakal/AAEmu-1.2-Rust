@@ -438,6 +438,20 @@ pub trait ItemSkillHooks: Send + Sync {
         None
     }
 
+    /// Verify and consume `amount` from the owned item `item_id`, requiring it to still be the
+    /// item with `expected_template_id`, under one container lock. `None` when the implementation
+    /// does not track items (tests / hooks); `Some(false)` refuses the cast.
+    fn consume_owned_item(
+        &self,
+        _server: &GameServer,
+        _player: &PlayerRef,
+        _item_id: u64,
+        _expected_template_id: u32,
+        _amount: i32,
+    ) -> Option<bool> {
+        None
+    }
+
     /// `holdingContainer.ConsumeItem(SkillReagents, templateId, amount, item)`.
     fn consume_item_by_id(
         &self,
