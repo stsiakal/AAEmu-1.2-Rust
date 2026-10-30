@@ -464,3 +464,179 @@ fn start_skill_rejects_unknown_caster_type() {
     let mut body = PacketStream::from_bytes(vec![1, 0, 0, 0, 255]);
     assert!(super::handlers::CSStartSkillPacket::read(&mut body).is_err());
 }
+
+/// A `SkillData` whose client-cast sources come from an in-memory `compact.sqlite3` shaped
+/// database: the real loader decides which skills are client sourced and item only.
+fn loaded_skill_sources(rows: &str) -> crate::data::skills::SkillData {
+    let conn = rusqlite::Connection::open_in_memory().expect("in-memory compact");
+    conn.execute_batch(&format!(
+        "CREATE TABLE skills (id INTEGER, show TEXT, ability_id INTEGER, ability_level INTEGER, \
+             level_step INTEGER, skill_points INTEGER, auto_learn TEXT, need_learn TEXT);
+         CREATE TABLE default_skills (skill_id INTEGER, slot_index INTEGER, add_to_slot TEXT);
+         CREATE TABLE passive_buffs (id INTEGER, ability_id INTEGER, level INTEGER, \
+             buff_id INTEGER, req_points INTEGER, active TEXT);
+         CREATE TABLE buffs (id INTEGER, kind_id INTEGER, duration INTEGER, level_duration INTEGER, \
+             tick REAL, stack_rule_id INTEGER, max_stack INTEGER, init_min_charge INTEGER);
+         CREATE TABLE effects (id INTEGER, actual_type TEXT, actual_id INTEGER);
+         CREATE TABLE skill_effects (skill_id INTEGER, effect_id INTEGER);
+         CREATE TABLE special_effects (id INTEGER, special_effect_type_id INTEGER);
+         CREATE TABLE items (id INTEGER, use_skill_id INTEGER);
+         CREATE TABLE item_grade_skills (skill_id INTEGER);
+         CREATE TABLE doodad_funcs (func_skill_id INTEGER);
+         {rows}"
+    ))
+    .expect("compact schema");
+    crate::data::skills::SkillData::load(&conn).expect("skill data")
+}
+
+/// The `SCSkillStarted` result of `skill` when the packet carries a unit caster, a unit target
+/// and no skill object (the shape these tests use).
+fn started_result(client: &mut TestClient, skill: u32) -> Option<u8> {
+    client
+        .drain()
+        .into_iter()
+        .find_map(|(op, body)| (op == crate::opcodes::sc::SCSkillStartedPacket).then_some(body))
+        .and_then(|body| {
+            let mut s = PacketStream::from_bytes(body);
+            if s.read_u32().ok() != Some(skill) {
+                return None;
+            }
+            let _ = s.read_u16();
+            let _ = s.read_u8();
+            let _ = s.read_bc();
+            let _ = s.read_u8();
+            let _ = s.read_bc();
+            let _ = s.read_u8();
+            let _ = s.read_u16();
+            let _ = s.read_u16();
+            let _ = s.read_u8();
+            let flags = s.read_u8().ok()?;
+            (flags & 1 != 0).then(|| s.read_u8().ok()).flatten()
+        })
+}
+
+/// Adds one item of `template_id` x `count` to the player's bag and registers its container.
+fn give_test_item(
+    server: &crate::GameServer,
+    player: &crate::world::PlayerRef,
+    obj_id: u64,
+    template_id: u32,
+    count: i32,
+) {
+    use crate::models::container::slot_type;
+    use crate::models::item::Item;
+    use crate::systems::economy::inventory::Inv;
+    let template = server.game_data.items.template(template_id).expect("item");
+    let mut item = Item::create(obj_id, template, count, 0, 1, &server.game_data.items, 0);
+    item.owner_id = u64::from(player.character_id);
+    item.slot_type = slot_type::INVENTORY;
+    item.slot = 0;
+    let bag = Inv::of(player).bag();
+    bag.lock().unwrap().items.push(item);
+    server.items.add_container(bag);
+}
+
+/// 26611 "Full XP Restoration": its scrolls' use skill, reachable through nothing else.
+#[tokio::test]
+async fn item_only_skill_is_refused_as_a_plain_cast_and_consumed_on_an_item_cast() {
+    use super::types::{caster_type, SkillCastTarget, SkillCaster, SkillObject};
+    use crate::data::items::ItemTemplate;
+    use crate::systems::economy::inventory::Inv;
+
+    const ITEM_ONLY: u32 = 20_003;
+    const SCROLL: u32 = 6_001;
+    let mut data = mate_cast_data();
+    let mut skill = super::tests::skill_template(ITEM_ONLY);
+    skill.target_type = 0;
+    skill.damage_type_id = 0;
+    let mut effect = super::tests::skill_effect(900_001, super::data::EffectKind::HealEffect, 1);
+    effect.consume_item_count = 1;
+    skill.effects.push(effect);
+    data.systems.skills.add_skill(skill);
+    let mut item = ItemTemplate::plain(SCROLL, 10);
+    item.use_skill_id = ITEM_ONLY;
+    item.use_skill_as_reagent = true;
+    data.items.templates.insert(SCROLL, item);
+    data.skills = loaded_skill_sources(&format!(
+        "INSERT INTO items (id, use_skill_id) VALUES ({SCROLL}, {ITEM_ONLY});"
+    ));
+    let server = Arc::new(test_server_with(data));
+    server.set_self();
+    super::bind(&server);
+    crate::systems::economy::bridges::install(&server);
+    let mut client = TestClient::new(&server, 1, 1);
+    let a = spawn_player(
+        &server,
+        &client,
+        test_character(1, "Caster", 100.0, 100.0),
+        0x100,
+    );
+    client.conn.active_char = Some(a.clone());
+    {
+        let mut c = a.data();
+        c.unit.hp = 500;
+        c.unit.max_hp = 1000;
+        c.unit.mp = 100;
+    }
+    let mut packet = cast_packet_as(caster_type::UNIT, a.obj_id, a.obj_id);
+    packet.skill_id = ITEM_ONLY;
+    super::handlers::start_skill(&server, &mut client.conn, packet);
+    assert_eq!(a.data().unit.hp, 500);
+    assert_eq!(
+        started_result(&mut client, ITEM_ONLY),
+        Some(super::types::skill_result::NO_PERM)
+    );
+    // The real item path still runs the skill and uses the scroll up.
+    give_test_item(&server, &a, 0x7001, SCROLL, 2);
+    let packet = super::handlers::CSStartSkillPacket {
+        skill_id: ITEM_ONLY,
+        caster: SkillCaster::Item {
+            obj_id: a.obj_id,
+            item_id: 0x7001,
+            item_template_id: SCROLL,
+            type1: 0,
+            type2: 0,
+        },
+        target: SkillCastTarget::Unit(a.obj_id),
+        flag: 0,
+        skill_object: SkillObject::None,
+    };
+    super::handlers::start_skill(&server, &mut client.conn, packet);
+    assert_eq!(a.data().unit.hp, 650);
+    assert_eq!(Inv::of(&a).items_count(SCROLL, -1), 1);
+}
+
+/// A skill named by an item table and by another client source keeps its plain cast.
+#[tokio::test]
+async fn item_and_doodad_skill_still_casts_as_a_plain_unit_skill() {
+    use super::types::caster_type;
+
+    const SHARED: u32 = 20_001;
+    let mut data = mate_cast_data();
+    data.skills = loaded_skill_sources(&format!(
+        "INSERT INTO items (id, use_skill_id) VALUES (6_002, {SHARED});
+         INSERT INTO doodad_funcs (func_skill_id) VALUES ({SHARED});"
+    ));
+    assert!(data.skills.is_client_sourced_skill(SHARED));
+    let server = Arc::new(test_server_with(data));
+    server.set_self();
+    super::bind(&server);
+    let mut client = TestClient::new(&server, 1, 1);
+    let a = spawn_player(
+        &server,
+        &client,
+        test_character(1, "Caster", 100.0, 100.0),
+        0x100,
+    );
+    client.conn.active_char = Some(a.clone());
+    {
+        let mut c = a.data();
+        c.unit.hp = 500;
+        c.unit.max_hp = 1000;
+        c.unit.mp = 100;
+    }
+    let mut packet = cast_packet_as(caster_type::UNIT, a.obj_id, a.obj_id);
+    packet.skill_id = SHARED;
+    super::handlers::start_skill(&server, &mut client.conn, packet);
+    assert_eq!(a.data().unit.hp, 650);
+}

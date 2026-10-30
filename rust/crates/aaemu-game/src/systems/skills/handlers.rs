@@ -99,6 +99,18 @@ pub fn start_skill(server: &GameServer, conn: &mut GameConnection, p: CSStartSki
     let result;
     let mut value = 0u32;
     let data = &server.game_data;
+    // A skill reached only through an item use must come with that item: the plain unit cast
+    // would otherwise run it (and consume nothing) anywhere. The Item caster branch below
+    // validates the item's own use skill and consumes the reagent item.
+    if !p.caster.is_item() && data.skills.is_item_only_skill(skill_id) {
+        tracing::warn!(
+            character = %player.data().unit.name,
+            skill_id,
+            "Client cast of an item-only skill without its item refused"
+        );
+        send_cast_refused(&player, skill_id, p.caster, target, p.skill_object);
+        return;
+    }
     let is_default = data.skills.is_default_skill(skill_id);
     let is_common = data.skills.is_common_skill(skill_id);
     let auto = player.data().unit.skill_state.auto_attack.clone();
@@ -178,7 +190,9 @@ pub fn start_skill(server: &GameServer, conn: &mut GameConnection, p: CSStartSki
             .is_some_and(|a| a.skill.template.id == skill_id)
     {
         result = skill_result::SUCCESS;
-    } else if is_default || (is_common && !p.caster.is_item()) {
+    } else if !data.skills.is_item_only_skill(skill_id)
+        && (is_default || (is_common && !p.caster.is_item()))
+    {
         let Some(skill) = template_skill(server, skill_id) else {
             return;
         };

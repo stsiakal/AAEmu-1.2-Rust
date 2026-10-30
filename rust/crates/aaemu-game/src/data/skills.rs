@@ -166,6 +166,8 @@ pub struct SkillData {
     pub common_skills: Vec<u32>,
     /// Skills with a legitimate client-driven source (see [`CLIENT_SKILL_SOURCES`]).
     client_sourced: HashSet<u32>,
+    /// Skills reachable only through an item (`ITEM_SKILL_SOURCES` and no other client source).
+    item_only: HashSet<u32>,
 }
 
 /// `(table, column)` pairs of the static data that name skills a client may cast without owning
@@ -198,10 +200,22 @@ pub const CLIENT_SKILL_SOURCES: &[(&str, &str)] = &[
     ("shipyard_steps", "skill_id"),
 ];
 
+/// The [`CLIENT_SKILL_SOURCES`] entries that reach a skill only through an item use (the
+/// `SkillCaster::Item` path, which validates and consumes the item). A skill named here and by
+/// no other source must never run as a plain unit cast.
+pub const ITEM_SKILL_SOURCES: &[(&str, &str)] =
+    &[("items", "use_skill_id"), ("item_grade_skills", "skill_id")];
+
 impl SkillData {
     /// Whether `id` is named by a client-driven source ([`CLIENT_SKILL_SOURCES`]).
     pub fn is_client_sourced_skill(&self, id: u32) -> bool {
         self.client_sourced.contains(&id)
+    }
+
+    /// Whether `id` is reachable only through an item use ([`ITEM_SKILL_SOURCES`]) and no
+    /// other client source. Such a skill is only accepted on the `SkillCaster::Item` path.
+    pub fn is_item_only_skill(&self, id: u32) -> bool {
+        self.item_only.contains(&id)
     }
 
     /// Marks `id` as client-sourced (tests and fixtures).
@@ -347,6 +361,8 @@ impl SkillData {
             d.buffs.insert(t.id, t);
             Ok(())
         })?;
+        let mut item_sourced = HashSet::new();
+        let mut non_item_sourced = HashSet::new();
         for (table, column) in CLIENT_SKILL_SOURCES {
             // A source table missing from an older compact database only narrows the set.
             let sql = format!("SELECT {column} FROM {table} WHERE {column} > 0");
@@ -355,6 +371,11 @@ impl SkillData {
                 for id in ids {
                     if let Ok(id) = u32::try_from(id?) {
                         d.client_sourced.insert(id);
+                        if ITEM_SKILL_SOURCES.contains(&(table, column)) {
+                            item_sourced.insert(id);
+                        } else {
+                            non_item_sourced.insert(id);
+                        }
                     }
                 }
                 Ok(())
@@ -363,6 +384,12 @@ impl SkillData {
                 tracing::warn!("client skill source {table}.{column} not loaded: {e}");
             }
         }
+        // An item skill that another source also hands to players (doodad / NPC interaction,
+        // craft, quest, ...) keeps its plain cast; only the item-exclusive ids are gated.
+        d.item_only = item_sourced
+            .into_iter()
+            .filter(|id| !non_item_sourced.contains(id))
+            .collect();
         d.finish();
         Ok(d)
     }

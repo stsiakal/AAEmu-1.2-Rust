@@ -2952,6 +2952,14 @@ two bots before the fix (a foreign `Mount` caster, an NPC-only skill and a far d
   only needs a non-success `SCSkillStarted`). Not closed here: a `Mount` caster naming the player
   itself still runs the mount branch (the self allowance above), and a bind-on-pickup item caster
   can still name a different skill id (the legacy fireplace exception, narrowed for UCC effects).
+- **Item-only skills.** `items.use_skill_id` and `item_grade_skills` are player-facing sources,
+  so the fallback branch ran an item's use skill as a plain unit cast and consumed nothing
+  (e.g. 26611 "Full XP Restoration" for free). `SkillData` now keeps the ids named by those two
+  tables and by no other source in a separate `item_only` set
+  (`SkillData::is_item_only_skill`); the `CSStartSkill` handler refuses a non-`Item` caster of
+  one with `NO_PERM` and only the `SkillCaster::Item` branch runs it (validating the item's own
+  use skill and consuming the reagent item). A skill another source also names (doodad / NPC
+  interaction, craft, ...) keeps its plain cast.
 
 ## Ship repair timer and destroyed-vehicle HP (2026-10-20)
 
