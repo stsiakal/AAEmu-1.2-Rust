@@ -161,16 +161,17 @@ impl BotSession {
         base.wrapping_add(started.elapsed().as_millis() as u32)
     }
 
-    /// The overall walk deadline (tests may cap it with [`BotSession::set_walk_deadline_cap`]).
-    pub(crate) fn cap_walk_deadline(&self, deadline: Instant) -> Instant {
+    /// The longest a walk of this bot may run, whatever its route allows (a test hook, see
+    /// [`BotSession::set_walk_deadline_cap`]; `None` in production).
+    pub(crate) fn walk_time_cap(&self) -> Option<Duration> {
         #[cfg(test)]
         {
             let cap = self.walk_deadline_cap_ms.load(Ordering::Relaxed);
             if cap > 0 {
-                return deadline.min(Instant::now() + Duration::from_millis(cap));
+                return Some(Duration::from_millis(cap));
             }
         }
-        deadline
+        None
     }
 
     /// Test hook: no walk of this bot may run longer than `cap`.

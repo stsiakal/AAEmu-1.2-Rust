@@ -52,6 +52,22 @@ const DETOUR_M: f32 = 8.0;
 const MAX_REPLANS: u32 = 3;
 /// Radius of the circles the repath rung routes around.
 const AVOID_RADIUS_M: f32 = 3.0;
+/// A walk may take this many times what the rest of its route needs at the bot's current speed
+/// ...
+const DEADLINE_ROUTE_FACTOR: f32 = 3.0;
+/// ... plus this much slack, in seconds.
+const DEADLINE_SLACK_S: f32 = 30.0;
+/// The speed (m/s) below which the allowance stops growing (a rooted bot does not get an
+/// infinite one).
+const DEADLINE_MIN_SPEED: f32 = 0.5;
+/// A sanity ceiling of one allowance (a day) that keeps the `Duration` conversion finite; no
+/// route needs anything near it.
+const MAX_ALLOWANCE_S: f32 = 86_400.0;
+/// Metres closer along its route that count as progress (they extend the allowance).
+const PROGRESS_M: f32 = 5.0;
+/// A walk whose remaining route did not shrink by [`PROGRESS_M`] for this long is given up,
+/// however much of its allowance is left.
+const NO_PROGRESS_TIMEOUT_S: f32 = 180.0;
 /// A position change this large that the walker's own packets did not make is a server
 /// teleport, not movement. The walker's packets are excluded by comparing against where the
 /// bot stood right after its last packet: a safe drop (up to `MAX_SAFE_DROP_M`, 9.5 m) moves
@@ -65,7 +81,8 @@ pub enum NavFailure {
     Unreachable(String),
     /// The player-legal recovery ladder ran out.
     Stuck(String),
-    /// The walk did not reach the target before its route-scaled deadline.
+    /// The walk ran out of its route-scaled allowance or stopped getting closer
+    /// ([`WalkClock`]).
     Timeout,
     /// A newer `goto` replaced this walk, or the bot left the world.
     Interrupted(&'static str),
@@ -264,6 +281,19 @@ impl RouteWalker {
 
     pub fn plan_len(&self) -> usize {
         self.plan.len()
+    }
+
+    /// The length of the route still ahead of `pos`: to the waypoint the walker is heading for
+    /// and along the rest of the plan; the straight way to the target once the plan is used up.
+    pub fn remaining_len(&self, pos: Vec3) -> f32 {
+        let Some(next) = self.plan.get(self.index) else {
+            return dist3(pos, self.final_target);
+        };
+        let mut len = dist3(pos, *next);
+        for pair in self.plan[self.index..].windows(2) {
+            len += dist3(pair[0], pair[1]);
+        }
+        len
     }
 
     /// Decides the next action from the server's position `pos` at `now_ms`.
@@ -566,9 +596,15 @@ async fn walk(
             return NavOutcome::Failed(NavFailure::Unreachable(reason));
         }
     };
-    let deadline = bot.cap_walk_deadline(walk_deadline(&plan, start, run_speed));
     let mut walker = RouteWalker::new(world, plan, final_target, radius);
     walker.set_speeds(run_speed, swim_speed);
+    let started = tokio::time::Instant::now();
+    let mut clock = WalkClock::new(
+        walker.remaining_len(start),
+        run_speed,
+        started,
+        bot.walk_time_cap().map(|cap| started + cap),
+    );
     let mut jump: Option<JumpState> = None;
     let mut last_pos = start;
     let mut tick = tokio::time::interval(Duration::from_millis(STEP_MS));
@@ -585,7 +621,19 @@ async fn walk(
             return NavOutcome::Failed(NavFailure::Interrupted("the bot was teleported"));
         }
         last_pos = pos;
-        if tokio::time::Instant::now() >= deadline {
+        if let Some(limit) = clock.check(
+            walker.remaining_len(pos),
+            run_speed,
+            tokio::time::Instant::now(),
+        ) {
+            tracing::info!(
+                "Bots: '{}' walk timed out ({limit:?}) at ({:.1}, {:.1}, {:.1}), {:.0} m of route left",
+                bot.name,
+                pos.x,
+                pos.y,
+                pos.z,
+                walker.remaining_len(pos)
+            );
             let outcome = NavOutcome::Failed(NavFailure::Timeout);
             return stop_and_end(bot, server, &player, generation, pos, final_target, outcome)
                 .await;
@@ -689,6 +737,12 @@ async fn walk(
                 {
                     return NavOutcome::Failed(failure);
                 }
+                // A new route: the allowance is derived from what is left of it.
+                clock.replanned(
+                    walker.remaining_len(pos),
+                    run_speed,
+                    tokio::time::Instant::now(),
+                );
             }
             WalkAction::Step(step) => {
                 if matches!(step.action, StepAction::Drop(_)) {
@@ -730,6 +784,11 @@ async fn walk(
                                 {
                                     return NavOutcome::Failed(failure);
                                 }
+                                clock.replanned(
+                                    walker.remaining_len(actual),
+                                    run_speed,
+                                    tokio::time::Instant::now(),
+                                );
                             }
                             _ => {}
                         }
@@ -1125,15 +1184,98 @@ pub(crate) fn speeds(player: &PlayerRef) -> (f32, f32) {
     )
 }
 
-/// The overall walk deadline: three times the route length at the bot's run speed plus 30 s,
-/// capped at 30 min, so a bot that keeps finding "progress" still gives up.
-fn walk_deadline(plan: &[Vec3], from: Vec3, run_speed: f32) -> tokio::time::Instant {
-    let mut len = plan.first().map_or(0.0, |p| dist3(from, *p));
-    for pair in plan.windows(2) {
-        len += dist3(pair[0], pair[1]);
+/// The time limit of one walk: an allowance that follows the route and the bot, and a
+/// no-progress timeout.
+///
+/// * The allowance is [`DEADLINE_ROUTE_FACTOR`] times what the rest of the route needs at the
+///   bot's *current* speed plus [`DEADLINE_SLACK_S`]. Nothing caps it below what the route
+///   needs: a 10 km route gets over an hour, where a fixed 30 minute cap ended walks of
+///   about 3 km (less for a slowed bot) while they were still making progress.
+/// * A re-plan derives it again from the new route ([`WalkClock::replanned`]) and every
+///   [`PROGRESS_M`] the bot gets closer along its route extends it, so a slowed bot or a long
+///   detour that keeps progressing is not timed out half way.
+/// * A walk whose remaining route has not shrunk by [`PROGRESS_M`] for
+///   [`NO_PROGRESS_TIMEOUT_S`] is given up whatever is left of its allowance, so a bot that
+///   wanders without getting closer still ends.
+struct WalkClock {
+    deadline: tokio::time::Instant,
+    /// The shortest remaining route length since the last re-plan and when it was reached.
+    best_m: f32,
+    best_at: tokio::time::Instant,
+    /// Test hook: an absolute stop (`BotSession::walk_time_cap`).
+    hard_stop: Option<tokio::time::Instant>,
+}
+
+/// Which limit of the [`WalkClock`] ended a walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalkLimit {
+    /// The allowance for the rest of the route ran out.
+    Allowance,
+    /// The bot stopped getting closer.
+    NoProgress,
+    /// The test cap.
+    Capped,
+}
+
+impl WalkClock {
+    fn new(
+        remaining_m: f32,
+        speed: f32,
+        now: tokio::time::Instant,
+        hard_stop: Option<tokio::time::Instant>,
+    ) -> Self {
+        Self {
+            deadline: now + allowance(remaining_m, speed),
+            best_m: remaining_m,
+            best_at: now,
+            hard_stop,
+        }
     }
-    let secs = (len / run_speed.max(0.5) * 3.0 + 30.0).clamp(30.0, 1_800.0);
-    tokio::time::Instant::now() + Duration::from_secs_f32(secs)
+
+    /// A new route from the bot's position: the allowance and the progress mark start again
+    /// from its length (lengths along different routes are not comparable).
+    fn replanned(&mut self, remaining_m: f32, speed: f32, now: tokio::time::Instant) {
+        self.deadline = now + allowance(remaining_m, speed);
+        self.best_m = remaining_m;
+        self.best_at = now;
+    }
+
+    /// Records the route still ahead at `now` (progress extends the allowance); the limit that
+    /// has been reached, if any.
+    fn check(
+        &mut self,
+        remaining_m: f32,
+        speed: f32,
+        now: tokio::time::Instant,
+    ) -> Option<WalkLimit> {
+        if remaining_m + PROGRESS_M <= self.best_m {
+            self.best_m = remaining_m;
+            self.best_at = now;
+            self.deadline = self.deadline.max(now + allowance(remaining_m, speed));
+        }
+        if self.hard_stop.is_some_and(|stop| now >= stop) {
+            Some(WalkLimit::Capped)
+        } else if now >= self.deadline {
+            Some(WalkLimit::Allowance)
+        } else if now.duration_since(self.best_at) >= Duration::from_secs_f32(NO_PROGRESS_TIMEOUT_S)
+        {
+            Some(WalkLimit::NoProgress)
+        } else {
+            None
+        }
+    }
+}
+
+/// The time the rest of a route of `remaining_m` metres is allowed to take at `speed` m/s.
+fn allowance(remaining_m: f32, speed: f32) -> Duration {
+    let secs =
+        remaining_m / speed.max(DEADLINE_MIN_SPEED) * DEADLINE_ROUTE_FACTOR + DEADLINE_SLACK_S;
+    let secs = if secs.is_finite() {
+        secs.clamp(DEADLINE_SLACK_S, MAX_ALLOWANCE_S)
+    } else {
+        DEADLINE_SLACK_S
+    };
+    Duration::from_secs_f32(secs)
 }
 
 fn position(player: &PlayerRef) -> Vec3 {

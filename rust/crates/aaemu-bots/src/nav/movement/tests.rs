@@ -555,12 +555,167 @@ fn drop_resets_keep_the_total_and_hit_the_rung_cap() {
 }
 
 #[test]
-fn a_long_walk_gets_a_route_scaled_deadline() {
-    let now = tokio::time::Instant::now();
-    let short = super::walk_deadline(&[], at(0.0, 0.0), 5.4);
-    assert!(short > now && short <= now + std::time::Duration::from_secs(31));
-    let long = super::walk_deadline(&[at(0.0, 0.0), at(100_000.0, 0.0)], at(0.0, 0.0), 5.4);
-    assert!(long <= now + std::time::Duration::from_secs(1_801));
+fn a_long_route_is_given_the_time_it_needs() {
+    use std::time::Duration;
+
+    use tokio::time::Instant;
+
+    let t0 = Instant::now();
+    // 10 km at 5.4 m/s takes about 31 minutes: three times that plus slack, far above the
+    // 30 minute cap that ended walks of about 3 km while they were still progressing.
+    let long = super::WalkClock::new(10_000.0, 5.4, t0, None);
+    assert!(
+        long.deadline >= t0 + Duration::from_secs(5_500),
+        "{:?}",
+        long.deadline - t0
+    );
+    // A short route still gets its slack.
+    let short = super::WalkClock::new(0.0, 5.4, t0, None);
+    assert!(short.deadline >= t0 + Duration::from_secs(30));
+    assert!(short.deadline <= t0 + Duration::from_secs(31));
+}
+
+#[test]
+fn a_slowed_walker_that_keeps_progressing_is_not_timed_out() {
+    use std::time::Duration;
+
+    use tokio::time::Instant;
+
+    // 1 km at 5.4 m/s allows 3 * 185 + 30 = 585 s (the allowance the first plan and speed
+    // gave). The bot is slowed to a tenth: it needs 1851 s, progressing the whole time, and
+    // the allowance follows its current speed.
+    let t0 = Instant::now();
+    let speed = 0.54;
+    let mut clock = super::WalkClock::new(1_000.0, 5.4, t0, None);
+    let (mut remaining, mut secs) = (1_000.0f32, 0.0f32);
+    while remaining > 0.0 {
+        secs += 0.1;
+        remaining -= speed * 0.1;
+        let now = t0 + Duration::from_secs_f32(secs);
+        assert_eq!(
+            clock.check(remaining.max(0.0), speed, now),
+            None,
+            "timed out after {secs:.0} s with {remaining:.0} m left"
+        );
+    }
+    assert!(secs > 1_800.0, "{secs}");
+}
+
+#[test]
+fn a_walker_that_stops_getting_closer_times_out_whatever_its_allowance() {
+    use std::time::Duration;
+
+    use tokio::time::Instant;
+
+    let window = super::NO_PROGRESS_TIMEOUT_S as u64;
+    // 5 km: an allowance of 2800 s, but the bot wanders (3 m closer, then back).
+    let t0 = Instant::now();
+    let mut clock = super::WalkClock::new(5_000.0, 5.4, t0, None);
+    assert_eq!(
+        clock.check(4_997.0, 5.4, t0 + Duration::from_secs(60)),
+        None
+    );
+    assert_eq!(
+        clock.check(5_000.0, 5.4, t0 + Duration::from_secs(window - 10)),
+        None
+    );
+    assert_eq!(
+        clock.check(4_998.0, 5.4, t0 + Duration::from_secs(window)),
+        Some(super::WalkLimit::NoProgress)
+    );
+    // 6 m closer is progress and restarts the window.
+    let mut clock = super::WalkClock::new(5_000.0, 5.4, t0, None);
+    assert_eq!(
+        clock.check(4_994.0, 5.4, t0 + Duration::from_secs(100)),
+        None
+    );
+    assert_eq!(
+        clock.check(4_994.0, 5.4, t0 + Duration::from_secs(100 + window - 1)),
+        None
+    );
+    assert_eq!(
+        clock.check(4_994.0, 5.4, t0 + Duration::from_secs(100 + window)),
+        Some(super::WalkLimit::NoProgress)
+    );
+}
+
+#[test]
+fn a_replan_derives_the_allowance_from_the_new_route() {
+    use std::time::Duration;
+
+    use tokio::time::Instant;
+
+    let t0 = Instant::now();
+    // 100 m: an allowance of 86 s.
+    let mut clock = super::WalkClock::new(100.0, 5.4, t0, None);
+    let t1 = t0 + Duration::from_secs(60);
+    // A re-plan onto a 3 km route: the allowance is that of the new route, and the progress
+    // mark starts again from its length.
+    clock.replanned(3_000.0, 5.4, t1);
+    assert!(clock.deadline >= t1 + Duration::from_secs(1_600));
+    assert_eq!(
+        clock.check(3_000.0, 5.4, t0 + Duration::from_secs(100)),
+        None,
+        "the first route's 86 s no longer apply"
+    );
+    let window = super::NO_PROGRESS_TIMEOUT_S as u64;
+    assert_eq!(
+        clock.check(3_000.0, 5.4, t1 + Duration::from_secs(window - 1)),
+        None
+    );
+    assert_eq!(
+        clock.check(3_000.0, 5.4, t1 + Duration::from_secs(window)),
+        Some(super::WalkLimit::NoProgress)
+    );
+}
+
+#[test]
+fn the_walk_clock_survives_odd_inputs_and_honours_the_test_cap() {
+    use std::time::Duration;
+
+    use tokio::time::Instant;
+
+    for (remaining, speed) in [
+        (f32::NAN, 5.4),
+        (f32::INFINITY, 5.4),
+        (1_000.0, 0.0),
+        (1_000.0, f32::NAN),
+        (-5.0, 5.4),
+        (1e30, 5.4),
+    ] {
+        let allowance = super::allowance(remaining, speed);
+        assert!(
+            allowance >= Duration::from_secs(30) && allowance <= Duration::from_secs(86_400),
+            "{remaining} m at {speed} m/s: {allowance:?}"
+        );
+    }
+    let t0 = Instant::now();
+    let mut clock = super::WalkClock::new(1_000.0, 5.4, t0, Some(t0 + Duration::from_millis(900)));
+    assert_eq!(
+        clock.check(1_000.0, 5.4, t0 + Duration::from_millis(800)),
+        None
+    );
+    assert_eq!(
+        clock.check(990.0, 5.4, t0 + Duration::from_millis(900)),
+        Some(super::WalkLimit::Capped),
+        "the cap is absolute: progress does not extend it"
+    );
+}
+
+#[test]
+fn the_remaining_route_is_what_is_left_of_the_plan() {
+    let world: Arc<dyn NavWorld + Send + Sync> = Arc::new(Flat);
+    let plan = vec![at(10.0, 0.0), at(10.0, 10.0), at(20.0, 10.0)];
+    let mut walker = RouteWalker::new(world, plan, at(20.0, 10.0), 1.0);
+    assert!((walker.remaining_len(at(0.0, 0.0)) - 30.0).abs() < 1e-3);
+    // At the first waypoint the walker moves on to the second.
+    let _ = walker.next(at(10.0, 0.0), 100);
+    assert!((walker.remaining_len(at(10.0, 0.0)) - 20.0).abs() < 1e-3);
+    // Once the plan is used up the way left is the straight one to the target.
+    walker.set_plan(Vec::new(), true);
+    assert!(
+        (walker.remaining_len(at(14.0, 7.0)) - dist3(at(14.0, 7.0), at(20.0, 10.0))).abs() < 1e-3
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
