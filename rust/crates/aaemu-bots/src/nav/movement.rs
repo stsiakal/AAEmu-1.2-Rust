@@ -912,10 +912,28 @@ async fn send_step(
             .await?;
         }
         StepAction::Jump(_) => {
+            tracing::debug!(
+                "Bots: '{}' jumps ({:.1}, {:.1}, {:.2}) -> ({:.1}, {:.1}, {:.2}): {:+.2} m",
+                bot.name,
+                pos.x,
+                pos.y,
+                pos.z,
+                step.to.x,
+                step.to.y,
+                step.to.z,
+                step.to.z - pos.z
+            );
             *jump = Some(JumpState::new(pos, step.to));
             return Ok(false);
         }
         StepAction::Drop(height) => {
+            tracing::debug!(
+                "Bots: '{}' drops {height:.2} m at ({:.1}, {:.1}, {:.2})",
+                bot.name,
+                pos.x,
+                pos.y,
+                pos.z
+            );
             let (_, _, rotation_z) =
                 roll_pitch_yaw_sbytes_movement(0.0, 0.0, heading(pos, step.to));
             send_move(
