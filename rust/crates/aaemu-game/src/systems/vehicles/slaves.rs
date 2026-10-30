@@ -2384,7 +2384,10 @@ pub(super) fn validated_summon_placement(
         return invalid("non-finite coordinates");
     }
     // The final ship pose: the 1.2 client search places ships 90 degrees CCW of the player and
-    // these coordinates are checked with, and spawned at, that same pose.
+    // these coordinates are checked with, and spawned at, that same pose. The placement's own
+    // `yaw` (the client's `PosRot`) is not used: the post-wait recheck re-derives the pose from
+    // the owner's current facing and validates exactly the transform that is spawned, so a
+    // stale client heading cannot skip the check.
     let final_yaw = owner_pos.rot_z + std::f32::consts::FRAC_PI_2;
     // `slaves.spawn_valid_area_range` is the data-side limit (50 m in the 1.2 DB); the skill's
     // own MaxRange is 0 for the boat summon (15802). Use the smaller nonzero limit.
@@ -2776,6 +2779,19 @@ async fn create_with_placement(
                         refund_summon_cooldown(owner, cooldown);
                         return None;
                     };
+                    // The cast's full 1.2 placement check ran before the reservations and the
+                    // hull load. The owner can have turned since, and the final ship yaw comes
+                    // from the current pose, so the 0.5 m centre sphere alone can accept a
+                    // turned hull that now lies across a pier. Recheck the transform that will
+                    // be spawned exactly as the search path does; refuse before the item is
+                    // used if it no longer passes.
+                    if crate::systems::ai::collision::files(server).is_some()
+                        && !summon_placement_clear_1_2(server, world, owner, template, &transform)
+                    {
+                        error(owner, error::SLAVE_SPAWN_SHIP_NEED_MORE_SPACE);
+                        refund_summon_cooldown(owner, cooldown);
+                        return None;
+                    }
                     position_override = Some(transform);
                 } else if let Some(chosen) = position_override {
                     // The search ran before the reservations and the hull load; the player can
@@ -6116,6 +6132,23 @@ mod summon_hull_overlap_tests {
         })));
     }
 
+    /// Turns the player in place once the item wait is over (the turn during the hull load).
+    fn turn_player_after_item_validation(
+        s: &crate::GameServer,
+        p: &crate::world::PlayerRef,
+        yaw: f32,
+    ) {
+        let p = p.clone();
+        *s.systems
+            .vehicles
+            .slave_summons
+            .test_after_item_validation
+            .lock()
+            .unwrap() = Some(super::TestPublicationHook(Arc::new(move |_| {
+            p.data().unit.transform.rot_z = yaw;
+        })));
+    }
+
     /// A spot chosen before the waits is rechecked at the player's current pose; when it no
     /// longer passes, the search reruns from there instead of spawning the stale spot.
     #[tokio::test]
@@ -6181,6 +6214,109 @@ mod summon_hull_overlap_tests {
         assert!(codes.contains(&100), "{codes:?}");
         assert!(!p.data().unit.cooldowns.cooldowns.contains_key(&RULE_SKILL));
         assert_eq!(p.data().unit.global_cooldown_ms, 0);
+    }
+
+    /// A `SummonPos` cleared beside a pier at the cast is invalid once the owner turns 90
+    /// degrees during the waits: the final ship yaw follows the owner's current pose, so the
+    /// full 1.2 placement check must run again on that transform and refuse (error 100),
+    /// instead of spawning the turned hull across the pier. The item is not used and the
+    /// cooldown is refunded.
+    #[tokio::test]
+    async fn a_turned_owner_makes_the_post_wait_placement_check_refuse_a_pier() {
+        let s = world_at_with(
+            search_data(),
+            GROUND,
+            &[(
+                Vec3::new(500.0, 542.0, 100.0),
+                Vec3::new(10.0, 1.0, 5.0),
+                false,
+            )],
+        );
+        install_empty_hull_loader(&s);
+        let (mut client, p) = search_player(&s);
+        give_summon_item(&s, &p, 0x9201);
+        p.data().unit.cooldowns.add_cooldown(RULE_SKILL, 10_000, 0);
+        p.data().unit.global_cooldown_ms = 10_000;
+        let placement = SummonPlacement {
+            x: 500.0,
+            y: 530.0,
+            z: WATER,
+            yaw: std::f32::consts::FRAC_PI_2,
+        };
+        // The cast-time checks pass: yaw 90 puts the hull's length along X and the pier 12 m
+        // north of the centre is outside the 3.25 m beam.
+        let world = s.world.world(0).unwrap();
+        let cast =
+            validated_summon_placement(&s, &world, &p, &ship_template(), Some(placement), 0.0)
+                .expect("the cast placement is valid");
+        assert!(summon_placement_clear_1_2(
+            &s,
+            &world,
+            &p,
+            &ship_template(),
+            &cast
+        ));
+        turn_player_after_item_validation(&s, &p, std::f32::consts::FRAC_PI_2);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            create_for_owner(&s, &p, 0x9201, RULE_ITEM, false, None, Some(placement), 0.0),
+        )
+        .await
+        .expect("summon job");
+        assert!(result.is_none(), "the turned hull overlaps the pier");
+        assert!(s.items.item_by_id(0x9201).is_some(), "the item is not used");
+        assert!(get_active_slave_by_owner_obj_id(&s.world.world(0).unwrap(), p.obj_id).is_none());
+        let codes: Vec<i16> = client
+            .drain()
+            .iter()
+            .filter(|f| f.0 == crate::opcodes::sc::SCErrorMsgPacket)
+            .map(|f| i16::from_le_bytes([f.1[0], f.1[1]]))
+            .collect();
+        assert!(
+            codes.contains(&crate::systems::vehicles::error::SLAVE_SPAWN_SHIP_NEED_MORE_SPACE),
+            "{codes:?}"
+        );
+        assert!(!p.data().unit.cooldowns.cooldowns.contains_key(&RULE_SKILL));
+        assert_eq!(p.data().unit.global_cooldown_ms, 0);
+    }
+
+    /// Without the turn the same `SummonPos` still passes the post-wait full check and spawns.
+    #[tokio::test]
+    async fn an_unturned_client_placement_still_spawns_after_the_waits() {
+        let s = world_at_with(
+            search_data(),
+            GROUND,
+            &[(
+                Vec3::new(500.0, 542.0, 100.0),
+                Vec3::new(10.0, 1.0, 5.0),
+                false,
+            )],
+        );
+        install_empty_hull_loader(&s);
+        let (_client, p) = search_player(&s);
+        give_summon_item(&s, &p, 0x9202);
+        let placement = SummonPlacement {
+            x: 500.0,
+            y: 530.0,
+            z: WATER,
+            yaw: std::f32::consts::FRAC_PI_2,
+        };
+        let slave = tokio::time::timeout(
+            Duration::from_secs(2),
+            create_for_owner(&s, &p, 0x9202, RULE_ITEM, false, None, Some(placement), 0.0),
+        )
+        .await
+        .expect("summon job")
+        .expect("the clear placement spawns");
+        let t = slave.data().unit.transform;
+        assert!(
+            (t.x - 500.0).abs() < 1e-4 && (t.y - 530.0).abs() < 1e-4,
+            "{t:?}"
+        );
+        assert!(
+            (t.rot_z - std::f32::consts::FRAC_PI_2).abs() < 1e-4,
+            "{t:?}"
+        );
     }
 }
 
