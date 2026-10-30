@@ -633,10 +633,11 @@ pub fn parse_item_task(body: &[u8]) -> ItemTaskInfo {
                     });
                 }
                 item_action::SWAP_SLOT => {
+                    s.read_u8()?; // from slot type
+                    s.read_u8()?; // from slot
+                                  // The item ends up in the destination slot: that is the one to remember.
                     let slot_type = s.read_u8()?;
                     let slot = s.read_u8()?;
-                    s.read_u8()?; // to slot type
-                    s.read_u8()?; // to slot
                     let id = s.read_u64()?;
                     s.read_u64()?; // to item id
                     s.read_i32()?; // flags
@@ -697,17 +698,22 @@ pub struct GameState {
     /// Houses of the selected character the server announced and has not demolished since, in
     /// arrival order. Kept whoever consumed the packet, so a house announced late is never lost.
     pub my_houses: Vec<MyHouse>,
-    /// First item of the bag (`SCCharacterInvenContentsPacket`, slot type 2): `(item id, slot)`.
+    /// Bag items of `SCCharacterInvenContentsPacket` (slot type 2): `(item id, slot, template)`.
     pub bag_items: Vec<(u64, u8, u32)>,
-    /// Bag stacks created or changed by `SCItemTaskSuccessPacket`s since connecting, by item id.
-    /// The character's starting inventory is not in here (its chunks only expose their first item).
+    /// The bag: the last inventory snapshot (`SCCharacterInvenContentsPacket`) plus every stack
+    /// an `SCItemTaskSuccessPacket` created or changed since, by item id.
     pub bag: HashMap<u64, BagStack>,
+    /// Units this client added to the bag since it connected, by item id. The crawler destroys
+    /// only these; it survives a reconnect while [`GameState::bag`] is rebuilt from the inventory
+    /// snapshot of the new connection.
+    pub added_items: HashMap<u64, i32>,
     pub bag_slots: u8,
     /// Active quests from `SCQuestsPacket`: template id -> status.
     pub active_quests: HashMap<u32, u8>,
     /// Latest `SCQuestContextStarted/Updated` state: template id -> (status, objectives).
     pub quest_states: HashMap<u32, (u8, [i32; 5])>,
-    /// Quest ids from `SCQuestContextCompletedPacket`.
+    /// Quest ids the character completed: from `SCCompletedQuestsPacket` (the server state of
+    /// this character) and from every `SCQuestContextCompletedPacket` since.
     pub completed_quests: HashSet<u32>,
     /// Latest `SCUnitPointsPacket` per unit: `(hp, mp)` (the wire carries them times 100).
     pub unit_points: HashMap<u32, (i32, i32)>,
@@ -730,7 +736,8 @@ pub struct GameState {
 }
 
 impl GameState {
-    /// Applies one `SCItemTaskSuccessPacket` item task to [`GameState::bag`].
+    /// Applies one `SCItemTaskSuccessPacket` item task to [`GameState::bag`] and the
+    /// [`GameState::added_items`] ledger.
     fn apply_item_task(&mut self, t: &TaskItem) {
         if t.id == 0 {
             return;
@@ -746,27 +753,49 @@ impl GameState {
                         count: t.count,
                     },
                 );
+                if t.count > 0 {
+                    *self.added_items.entry(t.id).or_default() += t.count;
+                }
             }
             item_action::ADD_STACK => {
-                let e = self.bag.entry(t.id).or_insert(BagStack {
-                    template: t.template,
-                    slot_type: t.slot_type,
-                    slot: t.slot,
-                    count: 0,
-                });
-                e.count = (e.count + t.count).max(0);
-                if t.template != 0 {
-                    e.template = t.template;
+                if t.count > 0 {
+                    let e = self.bag.entry(t.id).or_insert(BagStack {
+                        template: t.template,
+                        slot_type: t.slot_type,
+                        slot: t.slot,
+                        count: 0,
+                    });
+                    e.count += t.count;
+                    if t.template != 0 {
+                        e.template = t.template;
+                    }
+                    if t.slot_type != 0 {
+                        e.slot_type = t.slot_type;
+                    }
+                    e.slot = t.slot;
+                    *self.added_items.entry(t.id).or_default() += t.count;
+                } else if let Some(e) = self.bag.get_mut(&t.id) {
+                    // A consumption; never create a stack (or a ledger entry) from it.
+                    e.count = (e.count + t.count).max(0);
+                    if e.count == 0 {
+                        self.bag.remove(&t.id);
+                    }
                 }
-                if t.slot_type != 0 {
-                    e.slot_type = t.slot_type;
+                if t.count < 0 {
+                    if let Some(owed) = self.added_items.get_mut(&t.id) {
+                        *owed = (*owed + t.count).max(0);
+                        if *owed == 0 {
+                            self.added_items.remove(&t.id);
+                        }
+                    }
                 }
-                e.slot = t.slot;
             }
             item_action::REMOVE | item_action::REMOVE_CRAFTING | item_action::SEIZE => {
                 self.bag.remove(&t.id);
+                self.added_items.remove(&t.id);
             }
             item_action::SWAP_SLOT => {
+                // `t.slot_type`/`t.slot` are the destination slot of the moved item.
                 if let Some(e) = self.bag.get_mut(&t.id) {
                     e.slot_type = t.slot_type;
                     e.slot = t.slot;
@@ -996,8 +1025,18 @@ impl GameState {
             st.completed_quests.insert(quest);
             st.quest_states.insert(quest, (5, [0; 5]));
         } else if p.is_sc(sc::SCQuestContextFailedPacket) {
+            // The Rust server never sends this (a failure arrives as an Updated status 2);
+            // kept because the 1.2 packet table has it.
             let quest = s.read_u32()?;
             st.quest_states.entry(quest).or_default().0 = 2;
+        } else if p.is_sc(sc::SCCompletedQuestsPacket) {
+            let count = s.read_i32()?;
+            for _ in 0..count.max(0) {
+                // The wire carries the block id as 16 bits plus its 8-byte body.
+                let id = s.read_u16()?;
+                s.read_bytes(8)?;
+                st.completed_quests.insert(u32::from(id));
+            }
         } else if p.is_sc(sc::SCQuestsPacket) {
             let count = s.read_i32()?;
             if count > 0 {
@@ -1007,15 +1046,45 @@ impl GameState {
                 }
             }
         } else if p.is_sc(sc::SCCharacterInvenContentsPacket) {
+            use aaemu_game::models::item::detail_body_len;
             let slot_type = s.read_u8()?;
             let _num_chunks = s.read_u8()?;
             let chunk = s.read_u8()?;
             if slot_type == 2 {
-                // 10 items per chunk; only leading items can be located (variable layout).
-                let tpl = s.read_u32()?;
-                if tpl != 0 {
-                    let id = s.read_u64()?;
-                    st.bag_items.push((id, chunk * 10, tpl));
+                // Each slot is a full `Item.Write`: a zero template is an empty slot. The
+                // detail body length is fixed by its type (the 1.2 client reader), so the whole
+                // snapshot can be read and a reconnect can rebuild the bag.
+                let mut index = 0u16;
+                while s.remaining() > 0 {
+                    let tpl = s.read_u32()?;
+                    if tpl != 0 {
+                        let id = s.read_u64()?;
+                        s.read_u8()?; // grade
+                        s.read_u8()?; // flags
+                        let count = s.read_i32()?;
+                        let detail = s.read_u8()?;
+                        let len = detail_body_len(detail);
+                        anyhow::ensure!(detail == 0 || len != 0, "unknown item detail type");
+                        s.read_bytes(len)?;
+                        s.read_i64()?; // create time
+                        s.read_i32()?; // lifespan
+                        s.read_u32()?; // made unit id
+                        s.read_u8()?; // world id
+                        s.read_i64()?; // unsecure time
+                        s.read_i64()?; // unpack time
+                        let slot = u8::try_from(u16::from(chunk) * 10 + index).unwrap_or(u8::MAX);
+                        st.bag.insert(
+                            id,
+                            BagStack {
+                                template: tpl,
+                                slot_type: 2,
+                                slot,
+                                count,
+                            },
+                        );
+                        st.bag_items.push((id, slot, tpl));
+                    }
+                    index += 1;
                 }
             }
         }
@@ -2773,8 +2842,50 @@ mod bag_state_tests {
         s.into_bytes()
     }
 
+    fn swap(from: (u8, u8), to: (u8, u8), item_id: u64) -> Vec<u8> {
+        let mut s = PacketStream::new();
+        s.write_u8(8)
+            .write_u8(from.0)
+            .write_u8(from.1)
+            .write_u8(to.0)
+            .write_u8(to.1)
+            .write_u64(item_id)
+            .write_u64(0)
+            .write_i32(0);
+        s.into_bytes()
+    }
+
+    fn inventory_chunk(chunk: u8, items: &[(usize, u64, u32, i32)]) -> Packet {
+        let mut s = PacketStream::new();
+        s.write_u8(2) // bag
+            .write_u8(1)
+            .write_u8(chunk);
+        for index in 0..10 {
+            match items.iter().find(|(i, _, _, _)| *i == index) {
+                Some((_, id, template, count)) => {
+                    s.write_u32(*template)
+                        .write_u64(*id)
+                        .write_u8(0) // grade
+                        .write_u8(0) // flags
+                        .write_i32(*count)
+                        .write_u8(0) // detail type: no body
+                        .write_i64(0)
+                        .write_i32(0)
+                        .write_u32(0)
+                        .write_u8(0)
+                        .write_i64(0)
+                        .write_i64(0);
+                }
+                None => {
+                    s.write_u32(0);
+                }
+            }
+        }
+        packet(sc::SCCharacterInvenContentsPacket, s.into_bytes())
+    }
+
     #[test]
-    fn item_tasks_track_bag_counts() {
+    fn item_tasks_track_bag_counts_and_the_ledger() {
         let mut st = GameState::default();
         st.observe(&item_task(&create(100, 500, 2))).unwrap();
         assert_eq!(
@@ -2786,10 +2897,64 @@ mod bag_state_tests {
                 count: 2
             })
         );
+        assert_eq!(st.added_items.get(&100), Some(&2));
         st.observe(&item_task(&add_stack(100, 500, 5))).unwrap();
         assert_eq!(st.bag[&100].count, 7);
+        assert_eq!(st.added_items[&100], 7);
+        st.observe(&item_task(&add_stack(100, 500, -3))).unwrap();
+        assert_eq!(st.bag[&100].count, 4);
+        assert_eq!(st.added_items[&100], 4);
         st.observe(&item_task(&remove(100, 500))).unwrap();
         assert!(!st.bag.contains_key(&100));
+        assert!(!st.added_items.contains_key(&100));
+    }
+
+    #[test]
+    fn a_consumption_on_an_untracked_stack_creates_nothing() {
+        let mut st = GameState::default();
+        st.observe(&item_task(&add_stack(200, 500, -1))).unwrap();
+        // No count-0 bag entry and no ledger responsibility: cleanup must not invent a unit.
+        assert!(!st.bag.contains_key(&200));
+        assert!(!st.added_items.contains_key(&200));
+    }
+
+    #[test]
+    fn a_slot_swap_stores_the_destination_slot() {
+        let mut st = GameState::default();
+        st.observe(&item_task(&create(300, 500, 1))).unwrap();
+        st.observe(&item_task(&swap((2, 3), (2, 7), 300))).unwrap();
+        assert_eq!(st.bag[&300].slot, 7);
+    }
+
+    #[test]
+    fn an_inventory_snapshot_rebuilds_the_whole_bag() {
+        let mut st = GameState::default();
+        st.observe(&inventory_chunk(
+            1,
+            &[(0, 401, 33027, 1), (2, 402, 33029, 3)],
+        ))
+        .unwrap();
+        assert_eq!(st.bag.len(), 2);
+        assert_eq!(st.bag[&401].slot, 10);
+        assert_eq!(st.bag[&402].slot, 12);
+        assert_eq!(st.bag[&402].count, 3);
+        assert_eq!(st.bag_items.len(), 2);
+        // A snapshot alone never marks anything as added by this client.
+        assert!(st.added_items.is_empty());
+    }
+
+    #[test]
+    fn completed_quests_come_from_the_server_snapshot() {
+        let mut st = GameState::default();
+        let mut body = PacketStream::new();
+        body.write_i32(2)
+            .write_u16(11)
+            .write_raw(&[0; 8])
+            .write_u16(6250)
+            .write_raw(&[0; 8]);
+        st.observe(&packet(sc::SCCompletedQuestsPacket, body.into_bytes()))
+            .unwrap();
+        assert_eq!(st.completed_quests, HashSet::from([11, 6250]));
     }
 
     #[test]

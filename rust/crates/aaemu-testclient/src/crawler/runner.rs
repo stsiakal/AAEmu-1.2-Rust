@@ -24,7 +24,7 @@ use crate::stream::StreamClient;
 const QUIET: Duration = Duration::from_millis(400);
 const CAST_ANSWER: Duration = Duration::from_secs(8);
 
-/// One quest's verdict, appended to `<race>.jsonl` for the dashboard and resumption.
+/// One quest's verdict, appended to `<race>-<character>.jsonl` for the dashboard.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuestResult {
     pub quest: u32,
@@ -32,7 +32,7 @@ pub struct QuestResult {
     pub level: u8,
     pub zone: String,
     pub race: String,
-    /// `passed`, `completed-before`, `failed`, `unsupported` or `skipped`.
+    /// `passed`, `daily-limit`, `failed`, `unsupported` or `skipped`.
     pub status: String,
     /// `accept`, `objective 2`, `turn-in`, ...
     pub step: String,
@@ -122,6 +122,7 @@ impl QuestTracker {
                     e.status = 5;
                 }
             } else if p.is_sc(sc::SCQuestContextFailedPacket) {
+                // The server never sends this; a real failure is an Updated with status 2.
                 let mut s = p.stream();
                 if let Ok(quest) = s.read_u32() {
                     let e = self.states.entry(quest).or_default();
@@ -144,6 +145,45 @@ impl QuestTracker {
     fn status(&self, quest: u32) -> u8 {
         self.state(quest).map_or(0, |s| s.status)
     }
+}
+
+/// Objectives the GM setup had already satisfied when the quest started: a `QuestActObjLevel`
+/// act reads the setup level and an item gather act counts the bag setup filled. They are
+/// complete at accept, so the objective loop never calls `play_objective` for them and cannot
+/// notice the GM shortcut itself.
+fn setup_assisted_steps(
+    state: Option<QuestState>,
+    quest: &Quest,
+    setup_level: u8,
+    setup_items: &[u32],
+) -> Vec<String> {
+    let Some(state) = state else {
+        return Vec::new();
+    };
+    quest
+        .objectives
+        .iter()
+        .enumerate()
+        .filter_map(|(i, obj)| {
+            let reached = state
+                .objectives
+                .get(obj.objective_index as usize)
+                .copied()
+                .unwrap_or(0);
+            if reached < obj.required {
+                return None;
+            }
+            let by_setup = match obj.class.as_str() {
+                "QuestActObjLevel" => setup_level >= obj.level.max(2),
+                "QuestActObjItemGather" => obj.item != 0 && setup_items.contains(&obj.item),
+                "QuestActObjItemGroupGather" => {
+                    obj.items.iter().any(|item| setup_items.contains(item))
+                }
+                _ => false,
+            };
+            by_setup.then(|| format!("objective {} {}", i + 1, obj.class))
+        })
+        .collect()
 }
 
 /// The quest id of an `SCQuestContextCompletedPacket` (its first field).
@@ -217,7 +257,6 @@ impl Session {
 /// Entry point: connect, then play the quests of `cfg.race`.
 pub async fn run(cfg: &CrawlConfig, catalog: &Catalog) -> Result<()> {
     let result_path = cfg.result_path();
-    let mut passed = load_passed(&result_path);
     let failed = if cfg.skip_failed {
         load_failed(&result_path)
     } else {
@@ -228,6 +267,9 @@ pub async fn run(cfg: &CrawlConfig, catalog: &Catalog) -> Result<()> {
     let mut session = connect(cfg, catalog).await?;
     session.gm_bootstrap().await?;
     let account_id = session.account_id;
+    // Gates and skips come from the server's completed-quest list of THIS character, not from
+    // the result file: two characters of the same race must never inherit each other's state.
+    let mut passed: HashSet<u32> = session.game.state.completed_quests.clone();
 
     let mut quests: Vec<&Quest> = catalog
         .quests
@@ -242,7 +284,8 @@ pub async fn run(cfg: &CrawlConfig, catalog: &Catalog) -> Result<()> {
         .count();
     let budget = cfg.limit.map(|n| n.min(attemptable));
     println!(
-        "[crawl] {}: {} quests to attempt ({attemptable} attemptable, {} already passed)",
+        "[crawl] {}: {} quests to attempt ({attemptable} attemptable, {} already completed on this \
+         character)",
         cfg.race.name(),
         budget.map_or_else(|| "all".to_string(), |b| b.to_string()),
         passed.len()
@@ -269,7 +312,7 @@ pub async fn run(cfg: &CrawlConfig, catalog: &Catalog) -> Result<()> {
             match result.status.as_str() {
                 "passed" if result.gm_assisted => "okGM",
                 "passed" => "ok  ",
-                "completed-before" => "done",
+                "daily-limit" => "limit",
                 "skipped" => "skip",
                 "unsupported" => "UNSP",
                 _ => "FAIL",
@@ -280,9 +323,9 @@ pub async fn run(cfg: &CrawlConfig, catalog: &Catalog) -> Result<()> {
             result.step,
             result.reason
         );
-        // A quest that passed (or was already completed on the character) unlocks the quests
-        // gated on it, so later quests in the same run can be attempted without a second pass.
-        if result.status == "passed" || result.status == "completed-before" {
+        // A quest that passed unlocks the quests gated on it, so later quests in the same run
+        // can be attempted without a second pass. Error 621 (daily limit) does not unlock.
+        if result.status == "passed" {
             passed.insert(result.quest);
         }
         results.append(&result)?;
@@ -311,6 +354,10 @@ pub async fn run(cfg: &CrawlConfig, catalog: &Catalog) -> Result<()> {
                 Ok(mut fresh) => {
                     fresh.gm_bootstrap().await?;
                     fresh.tracker = session.tracker;
+                    // The new connection rebuilt the bag from its inventory snapshot; keep the
+                    // ledger of what this crawler added so cleanup still removes those items.
+                    fresh.game.state.added_items =
+                        std::mem::take(&mut session.game.state.added_items);
                     session = fresh;
                 }
                 Err(e) => {
@@ -321,6 +368,8 @@ pub async fn run(cfg: &CrawlConfig, catalog: &Catalog) -> Result<()> {
         }
     }
 
+    let _ = session.sleep_pump(500).await;
+    cleanup_added_items(&mut session).await;
     let _ = session.game.leave_world(0).await;
     let _ = session.pump().await;
     Ok(())
@@ -369,10 +418,9 @@ fn finish_result(
         Err(f) => {
             if f.step == "unsupported" {
                 r.status = "unsupported".into();
-            } else if f.step == "accept" && f.reason.contains("already completed") {
-                // Error 621: the character completed it in an earlier run. Record it so the
-                // quests gated on it unlock in this and later runs.
-                r.status = "completed-before".into();
+            } else if f.step == "accept" && f.reason.contains("daily limit") {
+                // Error 621 (`QuestDailyLimit`). It is not a completion: only the retry marker.
+                r.status = "daily-limit".into();
             } else if f.step == "gate" {
                 r.status = "skipped".into();
             }
@@ -381,14 +429,6 @@ fn finish_result(
         }
     }
     r
-}
-
-fn load_passed(path: &Path) -> HashSet<u32> {
-    // A quest the server reported as already completed (error 621) is as good as passed for the
-    // gate checks: its dependants must unlock in later runs.
-    let mut passed = load_with_status(path, "passed");
-    passed.extend(load_with_status(path, "completed-before"));
-    passed
 }
 
 fn load_failed(path: &Path) -> HashSet<u32> {
@@ -621,9 +661,8 @@ async fn crawl_quest(
     let log = LogWindow::new(cfg.server_log.as_deref());
     let reports = ReportWindow::new(cfg.bugreports.as_deref());
 
-    // Everything the crawler adds (setup items, GM hand-overs) or the quest leaves behind is
-    // destroyed after the quest; `before` is the bag state to restore.
-    let bag_before = session.game.state.bag.clone();
+    // A reward or hand-over that trailed the previous quest is still in the ledger.
+    cleanup_added_items(session).await;
     let body = run_quest_body(session, cfg, catalog, quest, anchor, &gate_items, deadline).await;
     if let Ok(steps) = &body {
         evidence.gm_assisted_steps = steps.clone();
@@ -664,37 +703,43 @@ async fn crawl_quest(
     }
     // Rewards and turn-in item tasks can trail the completed packet.
     let _ = session.sleep_pump(800).await;
-    cleanup_items(session, &bag_before).await;
+    cleanup_added_items(session).await;
     evidence
 }
 
-/// The destroys that restore `now` to the `before` bag snapshot: every stack the crawler added
-/// or the quest left (a new id), and only the units a quest or GM add put on a pre-existing
-/// stack. `(item id, slot type, slot, count)`.
+/// The destroys that remove exactly what the crawler's ledger says it added: `(item id, slot
+/// type, slot, count)`. Only units still in the bag and still owed are destroyed, so a stack the
+/// crawler never touched is never touched by cleanup.
 fn items_to_destroy(
-    before: &HashMap<u64, BagStack>,
-    now: &HashMap<u64, BagStack>,
+    added: &HashMap<u64, i32>,
+    bag: &HashMap<u64, BagStack>,
 ) -> Vec<(u64, u8, u8, i32)> {
     let mut out = Vec::new();
-    for (id, stack) in now {
+    for (id, owed) in added {
+        if *owed <= 0 {
+            continue;
+        }
+        let Some(stack) = bag.get(id) else {
+            continue;
+        };
         if stack.slot_type != 2 {
             continue;
         }
-        let count = match before.get(id) {
-            None => stack.count,
-            Some(old) if stack.count > old.count => stack.count - old.count,
-            _ => continue,
-        };
-        out.push((*id, stack.slot_type, stack.slot, count.max(1)));
+        let count = (*owed).min(stack.count);
+        if count <= 0 {
+            continue;
+        }
+        out.push((*id, stack.slot_type, stack.slot, count));
     }
     out.sort_unstable();
     out
 }
 
-/// Destroys the bag stacks the crawler added during a quest (GM items) and the ones the quest
-/// left (rewards, leftover objective items), so the bag does not fill up over a run.
-async fn cleanup_items(session: &mut Session, before: &HashMap<u64, BagStack>) {
-    let doomed = items_to_destroy(before, &session.game.state.bag);
+/// Destroys every bag unit the crawler added (GM items, quest rewards, leftover objective items)
+/// that is still there, so the bag does not fill up over a run. The ledger survives reconnects
+/// while the bag is rebuilt from the new connection's inventory snapshot.
+async fn cleanup_added_items(session: &mut Session) {
+    let doomed = items_to_destroy(&session.game.state.added_items, &session.game.state.bag);
     for (id, slot_type, slot, count) in &doomed {
         let mut s = PacketStream::new();
         s.write_u64(*id)
@@ -708,6 +753,18 @@ async fn cleanup_items(session: &mut Session, before: &HashMap<u64, BagStack>) {
     }
     if !doomed.is_empty() {
         let _ = session.sleep_pump(600).await;
+        for (id, _, _, count) in &doomed {
+            let remove = match session.game.state.added_items.get_mut(id) {
+                Some(owed) => {
+                    *owed = (*owed - *count).max(0);
+                    *owed == 0
+                }
+                None => false,
+            };
+            if remove {
+                session.game.state.added_items.remove(id);
+            }
+        }
     }
 }
 
@@ -733,6 +790,9 @@ async fn run_quest_body(
             .map_err(|e| QuestFailure::new("setup", format!("level pump: {e:#}")))?;
         session.level = target_level;
     }
+    let setup_level = session.level;
+    // Items setup put in the bag before the accept (a gather act counts the bag when it starts).
+    let mut setup_items: Vec<u32> = gate_items.to_vec();
     // A charge skill does direct damage; the auto attack alone cannot kill quest elites.
     let _ = session.game.learn_skill(11918).await;
     let _ = session.game.learn_skill(18131).await;
@@ -742,7 +802,20 @@ async fn run_quest_body(
 
     // ---- accept ---------------------------------------------------------------
     let accept = accept_quest(session, catalog, quest, anchor, deadline).await;
-    accept.map_err(|e| QuestFailure::new("accept", e))?;
+    setup_items.extend(accept.map_err(|e| QuestFailure::new("accept", e))?);
+    // The server runs the acts when the quest starts: an ItemGather act counts the current bag
+    // and an ObjLevel act reads the current level. Read that first state before the objective
+    // loop can break on it, or a setup-satisfied objective would look like a real pass.
+    session
+        .pump()
+        .await
+        .map_err(|e| QuestFailure::new("accept", format!("pump: {e:#}")))?;
+    gm_assisted.extend(setup_assisted_steps(
+        session.tracker.state(quest.id),
+        quest,
+        setup_level,
+        &setup_items,
+    ));
 
     // ---- objectives -----------------------------------------------------------
     for (i, obj) in quest.objectives.iter().enumerate() {
@@ -767,6 +840,13 @@ async fn run_quest_body(
                 break;
             }
             if session.tracker.progress(quest.id, obj.objective_index) >= obj.required {
+                // The Updated that completed it may have arrived after the post-accept pump;
+                // flag it here if the setup could have satisfied it.
+                for step in setup_assisted_steps(Some(state), quest, setup_level, &setup_items) {
+                    if !gm_assisted.contains(&step) {
+                        gm_assisted.push(step);
+                    }
+                }
                 break;
             }
             if Instant::now() >= deadline {
@@ -824,8 +904,13 @@ async fn accept_quest(
     quest: &Quest,
     anchor: (f32, f32, f32),
     deadline: Instant,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<Vec<u32>, String> {
     let starter = &quest.starter;
+    // Items setup put in the bag: the starter item, whether it is used or gained.
+    let starter_items = match starter.kind.as_str() {
+        "item" | "item_gain" => vec![starter.item],
+        _ => Vec::new(),
+    };
     match starter.kind.as_str() {
         "npc" => {
             let obj = goto_npc(session, catalog, starter.npc, anchor, deadline)
@@ -854,7 +939,7 @@ async fn accept_quest(
             .map_err(|e| format!("starter item {}: {e}", starter.item))?;
             let _ = session.sleep_pump(800).await;
             if session.tracker.status(quest.id) != 0 {
-                return Ok(());
+                return Ok(starter_items);
             }
             if starter.kind == "item" {
                 let use_skill = catalog.items.get(&starter.item).map_or(0, |i| i.use_skill);
@@ -889,16 +974,36 @@ async fn accept_quest(
             .filter(|p| p.is_sc(sc::SCErrorMsgPacket))
             .filter_map(|p| p.stream().read_i16().ok())
             .collect();
-        // 621 = QuestDailyLimit: the character already completed a non-repeatable quest.
+        // 621 = QuestDailyLimit (the server also sends it for an already completed
+        // non-repeatable quest). It is not a completion: later runs must retry.
         // 287 = CLOSED_ZONE, often a stale answer to the GM teleport that preceded the accept.
         if codes.contains(&621) {
-            return Err("already completed".into());
+            return Err("daily limit (error 621)".into());
         }
         if session.tracker.state(quest.id).is_some() {
-            return Ok(());
+            return Ok(starter_items);
         }
     }
     Err("no SCQuestContextStartedPacket (server refused or ignored the accept)".into())
+}
+
+/// What the quest packets and tracker say about a sent turn-in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TurnInState {
+    Pending,
+    Completed,
+    Failed,
+}
+
+fn turn_in_state(quest: u32, status: u8, packets: &[Packet]) -> TurnInState {
+    if status == 2 {
+        return TurnInState::Failed;
+    }
+    if status == 5 || packets.iter().any(|p| completed_quest_id(p) == Some(quest)) {
+        TurnInState::Completed
+    } else {
+        TurnInState::Pending
+    }
 }
 
 async fn turn_in(
@@ -939,28 +1044,36 @@ async fn turn_in(
             .pump()
             .await
             .map_err(|e| format!("turn-in pump: {e:#}"))?;
-        if packets
-            .iter()
-            .any(|p| completed_quest_id(p) == Some(quest.id))
-        {
-            return Ok(());
-        }
-        match session.tracker.status(quest.id) {
-            5 => return Ok(()),
-            2 => {
+        match turn_in_state(quest.id, session.tracker.status(quest.id), &packets) {
+            TurnInState::Completed => return Ok(()),
+            TurnInState::Failed => {
                 return Err(format!(
                     "quest failed on turn-in: {}",
                     last_events(&session.game)
                 ))
             }
-            _ => {}
+            TurnInState::Pending => {}
         }
         tokio::time::sleep(Duration::from_millis(400)).await;
     }
-    Err(format!(
-        "no SCQuestContextCompletedPacket (status {})",
-        session.tracker.status(quest.id)
-    ))
+    // The deadline may already have passed when the complete packet was sent (the teleport to
+    // the turn-in NPC uses it up), so the loop above never ran. Always give the answer the send
+    // may produce one final drain before deciding the turn-in failed.
+    let packets = session
+        .pump()
+        .await
+        .map_err(|e| format!("turn-in pump: {e:#}"))?;
+    match turn_in_state(quest.id, session.tracker.status(quest.id), &packets) {
+        TurnInState::Completed => Ok(()),
+        TurnInState::Failed => Err(format!(
+            "quest failed on turn-in: {}",
+            last_events(&session.game)
+        )),
+        TurnInState::Pending => Err(format!(
+            "no SCQuestContextCompletedPacket (status {})",
+            session.tracker.status(quest.id)
+        )),
+    }
 }
 
 async fn play_objective(
@@ -2018,23 +2131,28 @@ fn list_reports(dir: &Path) -> HashSet<PathBuf> {
 
 // ----- GM access -------------------------------------------------------------
 
-/// The game server config as the server itself loads it: `Config.json` next to `path`, then
-/// `path` over it, then `Section__Key` environment variables.
+/// The game server config as the server itself loads it: `Config.json`, then
+/// `Configurations/**/*.json` (sorted), then `Config.Local.json` in `path`'s directory, with an
+/// explicitly named file merged last; `Section__Key` environment variables win over all files.
 fn load_game_config(
     path: &Path,
     env: impl IntoIterator<Item = (String, String)>,
 ) -> anyhow::Result<serde_json::Value> {
-    let mut merged = serde_json::Value::Object(Default::default());
-    if let Some(base) = path.parent().map(|d| d.join("Config.json")) {
-        if base != path && base.exists() {
-            let text = std::fs::read_to_string(&base)
-                .with_context(|| format!("reading {}", base.display()))?;
-            aaemu_game::config::merge(&mut merged, serde_json::from_str(&text)?);
-        }
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut files = aaemu_game::config::config_files(dir);
+    if !files.iter().any(|file| file == path) {
+        files.push(path.to_path_buf());
     }
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    aaemu_game::config::merge(&mut merged, serde_json::from_str(&text)?);
+    let mut merged = serde_json::Value::Object(Default::default());
+    for file in files {
+        if !file.exists() {
+            continue;
+        }
+        let text = std::fs::read_to_string(&file)
+            .with_context(|| format!("reading {}", file.display()))?;
+        let text = aaemu_game::config::relax_json(text.trim_start_matches('\u{feff}'));
+        aaemu_game::config::merge(&mut merged, serde_json::from_str(&text)?);
+    }
     aaemu_game::config::apply_env(&mut merged, env);
     Ok(merged)
 }
@@ -2052,7 +2170,7 @@ fn mysql_provider(
         .and_then(|v| v.as_str())
         .unwrap_or("127.0.0.1")
         .to_string();
-    let port = match port_override {
+    let port: u16 = match port_override {
         Some(port) => port,
         None => {
             let text = get_ci(mysql, "Port")
@@ -2065,6 +2183,11 @@ fn mysql_provider(
                 .with_context(|| format!("invalid MySQLProvider.Port {text:?}"))?
         }
     };
+    anyhow::ensure!(
+        port != 3306,
+        "refusing MySQL port 3306 (the developer's own server); the crawler may only use the \
+         lane's private MySQL (reached through the game config or --mysql-port)"
+    );
     let user = get_ci(mysql, "User")
         .and_then(|v| v.as_str())
         .context("MySQLProvider.User missing")?
@@ -2163,27 +2286,6 @@ mod tests {
         dir
     }
 
-    fn result(quest: u32, status: &str) -> QuestResult {
-        QuestResult {
-            quest,
-            name: format!("quest {quest}"),
-            level: 1,
-            zone: "zone".into(),
-            race: "nuian".into(),
-            status: status.into(),
-            step: "accept".into(),
-            reason: String::new(),
-            gm_assisted: false,
-            gm_assisted_steps: Vec::new(),
-            act_kinds: Vec::new(),
-            objectives: Vec::new(),
-            duration_ms: 0,
-            warnings: Vec::new(),
-            reports: Vec::new(),
-            account_id: 1,
-        }
-    }
-
     fn stack(template: u32, slot: u8, count: i32) -> BagStack {
         BagStack {
             template,
@@ -2195,69 +2297,221 @@ mod tests {
 
     #[test]
     fn two_quests_needing_the_same_item_each_get_a_fresh_stack() {
-        let before = HashMap::new();
         let mut bag = HashMap::new();
+        let mut ledger = HashMap::new();
         bag.insert(1, stack(500, 3, 2));
-        let doomed = items_to_destroy(&before, &bag);
+        ledger.insert(1, 2);
+        let doomed = items_to_destroy(&ledger, &bag);
         assert_eq!(doomed, [(1, 2, 3, 2)]);
         // Applying the cleanup empties the bag again, so the next quest's gain is a new stack.
         for (id, _, _, _) in &doomed {
             bag.remove(id);
+            ledger.remove(id);
         }
         assert!(bag.is_empty());
         bag.insert(2, stack(500, 4, 2));
-        assert_eq!(items_to_destroy(&before, &bag), [(2, 2, 4, 2)]);
+        ledger.insert(2, 2);
+        assert_eq!(items_to_destroy(&ledger, &bag), [(2, 2, 4, 2)]);
     }
 
     #[test]
-    fn cleanup_removes_only_what_the_quest_added() {
-        let mut before = HashMap::new();
-        before.insert(9, stack(417, 3, 3));
-        let mut now = before.clone();
-        now.insert(9, stack(417, 3, 5));
-        now.insert(10, stack(500, 4, 1));
-        now.insert(
-            11,
+    fn cleanup_removes_only_the_units_the_crawler_added() {
+        let mut bag = HashMap::new();
+        let mut ledger = HashMap::new();
+        // A pre-existing stack of 3 grew by 2 (GM add): only the 2 are the crawler's.
+        bag.insert(9, stack(417, 3, 5));
+        ledger.insert(9, 2);
+        // A quest reward stack is fully the crawler's.
+        bag.insert(10, stack(500, 4, 1));
+        ledger.insert(10, 1);
+        // A zero responsibility (a consumed unit) is never destroyed.
+        bag.insert(11, stack(600, 5, 1));
+        ledger.insert(11, 0);
+        // An equipment slot is never destroyed.
+        bag.insert(
+            12,
             BagStack {
                 slot_type: 1,
-                ..stack(600, 0, 1)
+                ..stack(700, 0, 1)
             },
         );
+        ledger.insert(12, 1);
         assert_eq!(
-            items_to_destroy(&before, &now),
+            items_to_destroy(&ledger, &bag),
             [(9, 2, 3, 2), (10, 2, 4, 1)]
         );
     }
 
     #[test]
-    fn completed_before_counts_as_passed_for_gates() {
-        let dir = temp_dir("completed-before");
-        let path = dir.join("nuian.jsonl");
-        let mut text = String::new();
-        for (quest, status) in [
-            (1, "passed"),
-            (2, "completed-before"),
-            (3, "skipped"),
-            (4, "failed"),
-        ] {
-            text.push_str(&serde_json::to_string(&result(quest, status)).unwrap());
-            text.push('\n');
+    fn cleanup_never_destroys_an_untracked_stack() {
+        let bag = HashMap::from([(1, stack(500, 2, 1))]);
+        assert!(items_to_destroy(&HashMap::new(), &bag).is_empty());
+    }
+
+    fn objective(class: &str, index: u8, required: i32) -> Objective {
+        Objective {
+            class: class.into(),
+            component: 0,
+            act_id: 0,
+            objective_index: index,
+            required,
+            npc: 0,
+            npcs: Vec::new(),
+            doodad: 0,
+            highlight_doodad: 0,
+            item: 0,
+            items: Vec::new(),
+            sphere: 0,
+            level: 0,
         }
-        std::fs::write(&path, text).unwrap();
-        let passed = load_passed(&path);
-        assert_eq!(passed, HashSet::from([1, 2]));
-        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn quest(objectives: Vec<Objective>) -> Quest {
+        use crate::crawler::catalog::{Rewards, Starter, Turnin};
+        Quest {
+            id: 1,
+            name: "quest".into(),
+            level: 1,
+            zone_id: 0,
+            zone: String::new(),
+            category_id: 0,
+            detail_id: 0,
+            repeatable: false,
+            let_it_done: false,
+            score: 0,
+            start_component: 0,
+            starter: Starter {
+                kind: "auto".into(),
+                npc: 0,
+                doodad: 0,
+                item: 0,
+                count: 0,
+                sphere: 0,
+                act: String::new(),
+            },
+            objectives,
+            turnin: Turnin {
+                kind: "auto".into(),
+                npc: 0,
+                doodad: 0,
+                act: String::new(),
+            },
+            rewards: Rewards::default(),
+            gates: Vec::new(),
+            gate_items: Vec::new(),
+            unsupported: None,
+            instance: false,
+        }
+    }
+
+    #[test]
+    fn setup_satisfied_objectives_are_gm_assisted_at_accept() {
+        let mut level = objective("QuestActObjLevel", 0, 1);
+        level.level = 10;
+        let mut gather = objective("QuestActObjItemGather", 1, 1);
+        gather.item = 33381;
+        let mut group = objective("QuestActObjItemGroupGather", 2, 1);
+        group.items = vec![7, 8];
+        let q = quest(vec![
+            level,
+            gather,
+            group,
+            objective("QuestActObjTalk", 3, 1),
+        ]);
+        // Complete at accept: the setup level and gate item made them true; talk did not.
+        let state = QuestState {
+            status: 1,
+            objectives: [1, 1, 1, 0, 0],
+        };
+        assert_eq!(
+            setup_assisted_steps(Some(state), &q, 10, &[33381, 8]),
+            [
+                "objective 1 QuestActObjLevel",
+                "objective 2 QuestActObjItemGather",
+                "objective 3 QuestActObjItemGroupGather"
+            ]
+        );
+        // Not complete at accept: no flag even though setup could satisfy them.
+        let state = QuestState {
+            status: 1,
+            objectives: [0, 0, 0, 0, 0],
+        };
+        assert!(setup_assisted_steps(Some(state), &q, 10, &[33381, 8]).is_empty());
+        // Complete, but the setup neither raised the level nor put the items in the bag.
+        let state = QuestState {
+            status: 1,
+            objectives: [1, 1, 1, 0, 0],
+        };
+        assert!(setup_assisted_steps(Some(state), &q, 2, &[]).is_empty());
+    }
+
+    fn outcome(failure: Option<QuestFailure>) -> QuestOutcome {
+        QuestOutcome {
+            outcome: failure.map_or(Ok(()), Err),
+            warnings: Vec::new(),
+            reports: Vec::new(),
+            objectives: Vec::new(),
+            gm_assisted_steps: Vec::new(),
+            duration_ms: 0,
+        }
+    }
+
+    #[test]
+    fn daily_limit_is_recorded_as_retryable() {
+        let cfg = CrawlConfig::defaults();
+        let q = quest(Vec::new());
+        let r = finish_result(
+            &cfg,
+            &q,
+            outcome(Some(QuestFailure::new("accept", "daily limit (error 621)"))),
+            1,
+        );
+        assert_eq!(r.status, "daily-limit");
+    }
+
+    #[test]
+    fn setup_flag_reaches_the_finished_result() {
+        let cfg = CrawlConfig::defaults();
+        let q = quest(Vec::new());
+        let mut out = outcome(None);
+        out.gm_assisted_steps = vec!["objective 1 QuestActObjItemGather".into()];
+        let r = finish_result(&cfg, &q, out, 1);
+        assert_eq!(r.status, "passed");
+        assert!(r.gm_assisted);
+        assert_eq!(r.gm_assisted_steps.len(), 1);
+    }
+
+    fn completed_packet(quest: u32) -> Packet {
+        let mut body = PacketStream::new();
+        body.write_u32(quest).write_raw(&[0; 8]).write_u32(0);
+        Packet {
+            level: crate::game::LEVEL_GAME,
+            opcode: sc::SCQuestContextCompletedPacket,
+            body: body.into_bytes(),
+        }
+    }
+
+    #[test]
+    fn final_turn_in_check_accepts_a_completed_status() {
+        // The wait loop may not run once the deadline has passed: the final check still sees a
+        // completed tracker from the sent packet.
+        assert_eq!(turn_in_state(7, 5, &[]), TurnInState::Completed);
+        assert_eq!(turn_in_state(7, 0, &[]), TurnInState::Pending);
+        assert_eq!(turn_in_state(7, 2, &[]), TurnInState::Failed);
+        assert_eq!(
+            turn_in_state(7, 0, &[completed_packet(7)]),
+            TurnInState::Completed
+        );
+        // Another quest's completion packet does not count.
+        assert_eq!(
+            turn_in_state(7, 0, &[completed_packet(8)]),
+            TurnInState::Pending
+        );
     }
 
     #[test]
     fn completed_packet_is_matched_by_quest_id() {
-        let mut body = PacketStream::new();
-        body.write_u32(4242).write_raw(&[0; 8]).write_u32(0);
-        let packet = Packet {
-            level: crate::game::LEVEL_GAME,
-            opcode: sc::SCQuestContextCompletedPacket,
-            body: body.into_bytes(),
-        };
+        let packet = completed_packet(4242);
         assert_eq!(completed_quest_id(&packet), Some(4242));
         assert_eq!(
             completed_quest_id(&Packet {
@@ -2271,9 +2525,22 @@ mod tests {
     #[test]
     fn game_config_merges_local_over_base_and_env() {
         let dir = temp_dir("game-config");
+        // Comments and a trailing comma are valid for the game's relaxed reader.
         std::fs::write(
             dir.join("Config.json"),
-            r#"{"Connections":{"MySQLProvider":{"Host":"10.0.0.2","Port":"%db_port%","User":"u","Password":"p","Database":"base"}}}"#,
+            r#"{
+                // game-style comment
+                "Connections": {"MySQLProvider": {
+                    "Host": "10.0.0.2", "Port": "%db_port%", "User": "u",
+                    "Password": "p", "Database": "base",
+                }},
+            }"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("Configurations")).unwrap();
+        std::fs::write(
+            dir.join("Configurations").join("extra.json"),
+            r#"{"Connections":{"MySQLProvider":{"Port":"1111"}}}"#,
         )
         .unwrap();
         let local = dir.join("Config.Local.json");
@@ -2284,6 +2551,7 @@ mod tests {
         .unwrap();
 
         let value = load_game_config(&local, Vec::new()).unwrap();
+        // Local overrides the Configurations file, which overrides Config.json.
         assert_eq!(
             mysql_provider(&value, None).unwrap(),
             (
@@ -2314,5 +2582,16 @@ mod tests {
         let err = mysql_provider(&value, None).unwrap_err().to_string();
         assert!(err.contains("refusing to default to 3306"), "{err}");
         assert_eq!(mysql_provider(&value, Some(3317)).unwrap().1, 3317);
+    }
+
+    #[test]
+    fn an_explicit_3306_is_refused() {
+        let value = serde_json::json!({
+            "Connections": {"MySQLProvider": {"Port": "3306", "User": "u", "Database": "d"}}
+        });
+        let err = mysql_provider(&value, None).unwrap_err().to_string();
+        assert!(err.contains("refusing MySQL port 3306"), "{err}");
+        let err = mysql_provider(&value, Some(3306)).unwrap_err().to_string();
+        assert!(err.contains("refusing MySQL port 3306"), "{err}");
     }
 }

@@ -38,20 +38,23 @@ $TC crawl --race nuian \
   first character is created (`accounts` / `characters` in the lane's game database). The
   file is merged over the `Config.json` next to it and overridden by
   `Connections__MySQLProvider__*` environment variables, as the game server does; a config
-  without a port is refused (the crawler never assumes 3306) unless `--mysql-port` is given.
-  Without `--game-config` the GM bootstrap prints the SQL the account needs.
+  without a port is refused, and an explicit 3306 is refused too (the crawler may only use the
+  lane's private MySQL) unless `--mysql-port` names another port. `Configurations/**/*.json` is
+  merged in the server's order. Without `--game-config` the GM bootstrap prints the SQL the
+  account needs.
 - `--min-level` raises the character before each quest (setup); `0` uses the quest level.
   `--limit` counts quests the crawler can actually attempt, not unsupported/gated ones;
   without it the crawler attempts every quest currently available in the level band.
 - `--from-quest` starts at the first catalog quest with that id or later; `--levels a-b`
   restricts the level band.
-- Results are appended to `<out>/<race>.jsonl` and are resumable: quests that already passed
-  in that file are skipped. Unsupported and skipped quests are re-recorded but do not consume
-  the limit. A quest that passes (or that the server reports as already completed) unlocks the
-  quests chained behind it later in the same run; a prerequisite that failed keeps its
-  dependants skipped until it passes in a later run. `--skip-failed` additionally skips quests
-  that already failed in the result file, so a full-band pass only spends time on quests that
-  were never attempted.
+- Results are appended to `<out>/<race>-<character>.jsonl`, one file per character: two
+  characters of the same race never share results. Gates and passes are seeded from the
+  server's completed-quest list for the character that just entered the world, not from the
+  file. Unsupported and skipped quests are re-recorded but do not consume the limit. A quest
+  that passes unlocks the quests chained behind it later in the same run; a prerequisite that
+  failed keeps its dependants skipped until it passes in a later run. `--skip-failed`
+  additionally skips quests that already failed in that character's result file, so a
+  full-band pass only spends time on quests that were never attempted.
 - Enable `BugReports.Enabled` in the lane's `rs-game/Config.Local.json` (Directory empty =
   `<app>/BugReports`) to attach report paths to failures. The crawler ignores teleport /
   closed-zone report noise.
@@ -64,19 +67,22 @@ $TC crawl --race nuian \
 targets, turn-in, rewards, race/faction/level requirements and the nearest authored target
 positions. It is written on every run and never committed.
 
-Each result records `passed`, `completed-before`, `failed`, `unsupported` or `skipped`, the
-failing step (`accept`, `objective N <act>`, `turn-in`, ...), the objective counters reached,
-the duration, the server WARN/ERROR lines in the quest window and new bug-report paths. A quest
-that passes only because a GM command satisfied an objective (an item hand-over for a gather
-act with no highlight doodad, or `/level` for a level act) is marked `gm_assisted` with the
-objective list. `completed-before` is error 621 (the character already completed the quest in
-an earlier run); it still unlocks the quests gated on it.
+Each result records `passed`, `daily-limit`, `failed`, `unsupported` or `skipped`, the failing
+step (`accept`, `objective N <act>`, `turn-in`, ...), the objective counters reached, the
+duration, the server WARN/ERROR lines in the quest window and new bug-report paths. A quest is
+marked `gm_assisted` (with the objective list) when a GM command or the pre-accept setup
+satisfied an objective: an item hand-over for a gather act with no highlight doodad, a gather
+or level act the setup `/level`/gate/starter item made true at accept, or `/level` for a level
+act. `daily-limit` is error 621 (`QuestDailyLimit`); it is not a pass and is retried in later
+runs.
 
 `crawl.json` / `crawl.md` aggregate the latest result per race and quest: totals per race,
 level band, zone and act kind (with GM-assisted passes in their own column, outside the plain
 passed total); failing quests ranked by how many races hit them; bug-report fingerprints.
-Every item the crawler added for a quest and everything the quest left in the bag is destroyed
-after the quest, so a long run does not fill the inventory.
+A ledger records every bag unit the crawler adds, and cleanup destroys exactly those units
+(plus late quest rewards still in the ledger) after each quest and before the next one, so a
+long run does not fill the inventory. The ledger survives a reconnect while the bag is
+rebuilt from the new connection's inventory snapshot.
 
 ## Current coverage and limits
 

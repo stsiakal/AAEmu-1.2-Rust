@@ -143,9 +143,26 @@ impl CrawlConfig {
         }
     }
 
-    /// The per-race JSONL result file.
+    /// The per-character JSONL result file. Results are not shared between two characters of
+    /// the same race: each one has its own completed-quest state on the server.
     pub fn result_path(&self) -> PathBuf {
-        self.out.join(format!("{}.jsonl", self.race.name()))
+        let character = if self.character.is_empty() {
+            self.race.character_name().to_string()
+        } else {
+            self.character.clone()
+        };
+        let character: String = character
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        self.out
+            .join(format!("{}-{character}.jsonl", self.race.name()))
     }
 
     pub fn catalog_path(&self) -> PathBuf {
@@ -184,4 +201,30 @@ pub async fn run(cfg: CrawlConfig) -> anyhow::Result<()> {
 /// Rewrites the dashboard from every `*.jsonl` result file in `out`.
 pub fn dashboard_only(out: &Path) -> anyhow::Result<()> {
     dashboard::write(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn results_are_scoped_per_character() {
+        let mut cfg = CrawlConfig::defaults();
+        cfg.out = PathBuf::from("out");
+        cfg.character = "CrawlerNuian".into();
+        assert_eq!(
+            cfg.result_path(),
+            PathBuf::from("out").join("nuian-CrawlerNuian.jsonl")
+        );
+        cfg.character = "Crawler Nuian/2".into();
+        assert_eq!(
+            cfg.result_path(),
+            PathBuf::from("out").join("nuian-Crawler_Nuian_2.jsonl")
+        );
+        cfg.character.clear();
+        assert_eq!(
+            cfg.result_path(),
+            PathBuf::from("out").join("nuian-CrawlerNuian.jsonl")
+        );
+    }
 }

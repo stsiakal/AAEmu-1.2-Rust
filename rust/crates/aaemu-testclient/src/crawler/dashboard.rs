@@ -16,8 +16,8 @@ struct Counts {
     failed: u64,
     unsupported: u64,
     skipped: u64,
-    /// Quests the server reported as completed before this run (error 621).
-    completed_before: u64,
+    /// Quests refused with error 621 (`QuestDailyLimit`); retried in later runs.
+    daily_limit: u64,
 }
 
 impl Counts {
@@ -28,7 +28,8 @@ impl Counts {
             "failed" => self.failed += 1,
             "unsupported" => self.unsupported += 1,
             "skipped" => self.skipped += 1,
-            "completed-before" => self.completed_before += 1,
+            // `completed-before` was the old name for the same error 621 result.
+            "daily-limit" | "completed-before" => self.daily_limit += 1,
             _ => self.failed += 1,
         }
     }
@@ -38,7 +39,7 @@ impl Counts {
             + self.failed
             + self.unsupported
             + self.skipped
-            + self.completed_before
+            + self.daily_limit
     }
     fn values(&self) -> [u64; 6] {
         [
@@ -47,7 +48,7 @@ impl Counts {
             self.failed,
             self.unsupported,
             self.skipped,
-            self.completed_before,
+            self.daily_limit,
         ]
     }
 }
@@ -105,7 +106,7 @@ const COLUMNS: [&str; 6] = [
     "failed",
     "unsupported",
     "skipped",
-    "completed-before",
+    "daily limit",
 ];
 
 pub fn write(out: &Path) -> Result<()> {
@@ -237,13 +238,13 @@ fn render(d: &Dashboard) -> String {
     ));
     s.push_str(&format!(
         "**Totals:** {} passed, {} passed (GM-assisted), {} failed, {} unsupported, {} skipped, \
-         {} completed before.\n\n",
+         {} daily limit.\n\n",
         d.totals.passed,
         d.totals.passed_gm,
         d.totals.failed,
         d.totals.unsupported,
         d.totals.skipped,
-        d.totals.completed_before
+        d.totals.daily_limit
     ));
 
     s.push_str(&table_header("race"));
@@ -354,7 +355,7 @@ fn add_counts(a: Counts, b: Counts) -> Counts {
         failed: a.failed + b.failed,
         unsupported: a.unsupported + b.unsupported,
         skipped: a.skipped + b.skipped,
-        completed_before: a.completed_before + b.completed_before,
+        daily_limit: a.daily_limit + b.daily_limit,
     }
 }
 
@@ -444,11 +445,11 @@ mod tests {
         counts.add(&result(1, "passed", false));
         counts.add(&result(2, "passed", true));
         counts.add(&result(3, "failed", false));
-        counts.add(&result(4, "completed-before", false));
+        counts.add(&result(4, "daily-limit", false));
         assert_eq!(counts.passed, 1);
         assert_eq!(counts.passed_gm, 1);
         assert_eq!(counts.failed, 1);
-        assert_eq!(counts.completed_before, 1);
+        assert_eq!(counts.daily_limit, 1);
         assert_eq!(counts.total(), 4);
 
         let mut dashboard = Dashboard {
