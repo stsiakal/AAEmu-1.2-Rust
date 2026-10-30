@@ -65,15 +65,15 @@ fn client_source_skills_with_items(with_items: bool) -> crate::data::SkillData {
              req_points INT, active TEXT);
          CREATE TABLE buffs (id INT, kind_id INT, duration INT, level_duration INT, \
              tick REAL, stack_rule_id INT, max_stack INT, init_min_charge INT);
-         CREATE TABLE effects (id INT, actual_type TEXT);
-         INSERT INTO effects VALUES (18268, 'RecoverExpEffect');
-         INSERT INTO effects VALUES (39213, 'RecoverExpEffect');
+         CREATE TABLE effects (id INT, actual_id INT, actual_type TEXT);
+         INSERT INTO effects VALUES (18268, 1, 'RecoverExpEffect');
+         INSERT INTO effects VALUES (39213, 5, 'RecoverExpEffect');
          CREATE TABLE skill_effects (skill_id INT, effect_id INT);
          INSERT INTO skill_effects VALUES (17063, 18268);
          INSERT INTO skill_effects VALUES (26611, 39213);
          CREATE TABLE recover_exp_effects (id INT, need_priest TEXT);
-         INSERT INTO recover_exp_effects VALUES (18268, 't');
-         INSERT INTO recover_exp_effects VALUES (39213, 'f');
+         INSERT INTO recover_exp_effects VALUES (1, 't');
+         INSERT INTO recover_exp_effects VALUES (5, 'f');
          CREATE TABLE items (id INT, use_skill_id INT);",
     )
     .unwrap();
@@ -292,6 +292,39 @@ fn scroll_skill_is_sourced_by_items_not_by_the_priest_window() {
     assert!(
         !without_items.is_client_sourced_skill(SCROLL_SKILL),
         "effect 5 has need_priest = 'f': the priest window does not cast it"
+    );
+}
+
+/// The real 1.2 `compact.sqlite3` keys `recover_exp_effects` by `effects.actual_id`: the prayer's
+/// effect 18268 has `actual_id` 1 (`need_priest = 't'`) while the scroll's 39213 has `actual_id`
+/// 5 (`need_priest = 'f'`). Joining the source table on `effects.id` returns no rows at all.
+#[test]
+#[ignore = "needs AAEMU_COMPACT_DB"]
+fn real_compact_db_sources_the_prayer_through_effects_actual_id() {
+    let Ok(path) = std::env::var("AAEMU_COMPACT_DB") else {
+        return;
+    };
+    let conn =
+        Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let data = crate::data::SkillData::load(&conn).unwrap();
+    assert!(
+        data.is_client_sourced_skill(PRAYER_SKILL),
+        "the priest prayer must be client-sourced from the effect tables"
+    );
+    let ids = crate::data::skills::effect_sourced_skills(
+        &conn,
+        "RecoverExpEffect",
+        "recover_exp_effects",
+        "need_priest",
+    )
+    .unwrap();
+    assert!(
+        ids.contains(&PRAYER_SKILL),
+        "the prayer must be reached through effects.actual_id: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&SCROLL_SKILL),
+        "effect 5 has need_priest = 'f': the priest window does not cast 26611: {ids:?}"
     );
 }
 

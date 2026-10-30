@@ -215,6 +215,33 @@ pub const CLIENT_SKILL_SOURCES: &[(&str, &str)] = &[
 pub const CLIENT_SKILL_EFFECT_SOURCES: &[(&str, &str, &str)] =
     &[("RecoverExpEffect", "recover_exp_effects", "need_priest")];
 
+/// Skill ids named by one effect source table: `skill_effects` -> `effects` -> the source table.
+///
+/// The effect source tables are keyed by `effects.actual_id` (the effect template id, the C#
+/// `SkillEffect.Template` key), not by `effects.id`: in the real data `recover_exp_effects` 1 / 5
+/// are the `actual_id`s of `effects` 18268 / 39213. Only rows whose `column` flag is `'t'` are
+/// casts of the client's own UI.
+pub(crate) fn effect_sourced_skills(
+    conn: &Connection,
+    actual_type: &str,
+    table: &str,
+    column: &str,
+) -> rusqlite::Result<Vec<u32>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT se.skill_id FROM skill_effects se \
+         JOIN effects e ON e.id = se.effect_id \
+         JOIN {table} ef ON ef.id = e.actual_id \
+         WHERE e.actual_type = ?1 AND ef.{column} = 't' AND se.skill_id > 0"
+    ))?;
+    let mut ids = Vec::new();
+    for id in stmt.query_map([actual_type], |r| r.get::<_, i64>(0))? {
+        if let Ok(id) = u32::try_from(id?) {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
 impl SkillData {
     /// Whether `id` is named by a client-driven source ([`CLIENT_SKILL_SOURCES`]).
     pub fn is_client_sourced_skill(&self, id: u32) -> bool {
@@ -383,24 +410,11 @@ impl SkillData {
         for &(actual_type, table, column) in CLIENT_SKILL_EFFECT_SOURCES {
             // The effect table is the C# `SkillManager._effects` key: player recovery skills
             // (the priest's prayer) are reached through the client's own interaction UI.
-            let loaded = conn
-                .prepare(&format!(
-                    "SELECT se.skill_id FROM skill_effects se \
-                     JOIN effects e ON e.id = se.effect_id \
-                     JOIN {table} ef ON ef.id = e.id \
-                     WHERE e.actual_type = ?1 AND ef.{column} = 't' AND se.skill_id > 0"
-                ))
-                .and_then(|mut stmt| {
-                    let ids = stmt.query_map([actual_type], |r| r.get::<_, i64>(0))?;
-                    for id in ids {
-                        if let Ok(id) = u32::try_from(id?) {
-                            d.client_sourced.insert(id);
-                        }
-                    }
-                    Ok(())
-                });
-            if let Err(e) = loaded {
-                tracing::warn!("client skill effect source {actual_type} not loaded: {e}");
+            match effect_sourced_skills(conn, actual_type, table, column) {
+                Ok(ids) => d.client_sourced.extend(ids),
+                Err(e) => {
+                    tracing::warn!("client skill effect source {actual_type} not loaded: {e}")
+                }
             }
         }
         d.finish();
