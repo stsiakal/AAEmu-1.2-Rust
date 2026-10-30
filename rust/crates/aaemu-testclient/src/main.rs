@@ -20,6 +20,11 @@
 //! aaemu-testclient control --describe
 //! aaemu-testclient control --config private.json --login H:P --capture game.jsonl
 //!                          [--deadline-ms 570000]
+//! aaemu-testclient crawl --race nuian|elf|firran|harani --out DIR [--levels a-b]
+//!                        [--from-quest N] [--limit N] [--min-level N] [--skip-failed]
+//!                        [--game-config F] [--server-log F] [--bugreports DIR]
+//!                        Play every quest of one race (see CRAWLER.md).
+//! aaemu-testclient crawl --dashboard --out DIR
 //! ```
 //!
 //! Settings come from `--config` (JSON, see `testclient.example.json`), then the flags. Keep
@@ -29,6 +34,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use aaemu_testclient::crawler::{self, CrawlConfig, Race};
 use aaemu_testclient::diff::{self, DiffConfig};
 use aaemu_testclient::load;
 use aaemu_testclient::record::{self, Recorder};
@@ -46,7 +52,13 @@ struct Args {
 
 impl Args {
     fn parse() -> anyhow::Result<Self> {
-        const SWITCHES: &[&str] = &["list-bots", "describe"];
+        const SWITCHES: &[&str] = &[
+            "list-bots",
+            "describe",
+            "dashboard",
+            "no-grant-gm",
+            "skip-failed",
+        ];
         let mut it = std::env::args().skip(1);
         let cmd = it.next().unwrap_or_else(|| "help".into());
         let argv: Vec<String> = it.collect();
@@ -155,6 +167,64 @@ fn bot_config_with(
     Ok(serde_json::from_value(v)?)
 }
 
+fn crawl_config(args: &Args) -> anyhow::Result<CrawlConfig> {
+    let mut cfg = CrawlConfig::defaults();
+    if let Some(race) = args.get("race") {
+        cfg.race = race.parse::<Race>()?;
+    }
+    cfg.out = PathBuf::from(args.get("out").unwrap_or("crawl"));
+    cfg.user = args
+        .get("user")
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("crawl-{}", cfg.race.name()));
+    cfg.password = args.get("password").unwrap_or("testpass").to_string();
+    cfg.character = args
+        .get("character")
+        .map(str::to_string)
+        .unwrap_or_else(|| cfg.race.character_name().to_string());
+    cfg.login = args.get("login").unwrap_or("127.0.0.1:1237").to_string();
+    if let Some(levels) = args.get("levels") {
+        let (a, b) = levels.split_once('-').unwrap_or((levels, levels));
+        cfg.levels = (a.parse()?, b.parse()?);
+    }
+    if let Some(v) = args.get("from-quest") {
+        cfg.from_quest = Some(v.parse()?);
+    }
+    if let Some(v) = args.get("limit") {
+        cfg.limit = Some(v.parse()?);
+    }
+    if let Some(v) = args.get("compact") {
+        cfg.compact = PathBuf::from(v);
+    }
+    if let Some(v) = args.get("data-dir") {
+        cfg.data_dir = PathBuf::from(v);
+    }
+    if let Some(v) = args.get("game-config") {
+        cfg.game_config = Some(PathBuf::from(v));
+    }
+    if let Some(v) = args.get("mysql-bin") {
+        cfg.mysql_bin = Some(PathBuf::from(v));
+    }
+    if let Some(v) = args.get("mysql-port") {
+        cfg.mysql_port = Some(v.parse()?);
+    }
+    if let Some(v) = args.get("server-log") {
+        cfg.server_log = Some(PathBuf::from(v));
+    }
+    if let Some(v) = args.get("bugreports") {
+        cfg.bugreports = Some(PathBuf::from(v));
+    }
+    if let Some(v) = args.get("quest-timeout") {
+        cfg.quest_timeout = Duration::from_secs(v.parse()?);
+    }
+    if let Some(v) = args.get("objective-timeout") {
+        cfg.objective_timeout = Duration::from_secs(v.parse()?);
+    }
+    cfg.no_grant_gm = args.has("no-grant-gm");
+    cfg.skip_failed = args.has("skip-failed");
+    Ok(cfg)
+}
+
 fn print_outcome(label: &str, o: &Outcome) {
     for s in &o.steps {
         println!(
@@ -237,6 +307,14 @@ async fn main() -> anyhow::Result<()> {
     }
     let kind: Kind = args.get("scenario").unwrap_or("full").parse()?;
     match args.cmd.as_str() {
+        "crawl" => {
+            if args.has("dashboard") {
+                let out = PathBuf::from(args.get("out").context("crawl --dashboard needs --out")?);
+                return crawler::dashboard_only(&out);
+            }
+            let cfg = crawl_config(&args)?;
+            crawler::run(cfg).await?;
+        }
         "run" => {
             let cfg = bot_config(&args)?;
             let out = args.get("out").map(PathBuf::from);

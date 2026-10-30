@@ -152,6 +152,7 @@ dependencies = [
  "hex",
  "miniz_oxide",
  "regex",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

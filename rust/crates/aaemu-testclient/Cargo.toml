@@ -29,3 +29,4 @@ hex.workspace = true
 miniz_oxide.workspace = true
 # `expectlog` patterns in verify suites.
 regex.workspace = true
+rusqlite.workspace = true
