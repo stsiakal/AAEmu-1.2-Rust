@@ -299,11 +299,16 @@ with the player's melee `CSStartSkill` 2 and loots the corpse with `CSLootOpenBa
 3 x boar meat (item 4058). It then reports with `CSCompleteQuestContext` and requires `SCQuestContextCompleted` and
 the reward item 18791. The quest must start at objective 0 (meat left in the bag would pre-fill it), so the
 looted items are destroyed again unless the turn-in consumed them. The completion flag and the spawned NPCs are
-reset with GM commands so the next run can accept the quest again. GM-spawned NPCs carry no owner: bots running in
-parallel first move to their own spot (one of nine, 10 m apart, picked by character id), take the NPC announced
-exactly 3 m in front of them after their own `/spawn npc` (judged by the position of the announcement, hostile boars
-run off at once) and walk back to where they began in the cleanup. Note that the server respawns `/spawn npc` NPCs
-(the runtime spawner stays in the world), so every run leaves a giver and boars behind until the server restarts.
+reset with GM commands so the next run can accept the quest again. GM-spawned NPCs carry no owner: every bot of a
+parallel run owns one slot of a 4 x 4 grid (`--slot N`, 25 m apart, centred on the origin where its run began; default
+the number the account name ends with, the soak runner passes the bot index; more than 16 bots would share slots),
+teleports back to its slot before each `/spawn npc` (a boar chase drifts the bot away), takes only the NPC announced
+within 1 m of the point straight north of its slot that its own command asked for (judged by the position of the
+announcement, hostile boars run off at once) and walks back to where it began in the cleanup. A boar that moved makes
+the bot walk up to it and hit again; the refused hits are counted in the run variables `retry_too_far`,
+`retry_out_of_angle` and `retry_obstacle` (an intermittent server facing / line-of-sight refusal shows there, the soak
+dashboard sums them). Note that the server respawns `/spawn npc` NPCs (the runtime spawner stays in the world), so
+every run leaves a giver and boars behind until the server restarts.
 
 `gather` (GM account) tops labor up, spawns iron vein 1671 with `/spawn doodad` and mines it with the vein's
 `DoodadFuncUse` skill 13986 (doodad target, 10 labor, 4.5 s cast, range 4). It requires `SkillResult` 0, a

@@ -7,7 +7,7 @@ use aaemu_game::opcodes::sc;
 use anyhow::{ensure, Context};
 
 use super::questitem::{chat_text, gm_command};
-use super::{Runner, QUIET};
+use super::{BotConfig, Runner, QUIET};
 use crate::game::{GameClient, Packet};
 
 /// Assert that the bot's account may run GM setup commands.
@@ -284,28 +284,51 @@ pub(super) fn removed_ids(p: &Packet) -> anyhow::Result<Vec<u32>> {
     Ok(ids)
 }
 
-/// A deterministic per-character offset (metres) that keeps the GM spawns of bots running in
-/// parallel apart (at least 10 m between two spots), so each can tell its own NPC (3 m in
-/// front) from the others'.
-pub(super) fn spawn_offset(character_id: u32) -> (f32, f32) {
-    const SLOTS: [(f32, f32); 9] = [
-        (-10.0, -10.0),
-        (0.0, -10.0),
-        (10.0, -10.0),
-        (-10.0, 0.0),
-        (0.0, 0.0),
-        (10.0, 0.0),
-        (-10.0, 10.0),
-        (0.0, 10.0),
-        (10.0, 10.0),
-    ];
-    SLOTS[(u64::from(character_id) % SLOTS.len() as u64) as usize]
+/// The spawn grid of bots that run the same scenario at the same time: [`SLOTS`] spots in a
+/// square grid, [`SLOT_SPACING`] metres apart. Each bot owns one slot for the whole run
+/// (`--slot N`, see [`bot_slot`]), so the NPCs it spawns never land near another bot's spot.
+pub(super) const SLOTS: u32 = 16;
+const SLOT_COLUMNS: u32 = 4;
+pub(super) const SLOT_SPACING: f32 = 25.0;
+
+/// The bot's slot: `BotConfig::slot` (`--slot`), else the number its account name ends with (the
+/// soak runner's accounts are `<prefix>b<index>`), else 0; always below [`SLOTS`]. Only an
+/// explicit, unique `--slot` per bot keeps more than [`SLOTS`] bots apart.
+pub(super) fn bot_slot(cfg: &BotConfig) -> u32 {
+    cfg.slot.unwrap_or_else(|| trailing_number(&cfg.user)) % SLOTS
+}
+
+/// The decimal number a name ends with (0 without one), reduced modulo [`SLOTS`] as it is read.
+fn trailing_number(name: &str) -> u32 {
+    let stem = name.trim_end_matches(|c: char| c.is_ascii_digit());
+    name[stem.len()..]
+        .bytes()
+        .fold(0, |acc, digit| (acc * 10 + u32::from(digit - b'0')) % SLOTS)
+}
+
+/// The offset (east, north), in metres, of `slot` from the scenario origin: a 4 x 4 grid centred
+/// on it. The origin is where the bot stood when the scenario began, captured once, never the
+/// bot's current position (which drifts while it follows an NPC).
+pub(super) fn slot_offset(slot: u32) -> (f32, f32) {
+    let slot = slot % SLOTS;
+    let centre = (SLOT_COLUMNS - 1) as f32 / 2.0;
+    (
+        ((slot % SLOT_COLUMNS) as f32 - centre) * SLOT_SPACING,
+        ((slot / SLOT_COLUMNS) as f32 - centre) * SLOT_SPACING,
+    )
 }
 
 /// How far in front of the bot the GM `/spawn` commands place an NPC, and the leeway accepted
-/// when matching an announcement to the command.
+/// when matching an announcement to the command (the terrain snap and float rounding).
 pub(super) const SPAWN_DISTANCE: f32 = 3.0;
-pub(super) const SPAWN_TOLERANCE: f32 = 0.25;
+pub(super) const SPAWN_TOLERANCE: f32 = 1.0;
+
+/// Where `/spawn npc` puts an NPC for a bot that just teleported to `at`. The teleport leaves the
+/// bot facing yaw 0, and the server places the NPC `SPAWN_DISTANCE` in front
+/// (`add_distance_to_front`: `x -= d * sin(yaw)`, `y += d * cos(yaw)`), straight north.
+pub(super) fn spawn_point(at: (f32, f32, f32)) -> (f32, f32) {
+    (at.0, at.1 + SPAWN_DISTANCE)
+}
 
 /// The bot's own server position (`/position`), for checks the movement echo does not expose
 /// (a rider is a child transform while mounted).
@@ -408,18 +431,86 @@ pub(super) mod tests {
         assert_eq!(added_stack(&packets, 4058).map(|s| s.count), Some(2));
     }
 
+    fn config(user: &str, slot: Option<u32>) -> BotConfig {
+        serde_json::from_value(serde_json::json!({
+            "login": "127.0.0.1:1",
+            "user": user,
+            "password": "x",
+            "character": user,
+            "slot": slot,
+        }))
+        .unwrap()
+    }
+
     #[test]
-    fn spawn_slots_of_neighbouring_characters_are_at_least_ten_metres_apart() {
-        let spots: Vec<(f32, f32)> = (40..49).map(spawn_offset).collect();
-        let distinct: HashSet<(i32, i32)> =
-            spots.iter().map(|s| (s.0 as i32, s.1 as i32)).collect();
-        assert_eq!(distinct.len(), 9, "nine consecutive characters, nine spots");
+    fn the_sixteen_slots_are_distinct_spots_at_least_25_metres_apart_around_the_origin() {
+        let spots: Vec<(f32, f32)> = (0..SLOTS).map(slot_offset).collect();
+        let distinct: HashSet<(i32, i32)> = spots
+            .iter()
+            .map(|s| ((s.0 * 10.0) as i32, (s.1 * 10.0) as i32))
+            .collect();
+        assert_eq!(distinct.len(), SLOTS as usize);
         let mut closest = f32::MAX;
         for (i, a) in spots.iter().enumerate() {
             for b in &spots[i + 1..] {
                 closest = closest.min(((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt());
             }
         }
-        assert!(closest >= 10.0, "spots {closest} m apart");
+        assert!(closest >= SLOT_SPACING - 0.001, "spots {closest} m apart");
+        // Centred on the origin, so no spot is further than 53 m from where the bots began.
+        let (east, north) = spots
+            .iter()
+            .fold((0.0, 0.0), |sum, s| (sum.0 + s.0, sum.1 + s.1));
+        assert!(east.abs() < 0.001 && north.abs() < 0.001);
+        let farthest = spots.iter().map(|s| s.0.hypot(s.1)).fold(0.0, f32::max);
+        assert!(
+            farthest < 53.2,
+            "farthest slot {farthest} m from the origin"
+        );
+        // A slot beyond the grid wraps instead of leaving it.
+        assert_eq!(slot_offset(SLOTS), slot_offset(0));
+        assert_eq!(slot_offset(SLOTS + 5), slot_offset(5));
+    }
+
+    #[test]
+    fn eight_bots_of_one_soak_each_get_their_own_spot_whatever_their_character_ids() {
+        // The soak runner names its accounts `<prefix>b<index>` and passes `--slot <index>`.
+        let prefix = "sk10301234b";
+        let by_flag: HashSet<u32> = (0..8)
+            .map(|i| bot_slot(&config(&format!("{prefix}{i}"), Some(i))))
+            .collect();
+        assert_eq!(by_flag.len(), 8);
+        // Without the flag the account name's trailing index decides, with the same result.
+        let by_name: HashSet<u32> = (0..8)
+            .map(|i| bot_slot(&config(&format!("{prefix}{i}"), None)))
+            .collect();
+        assert_eq!(by_name, by_flag);
+        assert_eq!(bot_slot(&config("sk10301234b3", None)), 3);
+    }
+
+    #[test]
+    fn an_explicit_slot_wins_over_the_account_name_and_stays_inside_the_grid() {
+        assert_eq!(bot_slot(&config("bot12", Some(5))), 5);
+        assert_eq!(bot_slot(&config("bot12", None)), 12);
+        assert_eq!(bot_slot(&config("bot", None)), 0);
+        assert_eq!(bot_slot(&config("bot16", None)), 0);
+        assert_eq!(bot_slot(&config("bot", Some(SLOTS + 2))), 2);
+        // A very long number never overflows.
+        assert!(bot_slot(&config("bot99999999999999999999999999", None)) < SLOTS);
+    }
+
+    #[test]
+    fn the_spawn_point_is_where_the_servers_spawn_command_puts_an_npc_at_yaw_zero() {
+        assert_eq!(spawn_point((100.0, 200.0, 50.0)), (100.0, 203.0));
+        // `/spawn npc` places the NPC with the server's own `add_distance_to_front`; a bot that
+        // just teleported faces yaw 0 (its `move_to` sends direction 0).
+        let mut npc = aaemu_game::models::transform::Transform {
+            x: 100.0,
+            y: 200.0,
+            z: 50.0,
+            ..Default::default()
+        };
+        aaemu_game::systems::vehicles::slaves::add_distance_to_front(&mut npc, SPAWN_DISTANCE);
+        assert_eq!((npc.x, npc.y), spawn_point((100.0, 200.0, 50.0)));
     }
 }

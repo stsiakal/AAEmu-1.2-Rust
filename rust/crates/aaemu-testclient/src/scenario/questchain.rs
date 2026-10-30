@@ -7,6 +7,11 @@
 //! boars 3475 in front of itself, accepts with `CSStartQuestContext`, weakens each boar with the
 //! GM `/damage 99%` setup command, finishes it with `CSStartSkill` 2, loots the corpse with
 //! `CSLootOpenBag(lootAll)`, then reports with `CSCompleteQuestContext` and checks the reward.
+//!
+//! GM-spawned NPCs carry no owner, so bots running in parallel must not spawn near each other:
+//! every bot owns one slot of a 4 x 4 grid (`--slot N`, 25 m apart, anchored at the origin where
+//! its run began), teleports back to its slot before each `/spawn npc` (a boar chase drifts the
+//! bot away) and only accepts an NPC announced within 1 m of the point its own command asked for.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -16,11 +21,13 @@ use aaemu_game::systems::skills::types::skill_result;
 use anyhow::{bail, ensure, Context};
 
 use super::coreloop::{
-    destroy_item, gm_access, item_stacks, item_stacks_any, spawn_offset, teleport_to, ItemStack,
-    SPAWN_DISTANCE, SPAWN_TOLERANCE,
+    bot_slot, destroy_item, gm_access, item_stacks, item_stacks_any, slot_offset, spawn_point,
+    teleport_to, ItemStack, SPAWN_TOLERANCE,
 };
 use super::questitem::{chat_text, gm_command, last_quest_state};
-use super::{own_skill_response, packet_obj_id, quest_template_id, skill_response_result, Runner};
+use super::{
+    own_skill_response, packet_obj_id, quest_template_id, skill_response_result, BotConfig, Runner,
+};
 use crate::game::{GameClient, Packet, UnitInfo};
 
 /// Quest 251 "Angry Boars".
@@ -35,17 +42,43 @@ const MEATS: i32 = 3;
 const REWARD: u32 = 18791;
 /// Melee attack skill of the created fighter.
 const ATTACK: u32 = 2;
-/// Results of a hit that mean the boar moved (out of range, not in front, something between):
-/// the bot walks up to it and aims again.
-const RETRY_RESULTS: [u8; 3] = [
-    skill_result::TOO_FAR_RANGE,
-    skill_result::OUTOF_ANGLE,
-    skill_result::OBSTACLE,
-];
+
+/// How often the player's hit was refused with a result that means the boar moved (out of range,
+/// not in front, something between): the bot then walks up to it and aims again. The counts are
+/// published as run variables (`retry_too_far`, `retry_out_of_angle`, `retry_obstacle`), which
+/// the soak dashboard sums, so an intermittent server facing / line-of-sight bug shows up as a
+/// number even when the retry hides it from the pass rate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Retries {
+    too_far: u32,
+    out_of_angle: u32,
+    obstacle: u32,
+}
+
+impl Retries {
+    /// Counts a refused hit with `result`; false when `result` is not one the bot retries.
+    fn note(&mut self, result: i32) -> bool {
+        let counter = match u8::try_from(result) {
+            Ok(skill_result::TOO_FAR_RANGE) => &mut self.too_far,
+            Ok(skill_result::OUTOF_ANGLE) => &mut self.out_of_angle,
+            Ok(skill_result::OBSTACLE) => &mut self.obstacle,
+            _ => return false,
+        };
+        *counter += 1;
+        true
+    }
+
+    fn publish(&self, r: &mut Runner<'_>) {
+        r.var("retry_too_far", self.too_far);
+        r.var("retry_out_of_angle", self.out_of_angle);
+        r.var("retry_obstacle", self.obstacle);
+    }
+}
 
 #[derive(Default)]
 struct Cleanup {
-    /// Where the bot stood before it moved to its own spot; it goes back there at the end.
+    /// The scenario origin, where the bot stood before it moved to its own spot; it goes back
+    /// there at the end.
     home: Option<(f32, f32, f32)>,
     giver: Option<u32>,
     boars: Vec<u32>,
@@ -54,10 +87,14 @@ struct Cleanup {
     reward: Option<ItemStack>,
 }
 
-pub(super) async fn run(game: &mut GameClient, r: &mut Runner<'_>) -> anyhow::Result<()> {
+pub(super) async fn run(
+    game: &mut GameClient,
+    cfg: &BotConfig,
+    r: &mut Runner<'_>,
+) -> anyhow::Result<()> {
     gm_access(game, r).await?;
     let mut cleanup = Cleanup::default();
-    let result = run_inner(game, r, &mut cleanup).await;
+    let result = run_inner(game, bot_slot(cfg), r, &mut cleanup).await;
     let cleanup_result = cleanup_quest(game, r, &mut cleanup).await;
     let leave = super::coreloop::leave_world(game).await;
     result?;
@@ -68,6 +105,7 @@ pub(super) async fn run(game: &mut GameClient, r: &mut Runner<'_>) -> anyhow::Re
 
 async fn run_inner(
     game: &mut GameClient,
+    slot: u32,
     r: &mut Runner<'_>,
     cleanup: &mut Cleanup,
 ) -> anyhow::Result<()> {
@@ -76,21 +114,29 @@ async fn run_inner(
     game.drain(Duration::from_millis(300), Duration::from_secs(2))
         .await?;
 
-    // ---- a per-character spot so parallel bots spawn their own NPCs apart (GM-spawned NPCs
-    // carry no owner, so the bot takes the NPC that appears next to it) ----
+    // ---- the bot's own spot: parallel bots each own one slot of a grid 25 m apart, anchored at
+    // the origin where this run began (GM-spawned NPCs carry no owner, so the bot takes the NPC
+    // announced at the point its own command requested) ----
     let s = r.begin("game.questchain.position");
-    let base = game.state.self_pos;
-    cleanup.home = Some(base);
-    let (dx, dy) = spawn_offset(game.state.selected_char);
-    teleport_to(game, (base.0 + dx, base.1 + dy, base.2)).await?;
+    let origin = game.state.self_pos;
+    cleanup.home = Some(origin);
+    let (dx, dy) = slot_offset(slot);
+    let spot = (origin.0 + dx, origin.1 + dy, origin.2);
+    r.var("slot", slot);
+    let mut retries = Retries::default();
+    retries.publish(r);
+    let spawn_at = go_to_spot(game, spot).await?;
     r.end(
         s,
-        format!("at {:?} (spawn slot {dx:.1}, {dy:.1})", game.state.self_pos),
+        format!(
+            "slot {slot}: at {:?} (origin {origin:?} + {dx:.1}, {dy:.1}), NPCs spawn at {spawn_at:?}",
+            game.state.self_pos
+        ),
     );
 
     // ---- the giver in front of the bot ----
     let s = r.begin("game.questchain.giver");
-    let giver = spawn_npc(game, GIVER).await?;
+    let giver = spawn_npc(game, GIVER, spawn_at).await?;
     let giver_obj = giver.obj_id;
     cleanup.giver = Some(giver_obj);
     move_near(game, giver.pos).await?;
@@ -153,7 +199,10 @@ async fn run_inner(
             "too many boars without finishing the objective"
         );
         let s = r.begin(&format!("game.questchain.boar{boar_no}"));
-        let boar = spawn_npc(game, BOAR).await?;
+        // Back to the own spot first: the previous boar's chase (or the giver walk) carried the
+        // bot away, and a spawn from there would land on another bot's spot.
+        let spawn_at = go_to_spot(game, spot).await?;
+        let boar = spawn_npc(game, BOAR, spawn_at).await?;
         let boar_obj = boar.obj_id;
         cleanup.boars.push(boar_obj);
         move_near(game, boar.pos).await?;
@@ -189,10 +238,11 @@ async fn run_inner(
                 break;
             }
             ensure!(
-                RETRY_RESULTS.iter().any(|r| i32::from(*r) == result),
+                retries.note(result),
                 "attack on boar {boar_obj} (attempt {}) answered with SkillResult {result}",
                 attempt + 1
             );
+            retries.publish(r);
         }
         ensure!(
             result == 0,
@@ -356,19 +406,35 @@ async fn cleanup_quest(
     );
     Ok(())
 }
-/// Spawns NPC `template` in front of the bot and returns the new unit once it is announced.
-async fn spawn_npc(game: &mut GameClient, template: u32) -> anyhow::Result<UnitInfo> {
-    let me = game.state.self_pos;
+
+/// Teleports the bot to its spot (which also turns it to yaw 0, see [`spawn_point`]) and returns
+/// where a `/spawn npc` from there puts an NPC.
+async fn go_to_spot(game: &mut GameClient, spot: (f32, f32, f32)) -> anyhow::Result<(f32, f32)> {
+    teleport_to(game, spot).await?;
+    Ok(spawn_point(game.state.self_pos))
+}
+
+/// Spawns NPC `template` where the bot's own `/spawn npc` puts it (`spawn_at`, right after
+/// [`go_to_spot`]) and returns the new unit once it is announced.
+async fn spawn_npc(
+    game: &mut GameClient,
+    template: u32,
+    spawn_at: (f32, f32),
+) -> anyhow::Result<UnitInfo> {
     let seq = game.state.observation_seq;
     let reply = gm_command(game, &format!("spawn npc {template}")).await?;
     let texts: Vec<String> = reply.iter().filter_map(chat_text).collect();
     let deadline = Instant::now() + Duration::from_secs(40);
     loop {
-        if let Some(unit) = own_spawn(&game.state.units, template, me, seq) {
+        if let Some(unit) = own_spawn(&game.state.units, template, spawn_at, seq) {
             return Ok(unit);
         }
         if Instant::now() >= deadline {
-            bail!("NPC {template} was not announced after /spawn npc: {texts:?}");
+            bail!(
+                "NPC {template} was not announced within {SPAWN_TOLERANCE} m of {spawn_at:?} after \
+                 /spawn npc: {texts:?}; announced since then: {}",
+                announced_since(&game.state.units, template, spawn_at, seq)
+            );
         }
         game.drain(Duration::from_millis(400), Duration::from_secs(1))
             .await?;
@@ -376,16 +442,18 @@ async fn spawn_npc(game: &mut GameClient, template: u32) -> anyhow::Result<UnitI
 }
 
 /// The NPC the bot's own `/spawn npc` just announced: a unit of `template` announced after
-/// observation `seq` exactly [`SPAWN_DISTANCE`] away from the bot at `me` (GM-spawned NPCs carry
-/// no owner). It is judged by where the announcement placed it, not by where it is now: hostile
-/// boars run off at once, and another bot's spawn is at least 7 m away from this bot's spot.
+/// observation `seq` within [`SPAWN_TOLERANCE`] of `spawn_at`, the point this bot's command
+/// requested (GM-spawned NPCs carry no owner). It is judged by where the announcement placed it,
+/// not by where it is now: hostile boars run off at once. Another bot's spawn is a whole slot
+/// spacing away from `spawn_at`; of several units at the spot (an earlier run's respawned
+/// leftovers) the earliest announcement is the command's own, which is created synchronously.
 fn own_spawn(
     units: &HashMap<u32, UnitInfo>,
     template: u32,
-    me: (f32, f32, f32),
+    spawn_at: (f32, f32),
     seq: u64,
 ) -> Option<UnitInfo> {
-    let off = |u: &UnitInfo| (horizontal(me, u.announced_pos) - SPAWN_DISTANCE).abs();
+    let off = |u: &UnitInfo| horizontal(spawn_at, u.announced_pos);
     units
         .values()
         .filter(|u| {
@@ -395,12 +463,41 @@ fn own_spawn(
                 && off(u) <= SPAWN_TOLERANCE
         })
         .min_by(|a, b| {
-            off(a)
-                .total_cmp(&off(b))
-                .then(a.announced_seq.cmp(&b.announced_seq))
+            a.announced_seq
+                .cmp(&b.announced_seq)
+                .then(off(a).total_cmp(&off(b)))
                 .then(a.obj_id.cmp(&b.obj_id))
         })
         .cloned()
+}
+
+/// The units of `template` announced after `seq` with their distance to `spawn_at`: what the
+/// error of a missed spawn shows (a facing that differs from yaw 0 puts the NPC elsewhere).
+fn announced_since(
+    units: &HashMap<u32, UnitInfo>,
+    template: u32,
+    spawn_at: (f32, f32),
+    seq: u64,
+) -> String {
+    let mut seen: Vec<String> = units
+        .values()
+        .filter(|u| u.unit_type == 1 && u.id == template && u.announced_seq > seq)
+        .map(|u| {
+            format!(
+                "obj {} at ({:.1}, {:.1}), {:.1} m away",
+                u.obj_id,
+                u.announced_pos.0,
+                u.announced_pos.1,
+                horizontal(spawn_at, u.announced_pos)
+            )
+        })
+        .collect();
+    seen.sort();
+    if seen.is_empty() {
+        "nothing".into()
+    } else {
+        seen.join("; ")
+    }
 }
 
 /// Walk right next to `pos`.
@@ -421,7 +518,7 @@ fn meat_received(packets: &[Packet]) -> bool {
 }
 
 /// Distance on the ground (the terrain snaps spawned NPCs to a different height).
-fn horizontal(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
+fn horizontal(a: (f32, f32), b: (f32, f32, f32)) -> f32 {
     ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
 }
 
@@ -470,41 +567,160 @@ mod tests {
     }
 
     #[test]
-    fn the_own_spawn_is_the_unit_announced_after_the_command_three_metres_in_front() {
-        let me = (100.0, 200.0, 50.0);
+    fn the_own_spawn_is_the_unit_announced_after_the_command_at_the_requested_point() {
+        // The bot stands at (100, 200) facing north: its command asks for (100, 203).
+        let spawn_at = (100.0, 203.0);
         let units: HashMap<u32, UnitInfo> = [
             // already known before the command (older announcement), also at the spawn point
-            unit(1, BOAR, (103.0, 200.0, 51.0), 5),
-            // announced after the command: another bot's spawn 7 m away, a respawn 4 m away
-            unit(2, BOAR, (107.0, 200.0, 50.0), 11),
-            unit(3, BOAR, (100.0, 204.0, 50.0), 12),
+            unit(1, BOAR, (100.0, 203.0, 51.0), 5),
+            // announced after the command, but another bot's spawn 25 m away
+            unit(2, BOAR, (125.0, 203.0, 50.0), 11),
+            // 3 m from the bot on its other side: not where this command put its NPC
+            unit(3, BOAR, (100.0, 197.0, 50.0), 12),
             // another template at the spawn point
-            unit(4, GIVER, (103.0, 200.0, 50.0), 13),
-            // the own one: 3 m away on the ground though 4 m higher (terrain snap), and it has
-            // since run 40 m off
-            unit(5, BOAR, (100.0, 203.0, 54.0), 14),
+            unit(4, GIVER, (100.0, 203.0, 50.0), 13),
+            // the own one: 0.5 m off the point, 4 m higher (terrain snap), and it has since
+            // run 40 m off
+            unit(5, BOAR, (100.4, 203.3, 54.0), 14),
         ]
         .into_iter()
         .map(|u| (u.obj_id, u))
         .collect();
-        let own = own_spawn(&units, BOAR, me, 10).expect("an own spawn");
+        let own = own_spawn(&units, BOAR, spawn_at, 10).expect("an own spawn");
         assert_eq!(own.obj_id, 5);
         // Nothing qualifies before the announcement or for another template.
-        assert!(own_spawn(&units, BOAR, me, 14).is_none());
-        assert!(own_spawn(&units, 99, me, 10).is_none());
+        assert!(own_spawn(&units, BOAR, spawn_at, 14).is_none());
+        assert!(own_spawn(&units, 99, spawn_at, 10).is_none());
     }
 
     #[test]
-    fn of_two_spawns_at_the_same_distance_the_earlier_announcement_wins() {
-        let me = (0.0, 0.0, 0.0);
+    fn a_unit_just_outside_the_tolerance_is_not_the_own_spawn() {
+        let spawn_at = (0.0, 3.0);
+        let at = |off: f32| {
+            [unit(1, BOAR, (off, 3.0, 0.0), 20)]
+                .into_iter()
+                .map(|u| (u.obj_id, u))
+                .collect::<HashMap<_, _>>()
+        };
+        assert!(own_spawn(&at(SPAWN_TOLERANCE - 0.1), BOAR, spawn_at, 10).is_some());
+        assert!(own_spawn(&at(SPAWN_TOLERANCE + 0.1), BOAR, spawn_at, 10).is_none());
+        // The old ring test accepted anything 3 m from the bot, whichever side: not any more.
+        assert!(own_spawn(&at(-3.0), BOAR, spawn_at, 10).is_none());
+    }
+
+    #[test]
+    fn of_several_units_at_the_spot_the_earliest_announcement_wins() {
+        // A respawned leftover of an earlier run stands exactly on the point, the command's own
+        // NPC 0.6 m beside it: the command created its NPC first, so it was announced first.
         let units: HashMap<u32, UnitInfo> = [
-            unit(8, BOAR, (3.0, 0.0, 0.0), 21),
-            unit(7, BOAR, (0.0, 3.0, 0.0), 20),
+            unit(8, BOAR, (0.0, 3.0, 0.0), 21),
+            unit(7, BOAR, (0.6, 3.0, 0.0), 20),
         ]
         .into_iter()
         .map(|u| (u.obj_id, u))
         .collect();
-        assert_eq!(own_spawn(&units, BOAR, me, 10).map(|u| u.obj_id), Some(7));
+        assert_eq!(
+            own_spawn(&units, BOAR, (0.0, 3.0), 10).map(|u| u.obj_id),
+            Some(7)
+        );
+        // At the same announcement the nearer one wins, then the lower object id.
+        let units: HashMap<u32, UnitInfo> = [
+            unit(3, BOAR, (0.5, 3.0, 0.0), 20),
+            unit(2, BOAR, (0.0, 3.0, 0.0), 20),
+            unit(1, BOAR, (0.0, 3.0, 0.0), 20),
+        ]
+        .into_iter()
+        .map(|u| (u.obj_id, u))
+        .collect();
+        assert_eq!(
+            own_spawn(&units, BOAR, (0.0, 3.0), 10).map(|u| u.obj_id),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn eight_parallel_bots_each_find_only_their_own_npc() {
+        // Every bot began at the same origin (the Nuian start) and owns one slot; each bot's
+        // command announces a boar at its own spawn point to all of them.
+        let origin = (13000.0, 14000.0, 100.0);
+        let spawn_ats: Vec<(f32, f32)> = (0..8)
+            .map(|slot| {
+                let (dx, dy) = slot_offset(slot);
+                spawn_point((origin.0 + dx, origin.1 + dy, origin.2))
+            })
+            .collect();
+        let units: HashMap<u32, UnitInfo> = spawn_ats
+            .iter()
+            .enumerate()
+            .map(|(i, at)| unit(100 + i as u32, BOAR, (at.0, at.1, 100.0), 50 + i as u64))
+            .map(|u| (u.obj_id, u))
+            .collect();
+        for (i, at) in spawn_ats.iter().enumerate() {
+            assert_eq!(
+                own_spawn(&units, BOAR, *at, 10).map(|u| u.obj_id),
+                Some(100 + i as u32),
+                "bot {i} must bind its own boar"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missed_spawn_names_what_was_announced_instead() {
+        let units: HashMap<u32, UnitInfo> = [
+            unit(6, BOAR, (110.0, 203.0, 0.0), 12),
+            unit(5, BOAR, (100.0, 197.0, 0.0), 11),
+            unit(4, BOAR, (100.0, 203.0, 0.0), 3),
+            unit(7, GIVER, (100.0, 203.0, 0.0), 13),
+        ]
+        .into_iter()
+        .map(|u| (u.obj_id, u))
+        .collect();
+        assert_eq!(
+            announced_since(&units, BOAR, (100.0, 203.0), 10),
+            "obj 5 at (100.0, 197.0), 6.0 m away; obj 6 at (110.0, 203.0), 10.0 m away"
+        );
+        assert_eq!(announced_since(&units, BOAR, (100.0, 203.0), 20), "nothing");
+    }
+
+    #[test]
+    fn retried_hits_are_counted_by_their_skill_result() {
+        let mut retries = Retries::default();
+        assert!(retries.note(i32::from(skill_result::OUTOF_ANGLE)));
+        assert!(retries.note(i32::from(skill_result::OUTOF_ANGLE)));
+        assert!(retries.note(i32::from(skill_result::OBSTACLE)));
+        assert!(retries.note(i32::from(skill_result::TOO_FAR_RANGE)));
+        assert_eq!(
+            retries,
+            Retries {
+                too_far: 1,
+                out_of_angle: 2,
+                obstacle: 1
+            }
+        );
+        // A hit that landed and any other refusal are not retries.
+        assert!(!retries.note(0));
+        assert!(!retries.note(-1));
+        assert!(!retries.note(i32::from(skill_result::OBSTACLE) + 1000));
+        assert_eq!(retries.too_far + retries.out_of_angle + retries.obstacle, 4);
+    }
+
+    #[test]
+    fn the_retry_counts_become_run_variables_of_the_outcome() {
+        let rec = crate::record::Recorder::new(false);
+        let mut runner = Runner {
+            rec: &rec,
+            out: Default::default(),
+        };
+        let mut retries = Retries::default();
+        retries.publish(&mut runner);
+        // Zero is published too, so a dashboard can tell "no retry" from "not measured".
+        assert_eq!(runner.out.vars.get("retry_out_of_angle"), Some(&0));
+        retries.note(i32::from(skill_result::OUTOF_ANGLE));
+        retries.note(i32::from(skill_result::OBSTACLE));
+        retries.publish(&mut runner);
+        assert_eq!(runner.out.vars.get("retry_out_of_angle"), Some(&1));
+        assert_eq!(runner.out.vars.get("retry_obstacle"), Some(&1));
+        assert_eq!(runner.out.vars.get("retry_too_far"), Some(&0));
     }
 
     #[test]

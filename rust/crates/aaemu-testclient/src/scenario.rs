@@ -235,6 +235,11 @@ pub struct BotConfig {
     /// `questitem`: casts tried (rejected ones included) before the step fails.
     #[serde(default = "default_quest_item_max_attempts")]
     pub quest_item_max_attempts: u32,
+    /// `questchain`: the bot's slot (0..16) of the spawn grid. Bots running at the same time
+    /// need different ones (`--slot N`); default: the number the account name ends with (the soak
+    /// runner's accounts are `<prefix>b<index>`), else 0.
+    #[serde(default)]
+    pub slot: Option<u32>,
 }
 
 /// The client packet that asks a stablehand to revive the dead mate. The real protocol is still
@@ -951,7 +956,7 @@ async fn run_inner(
         return Ok(());
     }
     if kind == Kind::QuestChain {
-        questchain::run(&mut game, r).await?;
+        questchain::run(&mut game, cfg, r).await?;
         drop(stream);
         return Ok(());
     }

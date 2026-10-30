@@ -6,6 +6,7 @@
 //!                         [--out capture.jsonl] [--outcome-json outcome.json]
 //!                         [--npc-return-distance M] [--npc-return-away-secs S]
 //!                         [--revive-method repair|skill|none]   (mate-revive; GM account needed)
+//!                         [--slot N]   (questchain: spawn-grid slot 0..16, one per parallel bot)
 //! aaemu-testclient parity [--config F] --a H:P --b H:P [--a-label cs] [--b-label rs]
 //!                         [--user U] [--scenario full] [--masks masks.json] [--out-dir D]
 //!                         [--rounds N]
@@ -117,6 +118,7 @@ fn bot_config_with(
         ("skill", "skill_id"),
         ("quest", "quest_id"),
         ("gs", "game_server_id"),
+        ("slot", "slot"),
     ] {
         if let Some(x) = args.get(flag) {
             obj.insert(key.into(), x.parse::<u64>()?.into());
@@ -326,6 +328,34 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod slot_flag_tests {
+    use super::*;
+
+    fn config(flags: &[(&str, &str)]) -> anyhow::Result<BotConfig> {
+        let args = Args {
+            cmd: "run".into(),
+            flags: flags
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        };
+        bot_config_with(&args, |_| unreachable!("no --config given"))
+    }
+
+    #[test]
+    fn the_slot_flag_reaches_the_bot_config() {
+        assert_eq!(
+            config(&[("user", "sk1b4"), ("slot", "7")]).unwrap().slot,
+            Some(7)
+        );
+        // Without the flag the scenario derives the slot from the account name.
+        assert_eq!(config(&[("user", "sk1b4")]).unwrap().slot, None);
+        assert!(config(&[("slot", "seven")]).is_err());
+        assert!(config(&[("slot", "-1")]).is_err());
+    }
 }
 
 #[cfg(test)]
