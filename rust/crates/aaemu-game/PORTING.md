@@ -2960,6 +2960,12 @@ two bots before the fix (a foreign `Mount` caster, an NPC-only skill and a far d
   one with `NO_PERM` and only the `SkillCaster::Item` branch runs it (validating the item's own
   use skill and consuming the reagent item). A skill another source also names (doodad / NPC
   interaction, craft, ...) keeps its plain cast.
+- **SavePortal special-effect source.** Skills 11215 "Entering location in Teleport Book..." and
+  16841 "Editing Location in Teleport Book..." are not named by any source table: the 1.2 portal
+  window sends a plain `CSStartSkill` with a `SavePortalInfo` object. `SkillData` now sources the
+  skills whose effect is `SpecialEffect` 30 `SavePortal` (`CLIENT_SKILL_SPECIAL_EFFECT_SOURCES`,
+  narrow by type id, not by effect class). The effect still requires the Memory Ink reagent
+  (`skill_reagents`) and only renames the caster's own portal.
 
 ## Ship repair timer and destroyed-vehicle HP (2026-10-20)
 

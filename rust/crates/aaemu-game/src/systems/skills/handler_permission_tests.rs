@@ -640,3 +640,123 @@ async fn item_and_doodad_skill_still_casts_as_a_plain_unit_skill() {
     super::handlers::start_skill(&server, &mut client.conn, packet);
     assert_eq!(a.data().unit.hp, 650);
 }
+
+const SAVE_PORTAL_SKILL: u32 = 11_215;
+const MEMORY_INK: u32 = 4_053;
+const SAVE_PORTAL_EFFECT: u32 = 900;
+
+/// Skill 11215 with the `SavePortal` special effect and its Memory Ink reagent.
+fn save_portal_data() -> GameData {
+    use super::data::effects::SpecialEffect;
+    use super::data::{EffectKind, EffectTemplate, SkillItemAmount, SkillTemplate};
+    let mut d = GameData::empty();
+    d.systems.skills.add_effect(
+        EffectKind::SpecialEffect,
+        EffectTemplate::Special(SpecialEffect {
+            id: SAVE_PORTAL_EFFECT,
+            special_effect_type_id: 30,
+            value1: 0,
+            value2: 0,
+            value3: 0,
+            value4: 0,
+        }),
+        SAVE_PORTAL_EFFECT,
+    );
+    d.systems.skills.add_skill(SkillTemplate {
+        id: SAVE_PORTAL_SKILL,
+        target_type: 0,
+        damage_type_id: 0,
+        casting_time: 0,
+        effects: vec![super::tests::skill_effect(
+            SAVE_PORTAL_EFFECT,
+            EffectKind::SpecialEffect,
+            SAVE_PORTAL_EFFECT,
+        )],
+        ..super::tests::skill_template(SAVE_PORTAL_SKILL)
+    });
+    d.items.templates.insert(
+        MEMORY_INK,
+        crate::data::items::ItemTemplate::plain(MEMORY_INK, 10),
+    );
+    d.systems.skills.skill_reagents.push(SkillItemAmount {
+        id: 1,
+        skill_id: SAVE_PORTAL_SKILL,
+        item_id: MEMORY_INK,
+        amount: 1,
+    });
+    d.skills = loaded_skill_sources(&format!(
+        "INSERT INTO effects (id, actual_type, actual_id) \
+             VALUES ({SAVE_PORTAL_EFFECT}, 'SpecialEffect', {SAVE_PORTAL_EFFECT});
+         INSERT INTO skill_effects (skill_id, effect_id) \
+             VALUES ({SAVE_PORTAL_SKILL}, {SAVE_PORTAL_EFFECT});
+         INSERT INTO special_effects (id, special_effect_type_id) \
+             VALUES ({SAVE_PORTAL_EFFECT}, 30);"
+    ));
+    assert!(d.skills.is_client_sourced_skill(SAVE_PORTAL_SKILL));
+    d
+}
+
+fn save_portal_packet(player: &crate::world::PlayerRef) -> super::handlers::CSStartSkillPacket {
+    use super::types::{SkillCastTarget, SkillCaster, SkillObject};
+    super::handlers::CSStartSkillPacket {
+        skill_id: SAVE_PORTAL_SKILL,
+        caster: SkillCaster::Unit(player.obj_id),
+        target: SkillCastTarget::Unit(player.obj_id),
+        flag: 0,
+        skill_object: SkillObject::SavePortalInfo {
+            id: 0,
+            name: "Home".into(),
+        },
+    }
+}
+
+#[tokio::test]
+async fn teleport_book_record_skill_is_accepted_and_consumes_memory_ink() {
+    use crate::systems::economy::inventory::Inv;
+
+    let server = Arc::new(test_server_with(save_portal_data()));
+    server.set_self();
+    super::bind(&server);
+    crate::systems::economy::bridges::install(&server);
+    crate::systems::npcs::bridges::install(&server);
+    let mut client = TestClient::new(&server, 1, 1);
+    let a = spawn_player(
+        &server,
+        &client,
+        test_character(1, "Traveller", 100.0, 100.0),
+        0x100,
+    );
+    client.conn.active_char = Some(a.clone());
+    give_test_item(&server, &a, 0x7002, MEMORY_INK, 2);
+    super::handlers::start_skill(&server, &mut client.conn, save_portal_packet(&a));
+    let portals = a.data().portals.private_portals.clone();
+    assert_eq!(portals.len(), 1);
+    assert_eq!(portals[0].name, "Home");
+    assert!(portals[0].id > 0);
+    assert_eq!(Inv::of(&a).items_count(MEMORY_INK, -1), 1);
+}
+
+#[tokio::test]
+async fn teleport_book_record_without_memory_ink_is_refused_by_the_reagent_check() {
+    let server = Arc::new(test_server_with(save_portal_data()));
+    server.set_self();
+    super::bind(&server);
+    crate::systems::economy::bridges::install(&server);
+    crate::systems::npcs::bridges::install(&server);
+    let mut client = TestClient::new(&server, 1, 1);
+    let a = spawn_player(
+        &server,
+        &client,
+        test_character(1, "Traveller", 100.0, 100.0),
+        0x100,
+    );
+    client.conn.active_char = Some(a.clone());
+    let mut packet = save_portal_packet(&a);
+    packet.skill_object = super::types::SkillObject::None;
+    super::handlers::start_skill(&server, &mut client.conn, packet);
+    assert!(a.data().portals.private_portals.is_empty());
+    assert_eq!(
+        started_result(&mut client, SAVE_PORTAL_SKILL),
+        Some(super::types::skill_result::NEED_REAGENT)
+    );
+}
