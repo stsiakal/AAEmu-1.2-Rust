@@ -43,6 +43,9 @@ const BREADCRUMBS: usize = 120;
 /// unconditionally, so this only fires in tests (or when another system moved the bot between
 /// the packet and the next tick).
 const REJECTED_MOVE_M: f32 = 1.0;
+/// How long a refused step stands before the probes run again, in milliseconds (the walker
+/// ticks every 100 ms; the stuck tracker still counts every tick).
+const BLOCKED_CACHE_MS: i64 = 500;
 /// A detour fan step, in metres.
 const DETOUR_M: f32 = 8.0;
 /// Plain replans of the same route before the walk gives up.
@@ -196,6 +199,10 @@ pub struct RouteWalker {
     /// The last steering result for the same position and waypoint: the probes (capsule
     /// sweeps, water) run at most once per tick.
     last_step: Option<(Vec3, Vec3, MoveStep)>,
+    /// The position / waypoint a step was refused at, and until when the refusal stands: a
+    /// blocked walker does not repeat the (capsule sweeping) probes every tick while it waits
+    /// for the stuck ladder.
+    last_blocked: Option<(Vec3, Vec3, i64)>,
     /// Every rung delivered in this walk (diagnostics / traces).
     pub rungs: Vec<&'static str>,
 }
@@ -223,6 +230,7 @@ impl RouteWalker {
             run_speed: RUN_SPEED_MPS,
             swim_speed: nav::SWIM_SPEED_MPS,
             last_step: None,
+            last_blocked: None,
             rungs: Vec::new(),
         }
     }
@@ -233,6 +241,7 @@ impl RouteWalker {
             || (self.swim_speed - swim_speed).abs() > f32::EPSILON
         {
             self.last_step = None;
+            self.last_blocked = None;
         }
         self.run_speed = run_speed.max(0.1);
         self.swim_speed = swim_speed.max(0.1);
@@ -247,6 +256,7 @@ impl RouteWalker {
         self.index = 0;
         self.retrace = false;
         self.last_step = None;
+        self.last_blocked = None;
     }
 
     pub fn plan_len(&self) -> usize {
@@ -284,24 +294,42 @@ impl RouteWalker {
                     return WalkAction::Step(step);
                 }
             }
+            if let Some((cached_pos, cached_waypoint, until)) = self.last_blocked {
+                if now_ms < until
+                    && dist2(cached_pos, pos) <= 0.01
+                    && dist2(cached_waypoint, waypoint) <= 0.01
+                {
+                    return self.blocked_action(pos, now_ms);
+                }
+            }
             let retraced = nav::Retrace(self.world.as_ref());
             let world: &dyn NavWorld = if self.retrace {
                 &retraced
             } else {
                 self.world.as_ref()
             };
-            let Some(step) = nav::next_step_steered(
+            let step = match nav::next_step_steered_explained(
                 world,
                 pos,
                 waypoint,
                 &mut self.steer_bias,
                 self.run_speed,
                 self.swim_speed,
-            ) else {
-                if self.tracker.blocked((pos.x, pos.y), now_ms) {
-                    return self.deliver_rung(pos, now_ms);
+            ) {
+                Ok(step) => step,
+                Err(why) => {
+                    tracing::debug!(
+                        "Bots: blocked at ({:.1}, {:.1}, {:.1}) heading for ({:.1}, {:.1}, {:.1}): {why}",
+                        pos.x,
+                        pos.y,
+                        pos.z,
+                        waypoint.x,
+                        waypoint.y,
+                        waypoint.z
+                    );
+                    self.last_blocked = Some((pos, waypoint, now_ms + BLOCKED_CACHE_MS));
+                    return self.blocked_action(pos, now_ms);
                 }
-                return WalkAction::Wait;
             };
             self.last_step = Some((pos, waypoint, step));
             if self.breadcrumbs.back().is_none_or(|p| dist2(*p, pos) > 1.0) {
@@ -336,8 +364,17 @@ impl RouteWalker {
                 && dist2(pos, self.final_target) <= GOAL_TOLERANCE_M + close)
     }
 
+    /// A blocked tick: the stuck tracker counts it and either hands out a rung or waits.
+    fn blocked_action(&mut self, pos: Vec3, now_ms: i64) -> WalkAction {
+        if self.tracker.blocked((pos.x, pos.y), now_ms) {
+            return self.deliver_rung(pos, now_ms);
+        }
+        WalkAction::Wait
+    }
+
     fn deliver_rung(&mut self, pos: Vec3, now_ms: i64) -> WalkAction {
         self.last_step = None;
+        self.last_blocked = None;
         let Some(rung) = self.tracker.rung((pos.x, pos.y), now_ms) else {
             return WalkAction::Failed(NavFailure::Stuck(
                 "the recovery ladder had no rung left".into(),
@@ -411,6 +448,14 @@ struct JumpState {
 impl JumpState {
     fn position(&self) -> Vec3 {
         nav::jump_arc(self.from, self.to, self.elapsed)
+    }
+
+    /// The horizontal displacement of one [`STEP_MS`] tick of the flight: the packet velocity of a
+    /// jump is its real horizontal speed (a short jump is slow), not the running speed.
+    fn step_delta(&self) -> (f32, f32) {
+        let (dx, dy) = delta2(self.from, self.to);
+        let per_step = STEP_MS as f32 / 1000.0 / JUMP_AIR_TIME_S;
+        (dx * per_step, dy * per_step)
     }
 
     fn vertical_velocity(&self) -> f32 {
@@ -538,7 +583,7 @@ async fn walk(
                 server,
                 &player,
                 at,
-                delta2(state.from, state.to),
+                state.step_delta(),
                 state.vertical_velocity(),
                 rotation_z,
                 GameStanceType::COMBAT,

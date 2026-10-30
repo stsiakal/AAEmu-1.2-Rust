@@ -874,3 +874,116 @@ async fn fifty_real_plans_respect_the_gate_and_end_at_their_budget() {
     );
     assert_eq!(gate.available(), 4, "every permit came back");
 }
+
+/// A fence ahead of every step; the arc sweep calls a jump clear when it is at most `max_clear`
+/// metres long (a long running jump is still rising where it passes the fence, a short one
+/// has cleared it).
+struct FenceAhead {
+    max_clear: f32,
+}
+
+impl NavWorld for FenceAhead {
+    fn height(&self, _x: f32, _y: f32) -> Option<f32> {
+        Some(100.0)
+    }
+    fn obstacle(&self, _from: Vec3, _to: Vec3) -> Option<Obstacle> {
+        Some(Obstacle::Low(0.9))
+    }
+    fn jump_clear(&self, from: Vec3, to: Vec3) -> Option<bool> {
+        Some(((to.x - from.x).powi(2) + (to.y - from.y).powi(2)).sqrt() <= self.max_clear)
+    }
+}
+
+#[test]
+fn a_blocked_running_jump_falls_back_to_a_shorter_one() {
+    let from = Vec3::new(100.0, 100.0, 100.0);
+    let step = nav::next_step(&FenceAhead { max_clear: 2.0 }, from, at(110.0, 100.0))
+        .expect("a shorter jump clears");
+    assert!(matches!(step.action, StepAction::Jump(_)), "{step:?}");
+    let len = step.to.x - from.x;
+    assert!(
+        (len - nav::JUMP_DISTANCE_M * 0.45).abs() < 0.05,
+        "the longest clear candidate is 45% of the running jump: {len:.2} m"
+    );
+}
+
+#[test]
+fn a_clear_obstacle_gets_the_running_jump_and_a_blocked_one_none() {
+    let from = Vec3::new(100.0, 100.0, 100.0);
+    let step = nav::next_step(&FenceAhead { max_clear: 50.0 }, from, at(110.0, 100.0))
+        .expect("the running jump clears");
+    assert!(
+        (step.to.x - from.x - nav::JUMP_DISTANCE_M).abs() < 0.05,
+        "{step:?}"
+    );
+    assert!(
+        nav::next_step(&FenceAhead { max_clear: 0.5 }, from, at(110.0, 100.0)).is_none(),
+        "no jump length clears: the bot stays blocked (and the ladder takes over)"
+    );
+}
+
+#[test]
+fn a_jump_reports_its_real_horizontal_speed() {
+    // A 1.57 m jump takes the full air time: its per-tick displacement is a tenth of the
+    // flight's, not the whole 1.57 m (the packet velocity is the real, slow, horizontal speed).
+    let state = super::JumpState {
+        from: Vec3::new(0.0, 0.0, 0.0),
+        to: Vec3::new(1.57, 0.0, 0.0),
+        elapsed: 0.0,
+        fall_vel: 0,
+    };
+    let (dx, dy) = state.step_delta();
+    let speed = (dx * dx + dy * dy).sqrt() / (nav::STEP_MS as f32 / 1000.0);
+    assert!(
+        (speed - 1.57 / nav::JUMP_AIR_TIME_S).abs() < 0.01,
+        "{speed}"
+    );
+}
+
+/// A wall that counts the sweeps asked about it.
+struct CountingWall {
+    queries: std::sync::atomic::AtomicUsize,
+}
+
+impl NavWorld for CountingWall {
+    fn height(&self, _x: f32, _y: f32) -> Option<f32> {
+        Some(100.0)
+    }
+    fn obstacle(&self, _from: Vec3, _to: Vec3) -> Option<Obstacle> {
+        self.queries
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Some(Obstacle::High(3.0))
+    }
+}
+
+#[test]
+fn a_blocked_walker_does_not_repeat_its_probes_every_tick() {
+    use std::sync::atomic::Ordering;
+
+    let wall = Arc::new(CountingWall {
+        queries: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let world: Arc<dyn NavWorld + Send + Sync> = wall.clone();
+    let mut walker = RouteWalker::new(world, vec![at(110.0, 0.0)], at(110.0, 0.0), 1.0);
+    let pos = at(100.0, 0.0);
+    assert_eq!(walker.next(pos, 100), WalkAction::Wait);
+    let first = wall.queries.load(Ordering::SeqCst);
+    assert!(first > 0, "the first blocked tick probes");
+    assert_eq!(walker.next(pos, 200), WalkAction::Wait);
+    assert_eq!(
+        wall.queries.load(Ordering::SeqCst),
+        first,
+        "the second tick at the same spot reuses the refusal"
+    );
+    // The stuck tracker still counts every tick: the fourth blocked tick hands out the first
+    // rung (the repath), cached refusal or not.
+    assert_eq!(walker.next(pos, 300), WalkAction::Wait);
+    assert!(
+        matches!(walker.next(pos, 400), WalkAction::Replan { .. }),
+        "the ladder is not delayed by the cache"
+    );
+    // After the cache expires (and a rung moved on) the probes run again.
+    let before = wall.queries.load(Ordering::SeqCst);
+    let _ = walker.next(pos, 1_000);
+    assert!(wall.queries.load(Ordering::SeqCst) > before);
+}

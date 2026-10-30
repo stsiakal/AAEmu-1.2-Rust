@@ -1904,9 +1904,21 @@ pub fn next_step_with_speeds(
     run_speed: f32,
     swim_speed: f32,
 ) -> Option<MoveStep> {
+    next_step_explained(world, from, target, run_speed, swim_speed).ok()
+}
+
+/// [`next_step_with_speeds`] that says why a step is refused (the walker logs it at debug
+/// level when it is blocked).
+pub fn next_step_explained(
+    world: &dyn NavWorld,
+    from: Vec3,
+    target: Vec3,
+    run_speed: f32,
+    swim_speed: f32,
+) -> Result<MoveStep, &'static str> {
     let dist = dist2(from, target);
     if dist <= STOP_DISTANCE {
-        return Some(MoveStep {
+        return Ok(MoveStep {
             to: target,
             action: StepAction::Run,
         });
@@ -1928,18 +1940,15 @@ pub fn next_step_with_speeds(
     if let Some(obstacle) = world.obstacle(from, to) {
         return match obstacle {
             Obstacle::Low(h) if h <= JUMP_HEIGHT_M => {
-                let jump_len = (run_speed * JUMP_AIR_TIME_S).min(dist);
-                let jx = from.x + (target.x - from.x) / dist * jump_len;
-                let jy = from.y + (target.y - from.y) / dist * jump_len;
-                jump_step(world, from, Vec3::new(jx, jy, 0.0), h)
+                jump_over(world, from, target, run_speed * JUMP_AIR_TIME_S, h)
             }
-            _ => None,
+            _ => Err("an obstacle too high to jump is in the way"),
         };
     }
     let water = world.water_depth(to.x, to.y, to.z);
     if water > SWIM_DEPTH_M {
         let level = to.z + water;
-        return Some(MoveStep {
+        return Ok(MoveStep {
             to: Vec3::new(to.x, to.y, level - SWIM_DEPTH_M),
             action: StepAction::Swim,
         });
@@ -1948,39 +1957,82 @@ pub fn next_step_with_speeds(
         if dy <= JUMP_HEIGHT_M && horizontal <= run_speed * JUMP_AIR_TIME_S {
             return jump_step(world, from, to, dy);
         }
-        return None;
+        return Err("the ground ahead rises too steeply to climb or jump");
     }
     if dy < -STEP_HEIGHT_M {
         if -dy <= MAX_SAFE_DROP_M {
-            return Some(MoveStep {
+            return Ok(MoveStep {
                 to,
                 action: StepAction::Drop(-dy),
             });
         }
-        return None;
+        return Err("the drop ahead is deeper than a safe fall");
     }
-    Some(MoveStep {
+    Ok(MoveStep {
         to,
         action: StepAction::Run,
     })
 }
 
+/// Jump lengths tried, as fractions of the running jump's reach (`run speed * air time`).
+const JUMP_FRACTIONS: [f32; 4] = [1.0, 0.7, 0.45, 0.3];
+/// The shortest jump a bot tries, in metres.
+const MIN_JUMP_M: f32 = 0.9;
+
+/// Jumps the obstacle ahead: the running jump first, then shorter ones. Every jump climbs the
+/// same height whatever its length (the arc is a fixed parabola plus the interpolation to the
+/// landing), so a short, slow jump clears an obstacle a few decimetres ahead where the long
+/// one is still rising, exactly like a standing jump of a player at a fence.
+fn jump_over(
+    world: &dyn NavWorld,
+    from: Vec3,
+    target: Vec3,
+    reach: f32,
+    height: f32,
+) -> Result<MoveStep, &'static str> {
+    let dist = dist2(from, target);
+    let mut last = "the jump arc is blocked";
+    for fraction in JUMP_FRACTIONS {
+        let len = (reach * fraction).min(dist);
+        if len < MIN_JUMP_M.min(dist) {
+            break;
+        }
+        let landing = Vec3::new(
+            from.x + (target.x - from.x) / dist * len,
+            from.y + (target.y - from.y) / dist * len,
+            0.0,
+        );
+        match jump_step(world, from, landing, height) {
+            Ok(step) => return Ok(step),
+            Err(why) => last = why,
+        }
+    }
+    Err(last)
+}
+
 /// A jump step only when the landing has ground, is not deep water, is not a drop beyond the
 /// safe fall and the whole arc is free. The landing height is the terrain at the landing
 /// point (the arc interpolates to it, so it never ends at the take-off height).
-fn jump_step(world: &dyn NavWorld, from: Vec3, landing: Vec3, height: f32) -> Option<MoveStep> {
-    let jz = world.terrain_height(landing.x, landing.y)?;
+fn jump_step(
+    world: &dyn NavWorld,
+    from: Vec3,
+    landing: Vec3,
+    height: f32,
+) -> Result<MoveStep, &'static str> {
+    let Some(jz) = world.terrain_height(landing.x, landing.y) else {
+        return Err("no ground at the jump landing");
+    };
     let to = Vec3::new(landing.x, landing.y, jz);
     if from.z - jz > MAX_SAFE_DROP_M {
-        return None;
+        return Err("the jump would land below a safe fall");
     }
     if world.water_depth(to.x, to.y, to.z) > SWIM_DEPTH_M {
-        return None;
+        return Err("the jump would land in deep water");
     }
     if world.jump_clear(from, to) == Some(false) {
-        return None;
+        return Err("the jump arc is blocked");
     }
-    Some(MoveStep {
+    Ok(MoveStep {
         to,
         action: StepAction::Jump(height),
     })
@@ -2000,12 +2052,25 @@ pub fn next_step_steered(
     run_speed: f32,
     swim_speed: f32,
 ) -> Option<MoveStep> {
-    if let Some(step) = next_step_with_speeds(world, from, target, run_speed, swim_speed) {
-        return Some(step);
-    }
+    next_step_steered_explained(world, from, target, bias, run_speed, swim_speed).ok()
+}
+
+/// [`next_step_steered`] that says why the straight way was refused when no heading works.
+pub fn next_step_steered_explained(
+    world: &dyn NavWorld,
+    from: Vec3,
+    target: Vec3,
+    bias: &mut i8,
+    run_speed: f32,
+    swim_speed: f32,
+) -> Result<MoveStep, &'static str> {
+    let straight = match next_step_explained(world, from, target, run_speed, swim_speed) {
+        Ok(step) => return Ok(step),
+        Err(why) => why,
+    };
     let dist = dist2(from, target);
     if dist <= STOP_DISTANCE {
-        return None;
+        return Err(straight);
     }
     let base = (target.y - from.y).atan2(target.x - from.x);
     let reach = dist.min(run_speed * JUMP_AIR_TIME_S);
@@ -2014,12 +2079,12 @@ pub fn next_step_steered(
         let a = base + signed.to_radians();
         let (x, y) = (from.x + reach * a.cos(), from.y + reach * a.sin());
         let z = world.height(x, y).unwrap_or(from.z);
-        if let Some(step) =
-            next_step_with_speeds(world, from, Vec3::new(x, y, z), run_speed, swim_speed)
+        if let Ok(step) =
+            next_step_explained(world, from, Vec3::new(x, y, z), run_speed, swim_speed)
         {
             *bias = if signed >= 0.0 { 1 } else { -1 };
-            return Some(step);
+            return Ok(step);
         }
     }
-    None
+    Err(straight)
 }
