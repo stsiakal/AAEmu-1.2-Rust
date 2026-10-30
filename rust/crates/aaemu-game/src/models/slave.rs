@@ -48,6 +48,12 @@ pub struct Slave {
     /// `Throttle` / `Steering` (physics output).
     pub throttle: i8,
     pub steering: i8,
+    /// Last accepted `CSTurretState` aim, in radians in the slave model's frame (the frame the
+    /// 1.2 client's model aim uses; relayed unchanged in posture type 8).
+    pub turret_pitch: f32,
+    pub turret_yaw: f32,
+    /// Unix ms of the last accepted turret aim (the server-side 150 ms throttle).
+    pub turret_last_update_ms: i64,
     /// `HarpoonRope` (`ShipHarpoonRopeState`).
     pub harpoon_rope: ShipHarpoonRopeState,
     /// `LeaveTask` / `CancelTokenSource` (generation of the pending despawn task, 0 = none).
@@ -107,6 +113,9 @@ impl Slave {
             steering_request: 0,
             throttle: 0,
             steering: 0,
+            turret_pitch: 0.0,
+            turret_yaw: 0.0,
+            turret_last_update_ms: 0,
             harpoon_rope: ShipHarpoonRopeState::default(),
             leave_task: 0,
         }
