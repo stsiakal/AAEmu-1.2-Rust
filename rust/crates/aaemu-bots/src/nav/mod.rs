@@ -68,8 +68,10 @@ const SNAP_CELLS: i32 = 8;
 pub const STOP_DISTANCE: f32 = 0.35;
 
 /// Work units one plan may spend (the height grid prefill, A* expansions and collision queries
-/// all count). The height grid A* is the expensive planner.
-pub const PLAN_MAX_NODES: usize = 1_000_000;
+/// all count). The height grid A* is the expensive planner: a kilometre-scale coarse corridor
+/// spends about a million units per grid, so a route that needs a second or third grid (a pass
+/// round a cliff) needs a few million; on the live build 3M units are about a second.
+pub const PLAN_MAX_NODES: usize = 3_000_000;
 /// Wall clock one plan may spend, in milliseconds.
 pub const PLAN_MAX_MS: u64 = 5_000;
 /// Cells one height grid may allocate (`heights`, water cache, g / parent / closed): about 7 MB
@@ -576,6 +578,19 @@ pub async fn plan_guarded(
     gate: Arc<PlanGate>,
     cancel: PlanCancel,
 ) -> Option<PlanReport> {
+    plan_guarded_with_limits(world, from, to, gate, cancel, PLAN_MAX_NODES, PLAN_MAX_MS).await
+}
+
+/// [`plan_guarded`] with explicit work / time limits (tests use small ones).
+pub async fn plan_guarded_with_limits(
+    world: Arc<dyn NavWorld + Send + Sync>,
+    from: Vec3,
+    to: Vec3,
+    gate: Arc<PlanGate>,
+    cancel: PlanCancel,
+    max_nodes: usize,
+    max_ms: u64,
+) -> Option<PlanReport> {
     if cancel.is_cancelled() {
         return None;
     }
@@ -585,7 +600,12 @@ pub async fn plan_guarded(
     };
     let report = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        plan_explain_budget(&*world, from, to, PlanBudget::new().with_cancel(cancel))
+        plan_explain_budget(
+            &*world,
+            from,
+            to,
+            PlanBudget::with_limits(max_nodes, max_ms).with_cancel(cancel),
+        )
     })
     .await
     .ok()?;

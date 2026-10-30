@@ -784,3 +784,93 @@ fn a_step_ends_on_the_physics_terrain_not_the_bilinear_height() {
         "the step must stand on the terrain the verifier compares to: {step:?}"
     );
 }
+
+/// A flat world with a wall at x = 300: a goal behind it is unreachable, so the fine grid floods
+/// the near side until the plan budget stops it. `active` counts the plans running at once
+/// (first query -> drop).
+struct WalledWorld {
+    started: std::sync::atomic::AtomicBool,
+    active: Arc<std::sync::atomic::AtomicUsize>,
+    peak: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl WalledWorld {
+    fn note_start(&self) {
+        use std::sync::atomic::Ordering;
+        if !self.started.swap(true, Ordering::SeqCst) {
+            let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for WalledWorld {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        if self.started.load(Ordering::SeqCst) {
+            self.active.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl NavWorld for WalledWorld {
+    fn height(&self, _x: f32, _y: f32) -> Option<f32> {
+        self.note_start();
+        Some(100.0)
+    }
+    fn obstacle(&self, from: Vec3, to: Vec3) -> Option<Obstacle> {
+        ((from.x < 300.0) != (to.x < 300.0)).then_some(Obstacle::High(3.0))
+    }
+}
+
+/// 50 real plans at once: the gate admits four, every unreachable plan ends at its work budget,
+/// and the whole batch finishes within a few budgets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fifty_real_plans_respect_the_gate_and_end_at_their_budget() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let gate = Arc::new(nav::PlanGate::new(4));
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let started = std::time::Instant::now();
+    let mut tasks = Vec::new();
+    for _ in 0..50 {
+        let world: Arc<dyn NavWorld + Send + Sync> = Arc::new(WalledWorld {
+            started: std::sync::atomic::AtomicBool::new(false),
+            active: active.clone(),
+            peak: peak.clone(),
+        });
+        tasks.push(tokio::spawn(nav::plan_guarded_with_limits(
+            world,
+            at(250.0, 0.0),
+            at(400.0, 0.0),
+            gate.clone(),
+            nav::PlanCancel::never(),
+            20_000,
+            2_000,
+        )));
+    }
+    for task in tasks {
+        let report = task
+            .await
+            .expect("a plan task panicked")
+            .expect("the plan was not cancelled");
+        assert!(report.plan.is_none(), "{report:?}");
+        assert!(
+            report.failure().is_some_and(|why| why.contains("budget")),
+            "an unreachable plan must end at its budget: {:?}",
+            report.failure()
+        );
+    }
+    assert!(
+        peak.load(Ordering::SeqCst) <= 4,
+        "the gate admitted {} plans",
+        peak.load(Ordering::SeqCst)
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "50 budgeted plans took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(gate.available(), 4, "every permit came back");
+}
