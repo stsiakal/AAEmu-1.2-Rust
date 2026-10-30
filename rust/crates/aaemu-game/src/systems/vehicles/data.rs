@@ -1090,10 +1090,12 @@ impl VehiclesData {
                 wheeled_vehicle_gear_speed_ratio_1: r.f32("wheeled_vehicle_gear_speed_ratio_1")?,
                 wheeled_vehicle_gear_speed_ratio_2: r.f32("wheeled_vehicle_gear_speed_ratio_2")?,
                 wheeled_vehicle_gear_speed_ratio_3: r.f32("wheeled_vehicle_gear_speed_ratio_3")?,
+                // Tolerant readers: a NULL here (a model row without a prefab path / flags)
+                // must not make the whole game data load fatal; non-NULL values read as before.
                 ground: is_ground_transfer_model(
-                    &r.string("normal")?,
-                    r.string("can_fly")?.eq_ignore_ascii_case("t"),
-                    r.f32("floating_height")?,
+                    &r.string_or("normal", "")?,
+                    r.string_or("can_fly", "")?.eq_ignore_ascii_case("t"),
+                    r.f32_or("floating_height", 0.0)?,
                 ),
             };
             self.vehicle_models.entry(m.id).or_insert(m);
@@ -1516,6 +1518,46 @@ mod tests {
         assert_eq!(t.transfer_roads.len(), 1);
         assert_eq!(t.transfer_roads[0].zone_id, 0);
         assert_eq!(t.transfer_roads[0].pos.len(), 2);
+    }
+
+    /// `load_models` on an in-memory database shaped like the compact `vehicle_models` table:
+    /// a model row with NULL `normal` / `can_fly` / `floating_height` loads (as a ground model)
+    /// instead of failing the whole game data load, and non-NULL rows read as before.
+    #[test]
+    fn a_vehicle_model_row_with_null_columns_still_loads() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE vehicle_models (id, velocity, angVel, wheeled_vehicle_mass,
+                wheeled_vehicle_max_gear, wheeled_vehicle_gear_speed_ratio_reverse,
+                wheeled_vehicle_gear_speed_ratio_1, wheeled_vehicle_gear_speed_ratio_2,
+                wheeled_vehicle_gear_speed_ratio_3, normal, can_fly, floating_height);
+             CREATE TABLE ship_models (id, velocity, mass, mass_center_x, mass_center_y,
+                mass_center_z, mass_box_size_x, mass_box_size_y, mass_box_size_z, keel_length,
+                keel_height, keel_offset_z);
+             CREATE TABLE models (id, sub_id, sub_type);
+             INSERT INTO vehicle_models VALUES
+                (1, 1, 1, 1, 1, 1, 1, 1, 1, NULL, NULL, NULL),
+                (2, 1, 1, 1, 1, 1, 1, 1, 1, 'cgf://objects/Env/carriage_a.cgf', 'f', 0.0),
+                (3, 1, 1, 1, 1, 1, 1, 1, 1, 'prefab://Prefabs/airship.xml/airship.normal', 't', 0.0),
+                (4, 1, 1, 1, 1, 1, 1, 1, 1, 'cgf://objects/Env/carriage_a.cgf', 'f', 1.0),
+                (5, 1, 1, 1, 1, 1, 1, 1, 1, 'cgf://objects/Env/carriage_a.cgf', 'T', 0.0);",
+        )
+        .unwrap();
+        let files = crate::data::client_files::ClientFileManager::default();
+        let ctx = DataLoadCtx {
+            conn: &conn,
+            app_path: std::path::Path::new("."),
+            files: &files,
+            language: "en_us",
+        };
+        let mut data = VehiclesData::default();
+        data.load_models(&ctx).expect("a NULL column is not fatal");
+        let ground = |id: u32| data.vehicle_models[&id].ground;
+        assert!(ground(1), "no path, no flags: not an airship or a boat");
+        assert!(ground(2));
+        assert!(!ground(3), "can_fly = 't'");
+        assert!(!ground(4), "floating_height > 0");
+        assert!(!ground(5), "the flag is case-insensitive as before");
     }
 
     #[test]
