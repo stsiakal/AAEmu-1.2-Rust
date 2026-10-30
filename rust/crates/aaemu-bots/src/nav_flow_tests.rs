@@ -304,3 +304,50 @@ async fn cancelling_the_navigation_ends_the_walk_before_the_next_packet() {
         after.len()
     );
 }
+
+/// A slow (a `MoveSpeedMul` / `SwimSpeedMul` percent bonus) shortens the bot's steps and the
+/// speeds it reports, like a real client's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slowed_bot_walks_at_the_units_actual_speed() {
+    use aaemu_game::models::unit::{Bonus, BonusTemplate, UnitAttribute, UnitModifierType};
+
+    let server = nav_server();
+    let bot = bot_at(&server, 2, "Walker", 100.0, 100.0).await;
+    let player = bot.player().await.expect("player");
+    let (run, swim) = crate::nav::movement::speeds(&player);
+    assert!((run - crate::nav::RUN_SPEED_MPS).abs() < 0.01, "{run}");
+    assert!((swim - crate::nav::SWIM_SPEED_MPS).abs() < 0.01, "{swim}");
+    {
+        let mut c = player.data();
+        for attribute in [UnitAttribute::MoveSpeedMul, UnitAttribute::SwimSpeedMul] {
+            c.unit.bonuses.add_bonus(
+                900,
+                Bonus {
+                    template: BonusTemplate {
+                        attribute,
+                        modifier_type: UnitModifierType::Percent,
+                        value: -50,
+                        linear_level_bonus: 0,
+                    },
+                    value: -50,
+                },
+            );
+        }
+    }
+    let (slow_run, slow_swim) = crate::nav::movement::speeds(&player);
+    assert!((slow_run - run * 0.5).abs() < 0.01, "{slow_run}");
+    assert!((slow_swim - swim * 0.5).abs() < 0.01, "{slow_swim}");
+    // End to end: one second of walking covers about half the normal 5.4 m.
+    let goto = bot.start_goto(&server, Vec3::new(300.0, 100.0, SURFACE), 1.0);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let (x1, _, _) = position(&server, 2);
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let (x2, _, _) = position(&server, 2);
+    bot.cancel_navigation();
+    let _ = goto.wait().await;
+    let covered = x2 - x1;
+    assert!(
+        (2.0..3.6).contains(&covered),
+        "a 50% slow covers about 2.7 m per second, not {covered:.2}"
+    );
+}

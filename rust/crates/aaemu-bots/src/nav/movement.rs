@@ -446,11 +446,16 @@ async fn walk(
         ));
     };
     let world: Arc<dyn NavWorld + Send + Sync> = Arc::new(owned);
-    let final_target = Vec3::new(
-        target.x,
-        target.y,
-        world.height(target.x, target.y).unwrap_or(start.z),
-    );
+    // The height under a far target may load a heightmap cell from the client files: not on an
+    // async worker.
+    let target_z = {
+        let world = world.clone();
+        let (x, y, fallback) = (target.x, target.y, start.z);
+        tokio::task::spawn_blocking(move || world.height(x, y).unwrap_or(fallback))
+            .await
+            .unwrap_or(start.z)
+    };
+    let final_target = Vec3::new(target.x, target.y, target_z);
     let (run_speed, swim_speed) = speeds(&player);
     let plan = match plan_blocking(
         server,
@@ -909,7 +914,7 @@ async fn plan_blocking(
 
 /// The bot's current run / swim speed (m/s) from its unit attributes: slows, trade packs and
 /// buffs move it exactly like a player.
-fn speeds(player: &PlayerRef) -> (f32, f32) {
+pub(crate) fn speeds(player: &PlayerRef) -> (f32, f32) {
     let obj = WorldObject::from(player.clone());
     (
         RUN_SPEED_MPS * aaemu_game::systems::ai::nav::movement_speed_mul(&obj),
