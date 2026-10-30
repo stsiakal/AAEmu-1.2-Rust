@@ -703,6 +703,21 @@ pub fn select_loaded(
     Ok(())
 }
 
+/// The world-entry steps a client drives with `CSSpawnCharacterPacket` →
+/// `CSNotifyInGame` → `CSNotifyInGameCompleted`, as one call for a caller without a socket
+/// (the player bots; `test_support` flows use the individual functions to inspect each burst).
+/// The packet sequence is exactly the client's; the slug of S→C frames is asserted by
+/// `world::session_tests::enter_world_keeps_the_client_login_packet_sequence`.
+pub fn enter_world(server: &GameServer, conn: &mut GameConnection, visual: VisualOptions) {
+    spawn_character(server, conn, visual);
+    if conn.state != GameState::World {
+        // spawn_character refused (shutdown) or disconnected the connection.
+        return;
+    }
+    notify_in_game(server, conn);
+    notify_in_game_completed(server, conn);
+}
+
 /// `CSSpawnCharacterPacket.Read`.
 pub fn spawn_character(server: &GameServer, conn: &mut GameConnection, visual: VisualOptions) {
     if server.is_shutting_down() {
@@ -1233,6 +1248,18 @@ fn delete(server: &GameServer, p: &PlayerRef) {
         world.hide(p);
         world.remove_object(p.obj_id);
     }
+}
+
+/// [`leave_world_task`] now, without the `EnterWorldManager.Leave` logout timer: for a caller
+/// without a connection task (a server-side bot logout) and the `ConnCommand::LeaveWorld` arm.
+/// A pending timer is cancelled; the leave itself is the same save + world removal a client's
+/// expired logout runs.
+pub async fn leave_world_now(server: &GameServer, conn: &mut GameConnection, target: u8) {
+    if let Some(task) = conn.leave_task.take() {
+        task.abort();
+    }
+    let active = conn.active_char.clone();
+    leave_world_task(server, Some(conn), target, active).await;
 }
 
 /// `EnterWorldManager.LeaveWorldTask(connection, target, activeChar)`.

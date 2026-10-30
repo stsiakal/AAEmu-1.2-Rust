@@ -28,7 +28,7 @@ pub use server::GameServer;
 mod flow_tests;
 #[cfg(test)]
 mod object_flow_tests;
-#[cfg(test)]
-mod test_support;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 #[cfg(test)]
 mod world_flow_tests;

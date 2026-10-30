@@ -245,6 +245,7 @@ async fn run() -> anyhow::Result<()> {
         .await
         .context("starting subsystems")?;
     aaemu_game::managers::save::SaveManager::start(server.clone());
+    aaemu_game::systems::run_startup_extensions(&server)?;
 
     // Stage 5: deleted characters, online tracking, networks.
     aaemu_game::managers::character::schedule_deleted_characters_check(server.clone()).await;

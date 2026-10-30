@@ -94,6 +94,15 @@ impl PacketRegistry {
         self.packets.get(&(level, opcode)).copied()
     }
 
+    /// The `(level, opcode)` a packet type is registered for (used to tag packets a caller
+    /// dispatches without a wire frame, e.g. the server-side bots).
+    pub fn find_by_name(&self, name: &str) -> Option<(u8, u16)> {
+        self.packets
+            .iter()
+            .find(|(_, registration)| registration.name == name)
+            .map(|(key, _)| *key)
+    }
+
     pub fn len(&self) -> usize {
         self.packets.len()
     }
