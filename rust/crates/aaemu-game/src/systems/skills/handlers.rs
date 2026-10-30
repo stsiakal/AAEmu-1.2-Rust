@@ -82,6 +82,48 @@ fn template_skill(server: &GameServer, id: u32) -> Option<SkillRef> {
     }
 }
 
+/// The C# bind-on-pickup exception (`CSStartSkillPacket`, commit bfdc3268 / PR #615) was added
+/// for the house fireplace's `SavePortal`: the client sends a bind-on-pickup item as the
+/// `SkillItem` caster while the skill is the doodad's own `DoodadFuncUse`. Keep only that case:
+/// the packet must target a doodad within the skill's range whose current func group has a
+/// `DoodadFuncUse` for this skill. Any other mismatched skill id is refused.
+fn bind_on_pickup_doodad_use(
+    server: &GameServer,
+    player: &crate::world::PlayerRef,
+    skill: &SkillRef,
+    target: SkillCastTarget,
+) -> bool {
+    use super::geometry::Target;
+    use crate::systems::npcs::doodad::templates::FuncTemplate;
+
+    let SkillCastTarget::Doodad(obj_id) = target else {
+        return false;
+    };
+    let me = WorldObject::from(player);
+    let Some(world) = super::geometry::world_of(server, &me) else {
+        return false;
+    };
+    let Some(doodad) = world.object(obj_id).and_then(|o| o.as_doodad().cloned()) else {
+        return false;
+    };
+    let data = &server.game_data.systems.npcs.doodad;
+    let group = doodad.data().func_group_id;
+    let Some(func) = data.func_for_skill(group, skill.template.id) else {
+        return false;
+    };
+    let is_use = func.skill_id == skill.template.id
+        && matches!(
+            data.func_template(func.func_id, &func.func_type),
+            Some(FuncTemplate::Use(_))
+        );
+    if !is_use {
+        return false;
+    }
+    let target = Target::Obj(WorldObject::from(&doodad));
+    super::geometry::distance_to(server, &Target::Obj(me), &target, false)
+        <= skill.template.max_range.max(0) as f32
+}
+
 /// `CSStartSkillPacket.Read` behaviour.
 pub fn start_skill(server: &GameServer, conn: &mut GameConnection, mut p: CSStartSkillPacket) {
     let Some(player) = conn.active_char.clone() else {
@@ -234,34 +276,18 @@ pub fn start_skill(server: &GameServer, conn: &mut GameConnection, mut p: CSStar
         let Some((use_skill_id, bind_on_pickup)) = items.item_use_skill(server, template_id) else {
             return;
         };
-        if data.skills.is_item_only_skill(skill_id) {
-            // An item-only skill cannot borrow the legacy bind-on-pickup exception.
-            if skill_id != use_skill_id {
-                send_cast_refused(&player, skill_id, p.caster, target, p.skill_object);
-                return;
-            }
-        } else if skill_id != use_skill_id && !bind_on_pickup {
-            return;
-        }
         let Some(skill) = template_skill(server, skill_id) else {
             return;
         };
-        // The legacy bind-on-pickup exception supports fireplace portal actions, but
-        // binding alone cannot authorize imprinting or bleaching a UCC. Require the
-        // actual item's configured use skill at this client boundary; internal casts
-        // and plot children continue through the server-driven skill APIs.
         if skill_id != use_skill_id
-            && skill.template.effects.iter().any(|effect| {
-                matches!(
-                    effect.template,
-                    Some((
-                        super::data::EffectKind::ImprintUccEffect
-                            | super::data::EffectKind::CleanupUccEffect,
-                        _
-                    ))
-                )
-            })
+            && !(bind_on_pickup && bind_on_pickup_doodad_use(server, &player, &skill, target))
         {
+            // The item's own use skill is the only general authorization; item-only skills
+            // never take the legacy exception, and the exception itself is limited to the
+            // fireplace's real DoodadFuncUse interaction.
+            if data.skills.is_item_only_skill(skill_id) {
+                send_cast_refused(&player, skill_id, p.caster, target, p.skill_object);
+            }
             return;
         }
         // Continue with the server-resolved template: `skill::use_skill` validates and consumes

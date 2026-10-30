@@ -452,6 +452,19 @@ pub trait ItemSkillHooks: Send + Sync {
         None
     }
 
+    /// Atomically take `amount` of `template_id` from the player's inventory (bag / equipment /
+    /// bank). `None` when the implementation does not track items; `Some(false)` when the full
+    /// amount was not available (nothing is consumed then).
+    fn take_item_template(
+        &self,
+        _server: &GameServer,
+        _player: &PlayerRef,
+        _template_id: u32,
+        _amount: i32,
+    ) -> Option<bool> {
+        None
+    }
+
     /// `holdingContainer.ConsumeItem(SkillReagents, templateId, amount, item)`.
     fn consume_item_by_id(
         &self,

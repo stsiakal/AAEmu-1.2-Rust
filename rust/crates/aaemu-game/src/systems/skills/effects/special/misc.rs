@@ -286,6 +286,60 @@ fn save_portal_costs_reagent(server: &GameServer, args: &EffectArgs<'_>) -> bool
         })
 }
 
+/// Whether the skill carries an `InteractionEffect`: a doodad-func skill such as 16387.
+fn save_portal_needs_doodad(
+    server: &GameServer,
+    skill: &super::super::super::state::SkillRun,
+) -> bool {
+    let data = &server.game_data.systems.skills;
+    skill.template.effects.iter().any(|effect| {
+        effect
+            .template
+            .and_then(|(kind, id)| data.effect(kind, id))
+            .is_some_and(|t| {
+                matches!(
+                    t,
+                    crate::systems::skills::effects::EffectTemplate::Interaction { .. }
+                )
+            })
+    })
+}
+
+/// The target of a doodad `SavePortal` must be a doodad within the skill's range whose current
+/// func group has a `DoodadFuncUse` for this exact skill.
+fn save_portal_targets_its_doodad(server: &GameServer, args: &EffectArgs<'_>) -> bool {
+    use crate::systems::npcs::doodad::templates::FuncTemplate;
+    let Some(skill) = args.source.skill() else {
+        return false;
+    };
+    let Target::Obj(target) = &args.target else {
+        return false;
+    };
+    let Some(doodad) = target.as_doodad() else {
+        return false;
+    };
+    let data = &server.game_data.systems.npcs.doodad;
+    let group = doodad.data().func_group_id;
+    let Some(func) = data.func_for_skill(group, skill.template.id) else {
+        return false;
+    };
+    if func.skill_id != skill.template.id
+        || !matches!(
+            data.func_template(func.func_id, &func.func_type),
+            Some(FuncTemplate::Use(_))
+        )
+    {
+        return false;
+    }
+    let from = Target::Obj(
+        args.caster
+            .clone()
+            .unwrap_or_else(|| WorldObject::from(doodad.clone())),
+    );
+    super::super::super::geometry::distance_to(server, &from, &Target::Obj(target.clone()), false)
+        <= skill.template.max_range.max(0) as f32
+}
+
 /// `SavePortal`: a new private portal at the character's position (`SkillObjectSavePortalInfo`
 /// id 0) or a rename of portal `id`.
 pub fn save_portal(server: &GameServer, args: &EffectArgs<'_>, v: [i32; 4]) {
@@ -310,6 +364,82 @@ pub fn save_portal(server: &GameServer, args: &EffectArgs<'_>, v: [i32; 4]) {
                 "SavePortal refused to create a location for a skill without a reagent"
             );
             return;
+        }
+        // A doodad skill (16387 "Save Location", the fireplace's DoodadFuncUse) is only a real
+        // interaction when the packet targets that doodad, in range, with the same Use func.
+        if args
+            .source
+            .skill()
+            .is_some_and(|skill| save_portal_needs_doodad(server, skill))
+            && !save_portal_targets_its_doodad(server, args)
+        {
+            tracing::warn!(
+                skill = args.source.skill().map(|s| s.template.id).unwrap_or(0),
+                "SavePortal refused a doodad skill cast without its doodad interaction"
+            );
+            return;
+        }
+        // A book entry is only recorded when the cast actually pays its Memory Ink. Take
+        // `skill_reagents` (11215) and effect-level items (16387) atomically here; `skill.rs`
+        // skips its own reagent/effect-item debit for SavePortal.
+        if let Some(skill) = args.source.skill() {
+            let items = server.systems.skills.ext.items();
+            let Some(p) = caster.as_player() else {
+                return;
+            };
+            let reagents = server
+                .game_data
+                .systems
+                .skills
+                .reagents_for(skill.template.id);
+            if !reagents.is_empty() {
+                let mut paid = false;
+                for reagent in &reagents {
+                    let taken = items.take_item_template(
+                        server,
+                        p,
+                        reagent.item_id,
+                        i32::from(reagent.amount),
+                    ) != Some(false);
+                    if taken && skill.template.first_reagent_only {
+                        paid = true;
+                        break;
+                    }
+                    if !taken && !skill.template.first_reagent_only {
+                        paid = false;
+                        break;
+                    }
+                    paid |= taken;
+                }
+                if !paid {
+                    tracing::warn!(
+                        skill = skill.template.id,
+                        "SavePortal refused: the location reagent is missing"
+                    );
+                    return;
+                }
+            }
+            for effect in &skill.template.effects {
+                if effect.consume_item_id != 0 && effect.consume_item_count > 0 {
+                    let Some(p) = caster.as_player() else {
+                        return;
+                    };
+                    if items.take_item_template(
+                        server,
+                        p,
+                        effect.consume_item_id,
+                        effect.consume_item_count,
+                    ) == Some(false)
+                    {
+                        tracing::warn!(
+                            skill = skill.template.id,
+                            item_id = effect.consume_item_id,
+                            "SavePortal refused: the location reagent is missing"
+                        );
+                        return;
+                    }
+                }
+            }
         }
         let pos = world_pos(server, &Target::Obj(caster.clone()));
         let zone_id = p.data().unit.transform.zone_id;

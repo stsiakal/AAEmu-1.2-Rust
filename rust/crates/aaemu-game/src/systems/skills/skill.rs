@@ -711,6 +711,23 @@ pub fn use_skill(
         target_caster: *target_caster,
         skill_object: skill_object.clone(),
     };
+    if template.plot_id.is_some() {
+        // Plot-only skills never reach `apply_effects`: verify the cast item is still the same
+        // owned item before the plot runs (the plot itself consumes plot reagents).
+        if let (Some(p), SkillCaster::Item { item_id, .. }) = (caster.as_player(), caster_caster) {
+            let items = server.systems.skills.ext.items();
+            let still_owned =
+                items
+                    .owned_item(server, p, item_id)
+                    .is_some_and(|(template_id, _)| {
+                        items.consume_owned_item(server, p, item_id, template_id, 0) != Some(false)
+                    });
+            if !still_owned {
+                skill.state().cancelled = true;
+                return (skill_result::INVALID_SOURCE, 0);
+            }
+        }
+    }
     if let Some(plot_id) = template.plot_id {
         if template.plot_only {
             // Plot-only skills never enter `cast`; commit cooldowns once at acceptance,
@@ -1863,6 +1880,19 @@ pub fn apply_effects(server: &GameServer, skill: &SkillRef, ctx: &CastCtx) {
                     crate::systems::housing::is_building_effect(server, template)
                 })
     };
+    // `SavePortal` creates an entry only after its own atomic reagent take in `misc.rs`; the
+    // generic optional effect-item debit must not take a second one.
+    let save_portal = t.effects.iter().any(|effect| {
+        effect
+            .template
+            .and_then(|(kind, id)| data.effect(kind, id))
+            .is_some_and(|template| {
+                matches!(
+                    template,
+                    EffectTemplate::Special(s) if s.special_effect_type_id == 30
+                )
+            })
+    });
     let mut owned_item_use: Option<(u64, u32, i32)> = None;
     if let Some(last) = last_applied {
         // Deviation: C# looked at the last applied effect only. Skills with mixed flags (a
@@ -1893,11 +1923,13 @@ pub fn apply_effects(server: &GameServer, skill: &SkillRef, ctx: &CastCtx) {
         }
         if let Some(p) = &player {
             if let Some(e) = template_effect.filter(|e| {
-                // House construction pays at the progress commit, including stale/rejected
-                // targets. Never fall back to the optional debit for that same effect.
-                !to_apply.iter().any(|(target, candidate)| {
-                    std::ptr::eq(*candidate, *e) && paid_building(target, candidate)
-                })
+                // SavePortal pays its effect items in its own atomic step; house construction
+                // pays at the progress commit, including stale/rejected targets. Never fall
+                // back to the optional debit for those.
+                !save_portal
+                    && !to_apply.iter().any(|(target, candidate)| {
+                        std::ptr::eq(*candidate, *e) && paid_building(target, candidate)
+                    })
             }) {
                 // source item consumption, or enough of the item in the bag / equipment
                 if e.consume_source_item
@@ -1910,7 +1942,7 @@ pub fn apply_effects(server: &GameServer, skill: &SkillRef, ctx: &CastCtx) {
     }
     let reagents = data.reagents_for(t.id);
     let products = data.products_for(t.id);
-    if !reagents.is_empty() || !products.is_empty() {
+    if !save_portal && (!reagents.is_empty() || !products.is_empty()) {
         if let Some(p) = &player {
             if !reagents.is_empty() {
                 let mut found = false;
@@ -1934,24 +1966,6 @@ pub fn apply_effects(server: &GameServer, skill: &SkillRef, ctx: &CastCtx) {
             for prod in &products {
                 items.acquire_item(server, p, prod.item_id, i32::from(prod.amount));
             }
-        }
-    }
-
-    // An item that left the bag during the cast time refuses the effect before it runs. The
-    // pre-check resolves the template from the item itself; the consumption below repeats the
-    // check atomically, so a concurrent move cannot slip between them.
-    if let (Some((item_id, _, _)), Some(p)) = (owned_item_use, &player) {
-        let still_owned = items
-            .owned_item(server, p, item_id)
-            .is_some_and(|(template_id, _)| {
-                items.consume_owned_item(server, p, item_id, template_id, 0) == Some(true)
-            });
-        if !still_owned {
-            // The 1.2 server stopped the item skill without a result packet; the client sees
-            // the casting-stopped packet. The effects never run.
-            skill.state().cancelled = true;
-            stop(server, skill, caster, 0);
-            return;
         }
     }
 

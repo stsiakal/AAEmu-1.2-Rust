@@ -2,8 +2,6 @@
 
 use std::sync::Arc;
 
-use aaemu_commons::{Marshal, PacketStream};
-
 use crate::data::items::{bind_type, ItemTemplate};
 use crate::models::container::slot_type;
 use crate::net::registry::ClientPacket;
@@ -212,48 +210,18 @@ async fn configured_imprint_and_both_bleaches_cast_and_consume_their_real_source
 }
 
 #[tokio::test]
-async fn bind_on_pickup_exception_still_allows_non_ucc_client_skills() {
+async fn bind_on_pickup_item_cannot_authorize_a_non_ucc_client_skill() {
+    // The legacy C# exception was only for the house fireplace's doodad interaction. A BoP
+    // item with no use skill cannot authorize an arbitrary client skill id.
     let mut w = fixture();
     let (source, target) = operands(&w, TORCH);
+    let before_source = item_at(&w.pa, slot_type::INVENTORY, 0).unwrap();
     cast(&mut w, NON_UCC_SKILL, source, TORCH, target).await;
-    assert!(w.pa.data().unit.skill_last_used_ms > 0);
-    // An instant cast skips Started and broadcasts Fired from ScheduleEffects.
-    // Check the actual skill/source/target bytes rather than only a GCD update.
-    let frames = w.a.drain();
-    let fired = &frames
-        .iter()
-        .find(|(op, _)| *op == sc::SCSkillFiredPacket)
-        .expect("allowed instant item skill must fire")
-        .1;
-    let mut stream = PacketStream::from_bytes(fired.clone());
-    assert_eq!(stream.read_u32().unwrap(), NON_UCC_SKILL);
-    let tl = stream.read_u16().unwrap();
-    let expected = super::super::packets::SCSkillFiredPacket {
-        id: NON_UCC_SKILL,
-        tl,
-        caster: SkillCaster::Item {
-            obj_id: w.pa.obj_id,
-            item_id: source,
-            item_template_id: TORCH,
-            type1: 0,
-            type2: 0,
-        },
-        target: SkillCastTarget::Item {
-            obj_id: w.pa.obj_id,
-            id: target,
-            type1: 0,
-            type2: 0,
-        },
-        skill_object: SkillObject::None,
-        computed_delay: 0,
-        channeling_time: 0,
-        fire_anim_id: 0,
-    };
-    let mut expected_body = PacketStream::new();
-    expected.write(&mut expected_body);
-    assert_eq!(fired, &expected_body.into_bytes());
+    assert_eq!(w.pa.data().unit.skill_last_used_ms, 0);
     assert_eq!(
-        item_at(&w.pa, slot_type::INVENTORY, 1).unwrap().ucc_id,
-        0x1234
+        item_at(&w.pa, slot_type::INVENTORY, 0).unwrap(),
+        before_source
     );
+    assert!(w.a.drain().is_empty());
+    assert!(w.b.drain().is_empty());
 }

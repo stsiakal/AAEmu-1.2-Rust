@@ -130,3 +130,82 @@ pub(super) fn may_use_vehicle_skill(
             .any(|id| data.mount_skill_skill_id(id) == skill_id)
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every slave bar entry in the real 1.2 data maps to a skill its own slave accepts, and every
+    /// mate bar entry maps to a skill the mate accepts. Also reports the item-summonable vehicles
+    /// without bar skills (`carriage 7`, ...), which have no skill to authorize.
+    #[tokio::test]
+    #[ignore = "needs AAEMU_COMPACT_DB"]
+    async fn real_compact_db_every_vehicle_bar_skill_is_allowed() {
+        use crate::data::client_files::ClientFileManager;
+        use crate::systems::vehicles::data::VehiclesData;
+        use crate::world::Entity;
+
+        let Ok(path) = std::env::var("AAEMU_COMPACT_DB") else {
+            return;
+        };
+        let conn = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let app = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("app");
+        let files = ClientFileManager::new();
+        let ctx = crate::systems::DataLoadCtx {
+            conn: &conn,
+            app_path: &app,
+            files: &files,
+            language: "en_us",
+        };
+        let vehicles = VehiclesData::load(&ctx).expect("vehicles data");
+        let mut data = crate::data::GameData::empty();
+        data.systems.vehicles = vehicles;
+        let server = crate::test_support::test_server_with(data);
+        let vehicles = &server.game_data.systems.vehicles;
+
+        let mut checked = 0usize;
+        for &(_, slave_id, mount_skill_id) in &vehicles.slave_mount_skills {
+            let skill_id = vehicles.mount_skill_skill_id(mount_skill_id);
+            assert_ne!(
+                skill_id, 0,
+                "slave {slave_id}: mount skill {mount_skill_id}"
+            );
+            let slave = Entity::new(0x300, crate::models::slave::Slave::new(1, slave_id));
+            let caster = WorldObject::from(&slave);
+            assert!(
+                may_use_vehicle_skill(&server, &caster, skill_id),
+                "slave {slave_id} must accept its bar skill {skill_id} (mount skill {mount_skill_id})"
+            );
+            checked += 1;
+        }
+        for m in &vehicles.npc_mount_skills {
+            let skill_id = vehicles.mount_skill_skill_id(m.mount_skill_id);
+            if skill_id == 0 {
+                continue;
+            }
+            let mut mate = crate::models::mate::Mate::new(1, m.npc_id);
+            mate.skills = vec![m.mount_skill_id];
+            let mate = Entity::new(0x300, mate);
+            let caster = WorldObject::from(&mate);
+            assert!(
+                may_use_vehicle_skill(&server, &caster, skill_id),
+                "mate npc {} must accept its bar skill {skill_id}",
+                m.npc_id
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no vehicle bar skills loaded");
+        // Summonable vehicles with no `slave_mount_skills` rows in the 1.2 data: there is no
+        // bar skill to authorize, so the strict allowlist must not invent one.
+        for slave_id in [7u32, 9, 6, 3, 45, 52, 86, 18, 12, 13] {
+            assert!(
+                vehicles.slave_mount_skill_list(slave_id).is_empty(),
+                "slave {slave_id} now has bar skills; add it to the allowlist coverage"
+            );
+        }
+    }
+}

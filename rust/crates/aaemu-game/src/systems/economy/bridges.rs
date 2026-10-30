@@ -978,6 +978,29 @@ impl ItemSkillHooks for EconomyForSkills {
         Some(true)
     }
 
+    fn take_item_template(
+        &self,
+        server: &GameServer,
+        player: &PlayerRef,
+        template_id: u32,
+        amount: i32,
+    ) -> Option<bool> {
+        if amount <= 0 {
+            return Some(true);
+        }
+        let mut txn = ItemTxn::begin(server);
+        let consumed = inventory::consume_item(
+            &mut txn,
+            &Inv::of(player),
+            None,
+            task_type::SKILL_EFFECT_CONSUMPTION,
+            template_id,
+            amount,
+            None,
+        );
+        Some(consumed == amount)
+    }
+
     fn consume_item_by_id(
         &self,
         server: &GameServer,

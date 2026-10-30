@@ -2962,9 +2962,7 @@ two bots before the fix (a foreign `Mount` caster, an NPC-only skill and a far d
   skills a client-facing source table names are mount skill 13572 (mount branch) and
   quest/doodad conditions 10664, 10134, 12075 and 11380; they still need their ability active and
   the skill learned, as the client requires. The exact result codes are our choice (the client
-  only needs a non-success `SCSkillStarted`). Not closed here: a `Mount` caster naming the player
-  itself still runs the mount branch (the self allowance above), and a bind-on-pickup item caster
-  can still name a different skill id (the legacy fireplace exception, narrowed for UCC effects).
+  only needs a non-success `SCSkillStarted`).
 - **Item-only skills.** `items.use_skill_id` and `item_grade_skills` are player-facing sources,
   so the fallback branch ran an item's use skill as a plain unit cast and consumed nothing
   (e.g. 26611 "Full XP Restoration" for free). `SkillData` now keeps the ids named by those two
@@ -2985,16 +2983,21 @@ two bots before the fix (a foreign `Mount` caster, an NPC-only skill and a far d
 - **Item template from the owned item.** The `CSStartSkill` `SkillCaster::Item` branch resolves
   the template from `ItemManager` and rewrites the caster before `Skill.Use`, so the client's
   `ItemTemplateId` never decides the use skill, the reagent or the consumed template. Item-only
-  skills require `skill_id ==` the owned template's `UseSkillId` (the bind-on-pickup exception no
-  longer authorizes them). Consumption goes through `ItemSkillHooks::consume_owned_item`, which
-  checks the item id and template and consumes it under one container lock (amount 0 only
-  verifies). An item that leaves the bag during a cast time is refused by the cast-time item
-  check; a cancelled effect consumes nothing.
+  skills require `skill_id ==` the owned template's `UseSkillId`. The C# bind-on-pickup
+  exception (`bfdc3268`, PR #615) is kept only for its evidence-backed case: the house
+  fireplace's `DoodadFuncUse`, where the packet targets that doodad in range and its current
+  func group has a `Use` func for the skill. Consumption goes through
+  `ItemSkillHooks::consume_owned_item`, which checks the item id and template and consumes it
+  under one container lock. An item that leaves the bag during a cast time is refused by the
+  cast-time item check; a cancelled effect consumes nothing. Plot-only item skills verify the
+  same owned item before the plot runs.
 - **SavePortal creation.** `SpecialEffect` 30 `SavePortal` only records a new book entry when the
   casting skill pays a reagent (`skill_reagents` or an effect-level `consume_item_id` /
   `consume_source_item`). Skill 16841 "Editing Location in Teleport Book..." has no reagent and
-  may only rename an existing portal of the character; 11215 and the doodad version 16387 pay
-  Memory Ink and may record. No portal-book cap exists in the C# `PortalManager` /
+  may only rename an existing portal of the character; 11215 pays its `skill_reagents` Memory
+  Ink, and 16387 pays an effect-level Memory Ink taken atomically by the effect and only when
+  the cast targets a real fireplace doodad in range with its `DoodadFuncUse`. No portal-book cap
+  exists in the C# `PortalManager` /
   `CharacterPortals` or in the 1.2 data (the client UI pages the list by `COUNT_PER_PAGE`); none
   is invented here.
 - **Vehicle bar caster.** A `Mount` caster must be a mate the player may use or a slave the
