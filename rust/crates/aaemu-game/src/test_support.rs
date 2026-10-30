@@ -61,6 +61,72 @@ pub fn test_server() -> GameServer {
     test_server_with(GameData::empty())
 }
 
+/// Installs a flat heightmap at `surface` metres for the synthetic `main_world` (all four
+/// cells), so route planning and step height queries have terrain (bots flow tests).
+pub fn install_flat_heightmap(server: &GameServer, surface: f32) {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use crate::data::client_files::ClientFileManager;
+    use crate::systems::npcs::heightmap::{
+        HeightmapConfig, HeightmapWorlds, WorldHeightmap, CELL_HMAP_RESOLUTION,
+    };
+
+    const COEF: f64 = 65535.0 / (4096.0 / 4.0);
+    let points = (CELL_HMAP_RESOLUTION * CELL_HMAP_RESOLUTION) as usize;
+    let value = (f64::from(surface) * COEF) as u16;
+    let t = WorldHeightmap::with_size(0, "main_world", 2, 2, COEF);
+    for x in 0..2 {
+        for y in 0..2 {
+            assert!(t.insert_cell(x, y, vec![value; points]), "cell ({x}, {y})");
+        }
+    }
+    server
+        .systems
+        .npcs
+        .heightmaps
+        .install(Arc::new(HeightmapWorlds::from_parts(
+            Arc::new(ClientFileManager::new()),
+            vec![t],
+            HashMap::from([(TEST_ZONE, 0)]),
+            HeightmapConfig {
+                heightmaps_enable: true,
+                ..Default::default()
+            },
+        )));
+}
+
+/// Installs a flat collision terrain at `ground` metres for instance 0 (a heightfield plane,
+/// no geometry files), so `sweep_capsule` / `ground_height` answer on the synthetic world.
+pub fn install_test_terrain(server: &GameServer, ground: f32) {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    struct Flat {
+        ground: f32,
+    }
+    impl crate::systems::ai::collision::terrain::TerrainSource for Flat {
+        fn sample(&self, _ix: i32, _iy: i32) -> f32 {
+            self.ground
+        }
+        fn size(&self) -> (i32, i32) {
+            (2048, 2048)
+        }
+    }
+    let _ = server
+        .systems
+        .ai
+        .collision
+        .test_files
+        .set(Arc::new(HashMap::new()));
+    let _ = server
+        .systems
+        .ai
+        .collision
+        .test_terrain
+        .set(Arc::new(Flat { ground }));
+}
+
 /// An `ExperienceTable` for levels `1..=up_to` (strictly increasing total / mate exp,
 /// `skill_points = level`): tests that learn skills need `GetSkillPointsForLevel` /
 /// `GetAbLevel` to answer.

@@ -12,10 +12,17 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use aaemu_game::config::BotsConfig;
+use aaemu_game::systems::skills::controllers::Vec3;
 use aaemu_game::GameServer;
 use tokio::sync::Mutex;
 
 pub use session::BotSession;
+#[cfg(test)]
+pub(crate) use session::StepPause;
+pub(crate) use session::WalkSend;
+
+use crate::nav::movement::Goto;
+use crate::nav::{PlanGate, RoadGraphCache};
 
 /// The scheduler tick: connection commands are serviced this often.
 const HOST_TICK: Duration = Duration::from_millis(250);
@@ -34,6 +41,9 @@ pub struct BotInfo {
 pub struct BotHost {
     server: Weak<GameServer>,
     config: BotsConfig,
+    plan_gate: Arc<PlanGate>,
+    /// The road graphs of this host's server, shared by all its bots.
+    roads: RoadGraphCache,
     bots: Mutex<HashMap<u32, Arc<BotSession>>>,
 }
 
@@ -41,6 +51,8 @@ impl BotHost {
     pub fn new(server: &Arc<GameServer>, config: BotsConfig) -> Self {
         Self {
             server: Arc::downgrade(server),
+            plan_gate: Arc::new(PlanGate::new(config.plan_concurrency)),
+            roads: RoadGraphCache::default(),
             config,
             bots: Mutex::new(HashMap::new()),
         }
@@ -74,6 +86,7 @@ impl BotHost {
                         roster.remove(&bot.character_id);
                     }
                     drop(roster);
+                    bot.cancel_navigation();
                     bot.disconnect(&server).await;
                 }
             }
@@ -100,7 +113,16 @@ impl BotHost {
             }
         }
         let bot = crate::life::login(server, &self.config, name).await?;
+        self.adopt(server, bot).await
+    }
+
+    /// Puts a bot that is in the world on the roster. It gets the host's plan gate and road
+    /// graphs first: nothing else can reach it before it is on the roster, so no early `goto`
+    /// can pin the server-wide fallback gate (`BotSession::plan_gate`; the first call wins).
+    async fn adopt(&self, server: &GameServer, bot: Arc<BotSession>) -> anyhow::Result<u32> {
         let character_id = bot.character_id;
+        bot.install_plan_gate(self.plan_gate.clone());
+        bot.install_road_cache(self.roads.clone());
         let refusal = {
             let mut roster = self.bots.lock().await;
             if roster.len() >= self.config.max_bots {
@@ -143,6 +165,9 @@ impl BotHost {
         let Some(bot) = bot else {
             anyhow::bail!("no live bot named '{name}'");
         };
+        // Stop the walk before the character leaves the world: no packet may be sent after the
+        // logout removed it.
+        bot.cancel_navigation();
         bot.logout(server).await;
         bot.disconnect(server).await;
         tracing::info!(
@@ -151,6 +176,30 @@ impl BotHost {
             bot.character_id
         );
         Ok(())
+    }
+
+    /// The live bot named `name`.
+    pub async fn bot(&self, name: &str) -> Option<Arc<BotSession>> {
+        self.bots
+            .lock()
+            .await
+            .values()
+            .find(|b| b.name.eq_ignore_ascii_case(name))
+            .cloned()
+    }
+
+    /// `/bot goto <name> <x> <y> <z>`: starts walking (the caller awaits [`Goto::wait`]).
+    pub async fn goto(
+        &self,
+        server: &Arc<GameServer>,
+        name: &str,
+        target: Vec3,
+        radius: f32,
+    ) -> anyhow::Result<Goto> {
+        let Some(bot) = self.bot(name.trim()).await else {
+            anyhow::bail!("no live bot named '{}'", name.trim());
+        };
+        Ok(bot.start_goto(server, target, radius))
     }
 
     /// `/bot list`.
@@ -168,5 +217,43 @@ impl BotHost {
         }
         infos.sort_by(|a, b| a.name.cmp(&b.name));
         infos
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use aaemu_game::net::socketless::SocketlessConnection;
+    use aaemu_game::test_support::{test_character, test_server};
+
+    use super::*;
+    use crate::life;
+
+    /// A bot gets the host's plan gate before it is on the roster. `adopt` is parked at the
+    /// roster insert (the test holds the roster), after whatever it does first; the gate
+    /// asked for now must already be the host's, because an early `goto` that reaches a bot
+    /// without one pins the server-wide fallback gate for good (the first call wins).
+    #[tokio::test]
+    async fn a_bot_gets_the_hosts_gate_before_it_is_on_the_roster() {
+        let server = Arc::new(test_server());
+        server.set_self();
+        let host = Arc::new(BotHost::new(&server, BotsConfig::default()));
+        let conn = SocketlessConnection::new(&server, 1_000_002);
+        let bot = life::enter_loaded(&server, conn, test_character(2, "Walker", 100.0, 100.0))
+            .expect("the bot enters");
+        let roster = host.bots.lock().await;
+        let adopting = tokio::spawn({
+            let (host, server, bot) = (host.clone(), server.clone(), bot.clone());
+            async move { host.adopt(&server, bot).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            Arc::ptr_eq(&bot.plan_gate(), &host.plan_gate),
+            "the bot is not on the roster yet but already has the host's gate"
+        );
+        drop(roster);
+        assert_eq!(adopting.await.expect("task").expect("adopted"), 2);
+        assert!(host.bot("Walker").await.is_some(), "on the roster now");
     }
 }
