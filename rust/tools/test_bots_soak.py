@@ -8,6 +8,7 @@ import contextlib
 import io
 import os
 from pathlib import Path
+import re
 import signal
 import sys
 import tempfile
@@ -315,6 +316,195 @@ class RemainingScenariosTests(unittest.TestCase):
             bots_soak.remaining_scenarios(["full", "combat", "load"], {"combat"}),
             ["full"],
         )
+
+
+class SlotTests(unittest.TestCase):
+    def test_every_bot_gets_its_own_slot_in_list_order(self):
+        accounts = [f"sk10301234b{i}" for i in range(8)]
+        slots = bots_soak.assign_slots(accounts)
+        self.assertEqual([slots[a] for a in accounts], list(range(8)))
+        self.assertEqual(len(set(slots.values())), 8)
+
+    def test_a_full_grid_is_unique_and_more_bots_wrap_onto_the_first_slots(self):
+        accounts = [f"b{i}" for i in range(bots_soak.SPAWN_SLOTS + 2)]
+        slots = bots_soak.assign_slots(accounts)
+        self.assertEqual(len({slots[a] for a in accounts[: bots_soak.SPAWN_SLOTS]}), bots_soak.SPAWN_SLOTS)
+        self.assertEqual(slots[accounts[bots_soak.SPAWN_SLOTS]], 0)
+        self.assertEqual(slots[accounts[bots_soak.SPAWN_SLOTS + 1]], 1)
+        self.assertLess(max(slots.values()), bots_soak.SPAWN_SLOTS)
+
+    def test_the_slot_count_matches_the_testclients_grid(self):
+        source = (
+            bots_soak.REPO / "rust" / "crates" / "aaemu-testclient" / "src" / "scenario" / "coreloop.rs"
+        ).read_text(encoding="utf-8")
+        match = re.search(r"pub\(super\) const SLOTS: u32 = (\d+);", source)
+        self.assertIsNotNone(match, "coreloop.rs no longer defines SLOTS")
+        self.assertEqual(int(match.group(1)), bots_soak.SPAWN_SLOTS)
+
+    def provisioned(self, bots: int, scenarios: list[str], lost: str | None = None):
+        runner = fake_runner()
+        runner.args = types.SimpleNamespace(prefix="sk", bots=bots, scenarios=scenarios, load_bots=0)
+        runner.run_stamp = datetime(2026, 10, 30, 12, 34)
+        runner.provision = lambda accounts: [a for a in accounts if not (lost and a.endswith(lost))]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            runner.provision_all()
+        return runner, out.getvalue()
+
+    def test_slots_follow_the_accounts_that_were_provisioned(self):
+        runner, _ = self.provisioned(5, ["questchain"], lost="b2")
+        self.assertEqual(len(runner.bot_accounts), 4)
+        self.assertEqual(set(runner.slots), set(runner.bot_accounts))
+        self.assertEqual(sorted(runner.slots.values()), [0, 1, 2, 3])
+
+    def test_more_bots_than_slots_are_warned_about_for_questchain_only(self):
+        _, out = self.provisioned(bots_soak.SPAWN_SLOTS + 4, ["questchain", "gather"])
+        self.assertIn(f"WARN: {bots_soak.SPAWN_SLOTS + 4} bots but {bots_soak.SPAWN_SLOTS} spawn slots", out)
+        _, out = self.provisioned(bots_soak.SPAWN_SLOTS + 4, ["gather", "mount"])
+        self.assertNotIn("spawn slots", out)
+        _, out = self.provisioned(bots_soak.SPAWN_SLOTS, ["questchain"])
+        self.assertNotIn("spawn slots", out)
+
+
+class ScenarioCommandTests(unittest.TestCase):
+    def runner(self, slots: dict[str, int], attempt_timeout: int = 300) -> bots_soak.Runner:
+        runner = fake_runner()
+        runner.lane = types.SimpleNamespace(testclient=Path("tc.exe"), login="127.0.0.1:36237", password="pw")
+        runner.args = types.SimpleNamespace(attempt_timeout=attempt_timeout)
+        runner.slots = slots
+        return runner
+
+    @staticmethod
+    def value(cmd: list[str], flag: str) -> str:
+        return cmd[cmd.index(flag) + 1]
+
+    def test_the_command_carries_the_bots_slot_a_body_timeout_and_a_cleanup_budget(self):
+        runner = self.runner({"sk1b0": 0, "sk1b3": 3})
+        cmd = runner.scenario_command("questchain", "sk1b3", Path("out.json"), None)
+        self.assertEqual(self.value(cmd, "--slot"), "3")
+        self.assertEqual(self.value(cmd, "--scenario-timeout"), "175")
+        self.assertEqual(self.value(cmd, "--cleanup-timeout"), str(bots_soak.CLEANUP_BUDGET))
+        self.assertEqual(self.value(cmd, "--scenario"), "questchain")
+        self.assertEqual(self.value(cmd, "--user"), "sk1b3")
+        self.assertEqual(self.value(cmd, "--character"), "sk1b3")
+        self.assertEqual(self.value(cmd, "--outcome-json"), "out.json")
+        self.assertNotIn("--config", cmd)
+
+    def test_slot_zero_is_passed_as_well(self):
+        cmd = self.runner({"sk1b0": 0}).scenario_command("full", "sk1b0", Path("o.json"), None)
+        self.assertEqual(self.value(cmd, "--slot"), "0")
+
+    def test_an_account_without_a_slot_gets_no_slot_flag(self):
+        cmd = self.runner({"sk1b0": 0}).scenario_command("full", "other", Path("o.json"), None)
+        self.assertNotIn("--slot", cmd)
+
+    def test_a_config_file_replaces_the_character_flag(self):
+        cmd = self.runner({"sk1b1": 1}).scenario_command("npc-return", "sk1b1", Path("o.json"), Path("c.json"))
+        self.assertEqual(self.value(cmd, "--config"), "c.json")
+        self.assertNotIn("--character", cmd)
+        self.assertEqual(self.value(cmd, "--slot"), "1")
+
+    def test_the_scenario_timeout_leaves_the_login_and_cleanup_budgets_and_keeps_a_floor(self):
+        reserve = bots_soak.LOGIN_RESERVE + bots_soak.CLEANUP_BUDGET
+        self.assertEqual(bots_soak.scenario_timeout(300), 300 - reserve)
+        self.assertEqual(bots_soak.scenario_timeout(600), 600 - reserve)
+        self.assertEqual(bots_soak.scenario_timeout(60), bots_soak.MIN_SCENARIO_TIMEOUT)
+        cmd = self.runner({}, attempt_timeout=480).scenario_command("housing", "a", Path("o.json"), None)
+        self.assertEqual(self.value(cmd, "--scenario-timeout"), "355")
+        self.assertEqual(self.value(cmd, "--cleanup-timeout"), "90")
+
+    def test_the_default_leaves_housing_a_wide_margin(self):
+        # Housing needs up to ~200 s of body with 8 bots contending for its plot, and the login
+        # and the cleanup of a hung body must fit in the attempt on top of it.
+        body = bots_soak.scenario_timeout(bots_soak.DEFAULT_ATTEMPT_TIMEOUT)
+        self.assertGreaterEqual(body, 250)
+        self.assertLessEqual(body + bots_soak.LOGIN_RESERVE + bots_soak.CLEANUP_BUDGET, bots_soak.DEFAULT_ATTEMPT_TIMEOUT)
+        self.assertGreater(bots_soak.DEFAULT_ATTEMPT_TIMEOUT, body)
+
+
+class ScenarioListTests(unittest.TestCase):
+    def test_the_core_loop_scenarios_are_known_and_part_of_the_default_soak(self):
+        for name in ("gather", "mount", "questchain", "housing"):
+            self.assertIn(name, bots_soak.KNOWN_SCENARIOS)
+            self.assertIn(name, bots_soak.DEFAULT_SCENARIOS)
+        self.assertEqual(
+            bots_soak.parse_scenarios("gather, mount,questchain,housing,gather"),
+            ["gather", "mount", "questchain", "housing"],
+        )
+
+    def test_an_unknown_scenario_is_still_refused(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                bots_soak.parse_scenarios("gather,farming")
+
+    def test_every_known_scenario_is_a_testclient_scenario(self):
+        source = (
+            bots_soak.REPO / "rust" / "crates" / "aaemu-testclient" / "src" / "scenario.rs"
+        ).read_text(encoding="utf-8")
+        for name in bots_soak.KNOWN_SCENARIOS:
+            self.assertIn(f'"{name}" => Self::', source, f"the testclient does not parse '{name}'")
+
+
+class RunCountersTests(unittest.TestCase):
+    def test_only_retry_counters_are_read(self):
+        outcome = {
+            "vars": {
+                "retry_out_of_angle": 2,
+                "retry_obstacle": 0,
+                "slot": 3,
+                "account_id": 9,
+                "retry_negative": -1,
+                "retry_text": "x",
+                "retry_flag": True,
+            }
+        }
+        self.assertEqual(bots_soak.run_counters(outcome), {"retry_out_of_angle": 2, "retry_obstacle": 0})
+
+    def test_missing_outcome_or_vars_have_no_counters(self):
+        self.assertEqual(bots_soak.run_counters(None), {})
+        self.assertEqual(bots_soak.run_counters({}), {})
+        self.assertEqual(bots_soak.run_counters({"vars": None}), {})
+
+
+class CounterStatsTests(unittest.TestCase):
+    def stats(self) -> bots_soak.ScenarioStats:
+        stats = bots_soak.ScenarioStats()
+        stats.add(True, None, [], 100, {"retry_out_of_angle": 2, "retry_obstacle": 0})
+        stats.add(True, None, [], 100, {"retry_out_of_angle": 0, "retry_obstacle": 0})
+        stats.add(False, "failed early", ["game.questchain.giver"], 100, None)
+        stats.add(True, None, [], 100, {"retry_out_of_angle": 1, "retry_obstacle": 3})
+        return stats
+
+    def test_counters_are_summed_and_count_the_attempts_that_had_retries(self):
+        stats = self.stats()
+        self.assertEqual(stats.counters["retry_out_of_angle"], 3)
+        self.assertEqual(stats.counter_hits["retry_out_of_angle"], 2)
+        # The attempt that failed before the fight reported nothing.
+        self.assertEqual(stats.counter_reports["retry_out_of_angle"], 3)
+        self.assertEqual(stats.counters["retry_obstacle"], 3)
+        self.assertEqual(stats.counter_hits["retry_obstacle"], 1)
+        self.assertEqual(stats.attempts, 4)
+
+    def test_the_rows_and_the_table_show_the_counters(self):
+        runner = fake_runner()
+        runner.args = types.SimpleNamespace(max_setup_failures=5)
+        runner.stats = {"questchain": self.stats(), "gather": bots_soak.ScenarioStats()}
+        rows = runner.scenario_rows()
+        questchain = next(row for row in rows if row["scenario"] == "questchain")
+        self.assertEqual(
+            questchain["counters"],
+            [
+                {"name": "retry_obstacle", "total": 3, "attempts_with": 1, "attempts_reporting": 3},
+                {"name": "retry_out_of_angle", "total": 3, "attempts_with": 2, "attempts_reporting": 3},
+            ],
+        )
+        table = "\n".join(bots_soak.counter_table(rows))
+        self.assertIn("## Retry counters", table)
+        self.assertIn("| questchain | retry_out_of_angle | 3 | 2 | 3 |", table)
+        self.assertIn("| questchain | retry_obstacle | 3 | 1 | 3 |", table)
+        # A dashboard without any counter has no such section.
+        gather = [row for row in rows if row["scenario"] == "gather"]
+        self.assertEqual(bots_soak.counter_table(gather), [])
 
 
 if __name__ == "__main__":

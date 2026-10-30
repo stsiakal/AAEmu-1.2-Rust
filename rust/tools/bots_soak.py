@@ -14,9 +14,14 @@ What it does:
   * provisions `--bots` accounts (AutoAccount login + game `accounts` row, access level 100 so
     the GM scenarios work), plus the accounts of the one parallel `load` phase;
   * runs the scenarios in a per-bot loop, each cycle shuffled with `--seed`, until `--minutes`
-    have passed, recording every outcome (testclient `--outcome-json`);
-  * writes <runtime>/soak/<run>/dashboard.md and dashboard.json from the scenario outcomes, the
-    bug reporter's `summary.json` and the server log, and leaves the raw logs/reports there.
+    have passed, recording every outcome (testclient `--outcome-json`); every run gets the bot's
+    own `--slot` (the questchain spawn grid) and a `--scenario-timeout` plus the cleanup's
+    `--cleanup-timeout` budgeted inside `--attempt-timeout`, so a hung scenario cleans up before
+    the runner would kill it;
+  * writes <runtime>/soak/<run>/dashboard.md and dashboard.json from the scenario outcomes
+    (including their `retry_*` run counters: boar hits the server refused for facing, line of
+    sight or range), the bug reporter's `summary.json` and the server log, and leaves the raw
+    logs/reports there.
 
 Scenario failures are data, not runner errors: the exit status is 0 unless the stack or the
 provisioning could not be brought up.
@@ -57,8 +62,38 @@ KNOWN_SCENARIOS = [
     "ghost",
     "lunafrost",
     "cometsboon",
+    "gather",
+    "mount",
+    "questchain",
+    "housing",
 ]
 DEFAULT_SCENARIOS = KNOWN_SCENARIOS + ["load"]
+
+# The spawn grid of the testclient's questchain scenario (`coreloop::SLOTS`, a 4 x 4 grid 25 m
+# apart): every parallel bot owns one slot (`--slot N`), more bots than slots share spots.
+SPAWN_SLOTS = 16
+SLOT_SCENARIOS = {"questchain"}
+
+# Seconds one scenario attempt may take before the runner kills the testclient. Housing, the
+# longest, needs up to ~200 s of scenario body with 8 bots fighting over its plot, plus ~35 s to
+# log in and enter the world, so the body budget this leaves (see `scenario_timeout`) must stay
+# well above that.
+DEFAULT_ATTEMPT_TIMEOUT = 420
+
+# Seconds of `--attempt-timeout` a scenario needs before its body runs: the login, the world
+# entry and the client's setup (about 35 s in a soak).
+LOGIN_RESERVE = 35
+
+# Seconds of `--attempt-timeout` given to the scenario's cleanup (`--cleanup-timeout`). The
+# testclient starts it with a fresh budget whatever became of the body and bounds it itself, so a
+# body that ran out of time cannot make the runner kill the client mid-cleanup (which would leave
+# a house or a mount behind).
+CLEANUP_BUDGET = 90
+MIN_SCENARIO_TIMEOUT = 30
+
+# Run variables of a scenario outcome that count repeated work (`retry_out_of_angle`, ...); the
+# dashboard sums them per scenario.
+COUNTER_PREFIX = "retry_"
 
 # Scenarios that teleport every bot to the same NPC/doodad/plot. Contention on these is left in
 # by default (a soak should load the server); `--exclusive-scenarios` serialises the named ones
@@ -466,6 +501,34 @@ def parse_outcome(path: Path) -> dict | None:
         return None
 
 
+def assign_slots(accounts: list[str]) -> dict[str, int]:
+    """One spawn-grid slot per bot account: its position in the list, wrapped at SPAWN_SLOTS."""
+    return {account: index % SPAWN_SLOTS for index, account in enumerate(accounts)}
+
+
+def scenario_timeout(attempt_timeout: int) -> int:
+    """The testclient's `--scenario-timeout`: what the attempt timeout leaves after the login and
+    the cleanup. The leave of the world that follows the cleanup takes ~10 s of that remainder;
+    only an attempt whose body and cleanup both ran to their limits is killed during the leave,
+    after the cleanup has done its work."""
+    return max(MIN_SCENARIO_TIMEOUT, attempt_timeout - LOGIN_RESERVE - CLEANUP_BUDGET)
+
+
+def run_counters(outcome: dict | None) -> dict[str, int]:
+    """The `retry_*` run variables of an outcome: work the bot had to repeat (the questchain boar
+    hits the server refused for facing, line of sight or range)."""
+    counters: dict[str, int] = {}
+    for name, value in ((outcome or {}).get("vars") or {}).items():
+        if (
+            str(name).startswith(COUNTER_PREFIX)
+            and isinstance(value, int)
+            and not isinstance(value, bool)
+            and value >= 0
+        ):
+            counters[str(name)] = value
+    return counters
+
+
 class ScenarioStats:
     def __init__(self) -> None:
         self.attempts = 0
@@ -477,10 +540,27 @@ class ScenarioStats:
         self.durations: list[int] = []
         self.skipped = False
         self.skip_reason = ""
+        # `retry_*` run counters: the sum, the attempts that reported the counter and the ones
+        # whose value was above zero.
+        self.counters: Counter[str] = Counter()
+        self.counter_reports: Counter[str] = Counter()
+        self.counter_hits: Counter[str] = Counter()
 
-    def add(self, ok: bool, error: str | None, failed_steps: list[str], ms: int) -> None:
+    def add(
+        self,
+        ok: bool,
+        error: str | None,
+        failed_steps: list[str],
+        ms: int,
+        counters: dict[str, int] | None = None,
+    ) -> None:
         self.attempts += 1
         self.durations.append(ms)
+        for name, value in (counters or {}).items():
+            self.counters[name] += value
+            self.counter_reports[name] += 1
+            if value:
+                self.counter_hits[name] += 1
         if ok:
             self.ok += 1
             return
@@ -531,6 +611,7 @@ class Runner:
         self.accounts: list[str] = []
         self.load_accounts: list[str] = []
         self.bot_accounts: list[str] = []
+        self.slots: dict[str, int] = {}
         self.started = 0.0
         self.finished = 0.0
         self.started_wall = ""
@@ -757,6 +838,14 @@ class Runner:
             fail("no bot account could be provisioned")
         if len(self.bot_accounts) < self.args.bots:
             log(f"[setup] WARN: only {len(self.bot_accounts)} of {self.args.bots} bot accounts are usable")
+        # One spawn-grid slot per bot, fixed for the whole run (the list order is stable).
+        self.slots = assign_slots(self.bot_accounts)
+        slot_scenarios = sorted(SLOT_SCENARIOS & set(self.args.scenarios))
+        if slot_scenarios and len(self.bot_accounts) > SPAWN_SLOTS:
+            log(
+                f"[setup] WARN: {len(self.bot_accounts)} bots but {SPAWN_SLOTS} spawn slots: bots "
+                f"{SPAWN_SLOTS}.. share a slot with an earlier bot in {', '.join(slot_scenarios)}"
+            )
         log(f"[setup] {len(self.bot_accounts)} bot + {len(self.load_accounts)} load account(s) ready")
 
     # ---- scenario attempts -------------------------------------------------------------------
@@ -856,7 +945,9 @@ class Runner:
             with self.attempts_path.open("a", encoding="utf-8") as out:
                 out.write(json.dumps(record) + "\n")
             stats = self.stats.setdefault(name, ScenarioStats())
-            stats.add(record["ok"], record["error"], record["failed_steps"], record["ms"])
+            stats.add(
+                record["ok"], record["error"], record["failed_steps"], record["ms"], record.get("counters")
+            )
             self.maybe_skip(name)
         status = "ok" if record["ok"] else "FAIL"
         log(
@@ -865,16 +956,10 @@ class Runner:
         )
         return record
 
-    def run_attempt_once(
-        self, name: str, account: str, seq: int, retries: int, config: Path | None
-    ) -> dict:
-        attempt_dir = self.run_dir / "outcomes" / account
-        attempt_dir.mkdir(parents=True, exist_ok=True)
-        suffix = f"-r{retries}" if retries else ""
-        outcome_path = attempt_dir / f"{seq:04d}-{name}{suffix}.json"
-        log_dir = self.logs_dir / account
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / f"{seq:04d}-{name}{suffix}.log"
+    def scenario_command(
+        self, name: str, account: str, outcome_path: Path, config: Path | None
+    ) -> list[str]:
+        """The testclient command line of one scenario attempt of `account`."""
         cmd = [
             str(self.lane.testclient),
             "run",
@@ -888,11 +973,31 @@ class Runner:
             self.lane.password,
             "--outcome-json",
             str(outcome_path),
+            "--scenario-timeout",
+            str(scenario_timeout(self.args.attempt_timeout)),
+            "--cleanup-timeout",
+            str(CLEANUP_BUDGET),
         ]
+        slot = self.slots.get(account)
+        if slot is not None:
+            cmd.extend(["--slot", str(slot)])
         if config is not None:
             cmd.extend(["--config", str(config)])
         else:
             cmd.extend(["--character", account])
+        return cmd
+
+    def run_attempt_once(
+        self, name: str, account: str, seq: int, retries: int, config: Path | None
+    ) -> dict:
+        attempt_dir = self.run_dir / "outcomes" / account
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+        suffix = f"-r{retries}" if retries else ""
+        outcome_path = attempt_dir / f"{seq:04d}-{name}{suffix}.json"
+        log_dir = self.logs_dir / account
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"{seq:04d}-{name}{suffix}.log"
+        cmd = self.scenario_command(name, account, outcome_path, config)
         display = [c if c != self.lane.password else "***" for c in cmd]
         started = iso_now()
         t0 = time.monotonic()
@@ -910,8 +1015,9 @@ class Runner:
             out.write("\n--- stderr ---\n")
             out.write(stderr)
 
+        outcome = parse_outcome(outcome_path)
         ok, error, failed_steps = classify_attempt(
-            rc, timed_out, parse_outcome(outcome_path), stdout, stderr, self.args.attempt_timeout
+            rc, timed_out, outcome, stdout, stderr, self.args.attempt_timeout
         )
 
         record = {
@@ -925,6 +1031,7 @@ class Runner:
             "timeout": timed_out,
             "error": error,
             "failed_steps": failed_steps,
+            "counters": run_counters(outcome),
             "outcome": outcome_path.relative_to(self.run_dir).as_posix() if outcome_path.exists() else None,
             "log": log_path.relative_to(self.run_dir).as_posix(),
         }
@@ -1236,6 +1343,15 @@ class Runner:
                     "failed_steps": [
                         {"step": step, "count": count} for step, count in stats.failed_steps.most_common(5)
                     ],
+                    "counters": [
+                        {
+                            "name": counter,
+                            "total": stats.counters[counter],
+                            "attempts_with": stats.counter_hits[counter],
+                            "attempts_reporting": stats.counter_reports[counter],
+                        }
+                        for counter in sorted(stats.counters)
+                    ],
                     "p50_ms": p50,
                     "p95_ms": p95,
                 }
@@ -1333,6 +1449,8 @@ class Runner:
             )
         add("")
 
+        lines.extend(counter_table(data["scenario_rows"]))
+
         failures = [row for row in data["scenario_rows"] if row["fail"]]
         if failures:
             add("## Failures")
@@ -1407,6 +1525,30 @@ class Runner:
         md_path = self.run_dir / "dashboard.md"
         md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return md_path, data
+
+
+def counter_table(rows: list[dict]) -> list[str]:
+    """Markdown lines of the `retry_*` run counters of the scenario rows (nothing without any)."""
+    entries = [(row["scenario"], counter) for row in rows for counter in row.get("counters", [])]
+    if not entries:
+        return []
+    lines = [
+        "## Retry counters",
+        "",
+        "Work the bots repeated because the server refused it (hit out of angle / line of sight /"
+        " range); a total above zero points at an intermittent server problem even when every"
+        " attempt passed.",
+        "",
+        "| scenario | counter | total | attempts with >= 1 | attempts reporting |",
+        "| --- | --- | ---: | ---: | ---: |",
+    ]
+    for scenario, counter in sorted(entries, key=lambda e: (e[0], e[1]["name"])):
+        lines.append(
+            f"| {scenario} | {counter['name']} | {counter['total']} | "
+            f"{counter['attempts_with']} | {counter['attempts_reporting']} |"
+        )
+    lines.append("")
+    return lines
 
 
 def parse_scenarios(value: str) -> list[str]:
@@ -1487,7 +1629,16 @@ def main(argv: list[str]) -> int:
         default=None,
         help="accounts in the parallel 'load' phase (default: --bots; 0 disables it)",
     )
-    parser.add_argument("--attempt-timeout", type=int, default=300, help="seconds per scenario attempt (default 300)")
+    parser.add_argument(
+        "--attempt-timeout",
+        type=int,
+        default=DEFAULT_ATTEMPT_TIMEOUT,
+        help=(
+            f"seconds per scenario attempt (default {DEFAULT_ATTEMPT_TIMEOUT}); the testclient "
+            f"gets {LOGIN_RESERVE} s to log in and {CLEANUP_BUDGET} s to clean up, its body "
+            f"taking the rest"
+        ),
+    )
     parser.add_argument(
         "--between-seconds",
         type=float,
