@@ -75,7 +75,8 @@ impl Context<'_> {
                 buffs::check_buffs_by_tag(self.server, &self.me(), *self_has_tag)
             }
             Condition::CooldownReady { cooldown_ready } => {
-                if !self.learned.contains(cooldown_ready) && !DEFAULT_ATTACKS.contains(cooldown_ready)
+                if !self.learned.contains(cooldown_ready)
+                    && !DEFAULT_ATTACKS.contains(cooldown_ready)
                 {
                     return false;
                 }
@@ -160,17 +161,15 @@ fn first_castable(
         let (bx, by, _) = me_pos(context.player);
         let cell = ((bx / 2.0).floor() as i32, (by / 2.0).floor() as i32);
         let sig = state.loadout_signature(context.player);
-        if state.refused_on.get(&action.skill).is_some_and(|r| {
-            r.matches(context.target.obj_id(), cell, sig, context.now)
-        }) {
+        if state
+            .refused_on
+            .get(&action.skill)
+            .is_some_and(|r| r.matches(context.target.obj_id(), cell, sig, context.now))
+        {
             continue;
         }
         let me = WorldObject::from(context.player);
-        let target = if self_target {
-            &me
-        } else {
-            context.target
-        };
+        let target = if self_target { &me } else { context.target };
         let Some(template) = context
             .server
             .game_data
@@ -191,12 +190,7 @@ fn first_castable(
         ) {
             Ok(()) => return Some((action.skill, self_target)),
             Err(SkillBlock::Requirement(key)) => {
-                state.learn_requirement(
-                    action.skill,
-                    target_template(context.target),
-                    key,
-                    sig,
-                );
+                state.learn_requirement(action.skill, target_template(context.target), key, sig);
             }
             Err(_) => {}
         }

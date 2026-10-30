@@ -14,21 +14,21 @@
 //! [`GameConnection`]: aaemu_game::net::connection::GameConnection
 
 pub mod combat;
-pub mod commands;
 #[cfg(test)]
 mod combat_flow_tests;
 #[cfg(test)]
 mod combat_real_data_tests;
+pub mod commands;
 #[cfg(test)]
 mod flow_tests;
 pub mod host;
 pub mod life;
 pub mod nav;
-pub mod rotation;
 #[cfg(test)]
 mod nav_flow_tests;
 #[cfg(test)]
 mod nav_real_data_tests;
+pub mod rotation;
 
 use std::sync::Arc;
 
@@ -60,7 +60,8 @@ pub fn install(server: &Arc<GameServer>) -> anyhow::Result<()> {
         tracing::info!(
             "Bots: {} archetypes, {} rotations loaded",
             class.archetypes().len(),
-            class.archetypes()
+            class
+                .archetypes()
                 .iter()
                 .filter(|a| class.rotation_for(a).is_some())
                 .count()

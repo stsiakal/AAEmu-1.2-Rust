@@ -55,7 +55,15 @@ pub async fn maintain(
     state.next_pass_ms = now + PASS_INTERVAL_MS;
     let mut sent = 0;
     sent += take_skillset(server, bot, archetype, &player, level).await;
-    sent += learn_skills(server, bot, archetype, state, &player, PASS_PACKETS - sent.min(PASS_PACKETS)).await;
+    sent += learn_skills(
+        server,
+        bot,
+        archetype,
+        state,
+        &player,
+        PASS_PACKETS - sent.min(PASS_PACKETS),
+    )
+    .await;
     learn_passives(server, bot, archetype, state, &player).await;
     sent
 }
@@ -137,7 +145,12 @@ async fn learn_skills(
             continue;
         }
         if bot
-            .dispatch(server, CSLearnSkillPacket { skill_id: step.skill_id })
+            .dispatch(
+                server,
+                CSLearnSkillPacket {
+                    skill_id: step.skill_id,
+                },
+            )
             .await
             .is_err()
         {
@@ -181,18 +194,18 @@ async fn learn_passives(
             continue;
         }
         if bot
-            .dispatch(server, CSLearnBuffPacket { buff_id: step.buff_id })
+            .dispatch(
+                server,
+                CSLearnBuffPacket {
+                    buff_id: step.buff_id,
+                },
+            )
             .await
             .is_err()
         {
             continue;
         }
-        if player
-            .data()
-            .skills
-            .passive_buffs
-            .contains(&step.buff_id)
-        {
+        if player.data().skills.passive_buffs.contains(&step.buff_id) {
             state.known_passives.insert(step.buff_id);
             tracing::debug!(
                 "Bots: '{}' learned passive {} ({})",

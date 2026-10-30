@@ -115,9 +115,8 @@ impl BotHost {
         for bot in bots {
             let state = bot.brain().lock().await;
             let (x, y, z) = bot.position().await.unwrap_or((0.0, 0.0, 0.0));
-            let (hp, mp, max_hp, max_mp, battle) = bot.player().await.map_or(
-                (0, 0, 1, 1, false),
-                |p| {
+            let (hp, mp, max_hp, max_mp, battle) =
+                bot.player().await.map_or((0, 0, 1, 1, false), |p| {
                     let c = p.data();
                     (
                         c.unit.hp,
@@ -126,8 +125,7 @@ impl BotHost {
                         c.unit.max_mp.max(1),
                         c.unit.is_in_battle,
                     )
-                },
-            );
+                });
             tracing::info!(
                 "Bots: '{}' {:?} hp {hp}/{max_hp} mp {mp}/{max_mp} battle {battle} target {:?} resting {} at ({x:.0}, {y:.0}, {z:.0}) kills {} deaths {} casts {} out-of-range {} cooldown {} refused {} looted {}",
                 bot.name,
@@ -162,7 +160,9 @@ impl BotHost {
         let creation_ability = match archetype {
             Some(key) => match self.class.as_ref().and_then(|c| c.get(key)) {
                 Some(a) => Some(a.creation_ability()),
-                None => anyhow::bail!("unknown archetype '{key}' (see /bot list or Bots.ArchetypesFile)"),
+                None => anyhow::bail!(
+                    "unknown archetype '{key}' (see /bot list or Bots.ArchetypesFile)"
+                ),
             },
             None => self
                 .class
@@ -193,8 +193,12 @@ impl BotHost {
         let character_id = bot.character_id;
         bot.install_plan_gate(self.plan_gate.clone());
         bot.install_road_cache(self.roads.clone());
-        bot.configure(self.class.as_ref(), self.config.max_target_level_gap, self.config.brain_tick_ms)
-            .await;
+        bot.configure(
+            self.class.as_ref(),
+            self.config.max_target_level_gap,
+            self.config.brain_tick_ms,
+        )
+        .await;
         let refusal = {
             let mut roster = self.bots.lock().await;
             if roster.len() >= self.config.max_bots {

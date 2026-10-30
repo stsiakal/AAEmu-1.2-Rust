@@ -45,9 +45,11 @@ fn add_damage_skill(data: &mut GameData, id: u32, damage: i32, max_range: i32, c
         dps_multiplier: 1.0,
         ..Default::default()
     };
-    data.systems
-        .skills
-        .add_effect(EffectKind::DamageEffect, EffectTemplate::Damage(Box::new(effect)), effect_id);
+    data.systems.skills.add_effect(
+        EffectKind::DamageEffect,
+        EffectTemplate::Damage(Box::new(effect)),
+        effect_id,
+    );
     let mut template = SkillTemplate {
         id,
         target_type: 4,
@@ -87,7 +89,11 @@ async fn the_static_tables_describe_the_damage_skill() {
     assert!(info.damages);
     assert!(!info.heals);
     assert_eq!(info.max_range, 25.0);
-    assert!(info.power >= 1.0, "fixed damage has a power weight: {}", info.power);
+    assert!(
+        info.power >= 1.0,
+        "fixed damage has a power weight: {}",
+        info.power
+    );
 }
 
 #[tokio::test]
@@ -142,7 +148,10 @@ async fn the_rotation_chooses_its_filler_and_respects_range() {
         ..Default::default()
     };
     let now = aaemu_game::world::now_ms();
-    assert_eq!(choose_rotation(&server, &player, &mut state, &target_obj, 3.0, now), Some((KILL_SKILL, false)));
+    assert_eq!(
+        choose_rotation(&server, &player, &mut state, &target_obj, 3.0, now),
+        Some((KILL_SKILL, false))
+    );
 
     // Out of the skill's reach: the rule's `range`/the gate keep it out.
     state.rotation = Some(Arc::new(

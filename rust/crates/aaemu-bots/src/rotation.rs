@@ -282,7 +282,8 @@ impl Archetype {
         let mut ids = [0u8; 3];
         ids[0] = name_id(&self.leveling_tree_order.creation).unwrap_or(self.class_abilities[0]);
         ids[1] = name_id(&self.leveling_tree_order.char_level_5).unwrap_or(self.class_abilities[1]);
-        ids[2] = name_id(&self.leveling_tree_order.char_level_10).unwrap_or(self.class_abilities[2]);
+        ids[2] =
+            name_id(&self.leveling_tree_order.char_level_10).unwrap_or(self.class_abilities[2]);
         // A missing / inconsistent leveling order: keep the trio but move the creation tree
         // first so the created character always starts on a tree of its own class.
         if !ids.contains(&self.class_abilities[0]) || ids.contains(&0) {
@@ -322,7 +323,11 @@ pub struct ClassData {
 impl ClassData {
     /// Loads `archetypes_file` and every `*.json` of `rotation_dir` (both optional). A missing
     /// or unreadable file is an error: a configured class data path should work or say why.
-    pub fn load(archetypes_file: &str, rotation_dir: &str, default_key: &str) -> anyhow::Result<Self> {
+    pub fn load(
+        archetypes_file: &str,
+        rotation_dir: &str,
+        default_key: &str,
+    ) -> anyhow::Result<Self> {
         let mut data = ClassData {
             default_key: default_key.trim().to_lowercase(),
             ..Default::default()
@@ -402,7 +407,6 @@ impl ClassData {
         }
         data
     }
-
 }
 
 fn load_archetypes(path: &Path) -> anyhow::Result<Vec<Arc<Archetype>>> {

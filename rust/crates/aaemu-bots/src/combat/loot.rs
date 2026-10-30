@@ -49,12 +49,12 @@ pub async fn open_corpse(
 
 /// How many items the corpse's looting container still holds (`None` without a container).
 pub fn loot_count(server: &GameServer, corpse: u32) -> Option<usize> {
-    server.systems.economy.loot.get(corpse).map(|c| {
-        c.lock()
-            .expect("loot container poisoned")
-            .items
-            .len()
-    })
+    server
+        .systems
+        .economy
+        .loot
+        .get(corpse)
+        .map(|c| c.lock().expect("loot container poisoned").items.len())
 }
 
 /// Where a corpse stands (its object may already be gone).

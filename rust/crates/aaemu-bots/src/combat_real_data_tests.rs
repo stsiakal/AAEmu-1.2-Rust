@@ -60,13 +60,11 @@ fn every_rotation_skill_exists_in_the_compact_database() {
         "darkrunner",
     )
     .expect("the research files parse");
-    let db = std::env::var("AAEMU_COMPACT_DB")
-        .expect("set AAEMU_COMPACT_DB to the 1.2 compact.sqlite3");
-    let conn = rusqlite::Connection::open_with_flags(
-        db,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .expect("the compact database opens");
+    let db =
+        std::env::var("AAEMU_COMPACT_DB").expect("set AAEMU_COMPACT_DB to the 1.2 compact.sqlite3");
+    let conn =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("the compact database opens");
     let mut missing = Vec::new();
     let mut checked = 0usize;
     for archetype in class.archetypes() {
@@ -82,7 +80,9 @@ fn every_rotation_skill_exists_in_the_compact_database() {
         for id in ids {
             checked += 1;
             let exists: i64 = conn
-                .query_row("SELECT COUNT(*) FROM skills WHERE id = ?1", [id], |r| r.get(0))
+                .query_row("SELECT COUNT(*) FROM skills WHERE id = ?1", [id], |r| {
+                    r.get(0)
+                })
                 .expect("skills query");
             if exists == 0 {
                 missing.push((archetype.key.clone(), id));
@@ -96,8 +96,8 @@ fn every_rotation_skill_exists_in_the_compact_database() {
 #[test]
 #[ignore = "needs compact.sqlite3 (AAEMU_COMPACT_DB)"]
 fn three_archetypes_have_a_level_one_button_and_a_damage_skill() {
-    let db = std::env::var("AAEMU_COMPACT_DB")
-        .expect("set AAEMU_COMPACT_DB to the 1.2 compact.sqlite3");
+    let db =
+        std::env::var("AAEMU_COMPACT_DB").expect("set AAEMU_COMPACT_DB to the 1.2 compact.sqlite3");
     let conn =
         rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .expect("the compact database opens");
@@ -127,6 +127,9 @@ fn three_archetypes_have_a_level_one_button_and_a_damage_skill() {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .expect("effect / plot columns");
-        assert!(effects > 0 || plot.is_some(), "{name} skill {skill} has effects");
+        assert!(
+            effects > 0 || plot.is_some(),
+            "{name} skill {skill} has effects"
+        );
     }
 }

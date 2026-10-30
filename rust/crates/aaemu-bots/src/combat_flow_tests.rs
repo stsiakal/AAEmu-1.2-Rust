@@ -35,9 +35,7 @@ const DROP_ITEM: u32 = 7_001;
 const LOOT_PACK: u32 = 77;
 
 fn add_damage_skill(data: &mut GameData, id: u32, damage: i32, cast_ms: i32, ability_id: u8) {
-    use aaemu_game::systems::skills::data::effects::{
-        DamageEffect, EffectKind, EffectTemplate,
-    };
+    use aaemu_game::systems::skills::data::effects::{DamageEffect, EffectKind, EffectTemplate};
     use aaemu_game::systems::skills::data::templates::SkillEffect;
 
     let effect_id = 900_000 + id;
@@ -237,7 +235,10 @@ async fn a_bot_kills_a_monster_through_the_real_skill_packets_and_loots_it() {
     assert!(counted, "the kill was counted");
     {
         let state = bot.brain().lock().await;
-        assert!(state.casts_started >= 1, "the cast went through the handler");
+        assert!(
+            state.casts_started >= 1,
+            "the cast went through the handler"
+        );
     }
     // The kill leaves a corpse with loot; the next thinks open it like a client.
     let looted = wait_until(&server, &bot, Duration::from_secs(5), || {

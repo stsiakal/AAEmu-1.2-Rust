@@ -290,7 +290,13 @@ impl CombatState {
 }
 
 /// Configures a freshly adopted bot: its class data, the level gap and the think cadence.
-pub fn configure(bot: &mut CombatState, archetype: Option<Arc<Archetype>>, rotation: Option<Arc<Rotation>>, max_gap: u8, tick_ms: u64) {
+pub fn configure(
+    bot: &mut CombatState,
+    archetype: Option<Arc<Archetype>>,
+    rotation: Option<Arc<Rotation>>,
+    max_gap: u8,
+    tick_ms: u64,
+) {
     bot.archetype = archetype;
     bot.rotation = rotation;
     bot.max_target_level_gap = max_gap;
@@ -407,13 +413,12 @@ pub async fn think(bot: &Arc<BotSession>, server: &Arc<GameServer>) -> Duration 
     // The rotation first, the data scoring as the fallback.
     let chosen = rotation::choose_rotation(server, &player, &mut state, &target_obj, dist, now)
         .map(|(skill, self_target)| Choice::Cast { skill, self_target })
-        .unwrap_or_else(|| skills::choose_data(server, &player, &mut state, &target_obj, dist, now));
+        .unwrap_or_else(|| {
+            skills::choose_data(server, &player, &mut state, &target_obj, dist, now)
+        });
 
     match chosen {
-        Choice::Cast {
-            skill,
-            self_target,
-        } => {
+        Choice::Cast { skill, self_target } => {
             if bot.walking() {
                 // Let the walker finish its arrival radius before the cast changes the facing.
                 bot.bump_nav_generation();
@@ -638,7 +643,10 @@ fn flee(
         );
     }
     let z = aaemu_game::systems::ai::nav::NavView::of_object(server, &WorldObject::from(player))
-        .and_then(|v| v.terrain_height(target.0, target.1).or_else(|| v.height(target.0, target.1)))
+        .and_then(|v| {
+            v.terrain_height(target.0, target.1)
+                .or_else(|| v.height(target.0, target.1))
+        })
         .unwrap_or(pz);
     state.fleeing_to = Some(target);
     state.flee_fails = state.flee_fails.saturating_add(1);
@@ -661,10 +669,14 @@ async fn loot_step(
         state.loot_target = None;
         return false;
     }
-    if loot::in_loot_range(server, {
-        let (x, y, _) = me_pos(player);
-        (x, y)
-    }, corpse) {
+    if loot::in_loot_range(
+        server,
+        {
+            let (x, y, _) = me_pos(player);
+            (x, y)
+        },
+        corpse,
+    ) {
         loot::open_corpse(bot, server, state, corpse).await;
         state.loot_target = None;
         return false;
@@ -697,9 +709,13 @@ async fn no_target(
         if bot.walking() && state.walk_to.is_some() {
             return Duration::from_millis(300);
         }
-        let z = aaemu_game::systems::ai::nav::NavView::of_object(server, &WorldObject::from(player))
-            .and_then(|v| v.terrain_height(center.0, center.1).or_else(|| v.height(center.0, center.1)))
-            .unwrap_or(pz);
+        let z =
+            aaemu_game::systems::ai::nav::NavView::of_object(server, &WorldObject::from(player))
+                .and_then(|v| {
+                    v.terrain_height(center.0, center.1)
+                        .or_else(|| v.height(center.0, center.1))
+                })
+                .unwrap_or(pz);
         state.walk_to = Some(*center);
         let _ = bot.start_goto(server, Vec3::new(center.0, center.1, z), 5.0);
         return Duration::from_millis(300);
@@ -711,14 +727,8 @@ async fn no_target(
     state.next_wander_ms = now + WANDER_MS;
     let angle = (state.wander as f32 * 2.399_963_2) % (std::f32::consts::PI * 2.0);
     let reach = *radius * WANDER_FRACTION;
-    let x = (center.0 + reach * angle.cos()).clamp(
-        center.0 - *radius,
-        center.0 + *radius,
-    );
-    let y = (center.1 + reach * angle.sin()).clamp(
-        center.1 - *radius,
-        center.1 + *radius,
-    );
+    let x = (center.0 + reach * angle.cos()).clamp(center.0 - *radius, center.0 + *radius);
+    let y = (center.1 + reach * angle.sin()).clamp(center.1 - *radius, center.1 + *radius);
     let z = aaemu_game::systems::ai::nav::NavView::of_object(server, &WorldObject::from(player))
         .and_then(|v| v.terrain_height(x, y).or_else(|| v.height(x, y)))
         .unwrap_or(pz);

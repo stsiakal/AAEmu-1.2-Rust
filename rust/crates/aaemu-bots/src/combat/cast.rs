@@ -20,9 +20,7 @@ use aaemu_game::packets::c2g_world::CSMoveUnitPacket;
 use aaemu_game::server::GameServer;
 use aaemu_game::systems::skills::controllers::roll_pitch_yaw_sbytes_movement;
 use aaemu_game::systems::skills::handlers::CSStartSkillPacket;
-use aaemu_game::systems::skills::types::{
-    skill_result, SkillCastTarget, SkillCaster, SkillObject,
-};
+use aaemu_game::systems::skills::types::{skill_result, SkillCastTarget, SkillCaster, SkillObject};
 use aaemu_game::world::PlayerRef;
 
 use crate::host::BotSession;
@@ -202,11 +200,16 @@ pub async fn cast(
     } else {
         let result = cast_result(&frames);
         match result {
-            Some(result) if result == skill_result::TOO_FAR_RANGE || result == skill_result::TOO_CLOSE_RANGE => {
+            Some(result)
+                if result == skill_result::TOO_FAR_RANGE
+                    || result == skill_result::TOO_CLOSE_RANGE =>
+            {
                 state.casts_out_of_range += 1;
                 return CastOutcome::OutOfRange;
             }
-            Some(result) if result == skill_result::COOLDOWN_TIME || result == skill_result::ON_CASTING => {
+            Some(result)
+                if result == skill_result::COOLDOWN_TIME || result == skill_result::ON_CASTING =>
+            {
                 state.casts_on_cooldown += 1;
                 return CastOutcome::Cooldown;
             }

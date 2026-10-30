@@ -282,7 +282,10 @@ pub enum SkillBlock {
     /// The global cooldown or the per-use interval (milliseconds left).
     GlobalCooldown(i64),
     /// Not enough mana.
-    Mana { need: i32, have: i32 },
+    Mana {
+        need: i32,
+        have: i32,
+    },
     /// The target is not one the bot may use the skill on (not attackable).
     Relation,
     /// The caster or the target is dead (or alive when the skill needs a corpse).
@@ -389,10 +392,7 @@ pub fn skill_gate(
     let me = WorldObject::from(player);
     let need = skill::mana_cost(server, &SkillRun::new(template.clone(), 1), &me);
     if need > cs.mp {
-        return Err(SkillBlock::Mana {
-            need,
-            have: cs.mp,
-        });
+        return Err(SkillBlock::Mana { need, have: cs.mp });
     }
     if let Some(hp) = target.with_unit(|u| u.unit().hp) {
         if hp <= 0 && template.target_alive && !template.target_dead {
@@ -421,16 +421,14 @@ pub fn skill_gate(
 pub fn default_attack(server: &GameServer, player: &PlayerRef) -> u32 {
     let mainhand = {
         let c = player.data();
-        c.inventory
-            .get(slot_type::EQUIPMENT)
-            .and_then(|e| {
-                e.lock()
-                    .expect("equipment poisoned")
-                    .items
-                    .iter()
-                    .find(|i| i.slot == aaemu_game::models::container::equip_slot::MAINHAND)
-                    .map(|i| i.template_id)
-            })
+        c.inventory.get(slot_type::EQUIPMENT).and_then(|e| {
+            e.lock()
+                .expect("equipment poisoned")
+                .items
+                .iter()
+                .find(|i| i.slot == aaemu_game::models::container::equip_slot::MAINHAND)
+                .map(|i| i.template_id)
+        })
     };
     let reach = mainhand
         .and_then(|id| server.game_data.items.template(id))
@@ -504,7 +502,8 @@ pub fn choose_data(
             .filter(|other| other.obj_id != v.obj_id)
             .filter(|other| {
                 let n = other.data();
-                n.unit.hp > 0 && dist2(n.unit.transform.x, n.unit.transform.y, v.x, v.y) <= AOE_RADIUS_M
+                n.unit.hp > 0
+                    && dist2(n.unit.transform.x, n.unit.transform.y, v.x, v.y) <= AOE_RADIUS_M
             })
             .filter(|other| attackable(server, player, other))
             .count()
@@ -682,7 +681,11 @@ pub fn learned(player: &PlayerRef) -> HashSet<u32> {
 }
 
 /// Healing potions in the bag: `(item id, template id, use skill id)`.
-pub fn healing_items(server: &GameServer, state: &mut CombatState, player: &PlayerRef) -> Vec<(u64, u32, u32)> {
+pub fn healing_items(
+    server: &GameServer,
+    state: &mut CombatState,
+    player: &PlayerRef,
+) -> Vec<(u64, u32, u32)> {
     let bag = {
         let c = player.data();
         c.inventory.get(slot_type::INVENTORY).cloned()
@@ -723,10 +726,19 @@ mod tests {
             id: 3,
             ..Default::default()
         };
-        assert!(cast_throttled(&t, true, 1_000, 0, 1_100), "500 ms melee delay");
-        assert!(!cast_throttled(&t, true, 1_000, 0, 1_600), "after the delay");
+        assert!(
+            cast_throttled(&t, true, 1_000, 0, 1_100),
+            "500 ms melee delay"
+        );
+        assert!(
+            !cast_throttled(&t, true, 1_000, 0, 1_600),
+            "after the delay"
+        );
         t.id = 10;
-        assert!(!cast_throttled(&t, true, 1_000, 0, 1_200), "150 ms for other skills");
+        assert!(
+            !cast_throttled(&t, true, 1_000, 0, 1_200),
+            "150 ms for other skills"
+        );
         t.ignore_global_cooldown = false;
         assert!(
             cast_throttled(&t, true, 0, 2_000, 1_000),
@@ -749,7 +761,10 @@ mod tests {
             requirement_kind("skill_urk_target_npc_group"),
             Requirement::TargetKind
         );
-        assert_eq!(requirement_kind("skill_urk_need_stealth"), Requirement::Passing);
+        assert_eq!(
+            requirement_kind("skill_urk_need_stealth"),
+            Requirement::Passing
+        );
     }
 
     #[test]

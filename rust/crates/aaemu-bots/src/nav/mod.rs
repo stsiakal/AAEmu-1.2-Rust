@@ -2138,6 +2138,9 @@ mod budget_tests {
         for _ in 0..CLOCK_BATCH {
             budget.tick();
         }
-        assert!(!budget.tick(), "a 0 ms budget stops at its first clock read");
+        assert!(
+            !budget.tick(),
+            "a 0 ms budget stops at its first clock read"
+        );
     }
 }

@@ -324,8 +324,8 @@ mod tests {
         spawn_monster(&server, 0x202, 1, 2, 50, 112.0, 100.0);
         spawn_monster(&server, 0x203, 1, 2, 50, 100.0, 118.0);
         let rules = PullRules::default();
-        let target = find_target(&server, &player, &[], &rules, SEARCH_RADIUS_M, 3, 0)
-            .expect("a target");
+        let target =
+            find_target(&server, &player, &[], &rules, SEARCH_RADIUS_M, 3, 0).expect("a target");
         assert_eq!(target.obj_id, 0x203, "the lone monster beats the pair");
     }
 
@@ -337,8 +337,8 @@ mod tests {
         tagged.data().tagger_obj_id = 0x999;
         spawn_monster(&server, 0x203, 3, 2, 50, 107.0, 100.0);
         let rules = PullRules::default();
-        let target = find_target(&server, &player, &[], &rules, SEARCH_RADIUS_M, 3, 0)
-            .expect("a target");
+        let target =
+            find_target(&server, &player, &[], &rules, SEARCH_RADIUS_M, 3, 0).expect("a target");
         assert_eq!(target.obj_id, 0x203, "only the pullable monster is left");
     }
 
@@ -351,8 +351,8 @@ mod tests {
             allow_tagged: true,
             ..Default::default()
         };
-        let target = find_target(&server, &player, &[2], &rules, SEARCH_RADIUS_M, 3, 0)
-            .expect("a target");
+        let target =
+            find_target(&server, &player, &[2], &rules, SEARCH_RADIUS_M, 3, 0).expect("a target");
         assert_eq!(target.obj_id, 0x202);
     }
 

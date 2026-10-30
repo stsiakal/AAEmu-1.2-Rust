@@ -157,7 +157,12 @@ pub fn choose_revive(
 }
 
 /// [`choose_revive`] on the live world around the corpse.
-pub fn revive_choice(server: &GameServer, player: &PlayerRef, state: &CombatState, now: i64) -> ReviveChoice {
+pub fn revive_choice(
+    server: &GameServer,
+    player: &PlayerRef,
+    state: &CombatState,
+    now: i64,
+) -> ReviveChoice {
     let (offer, my_level) = {
         let c = player.data();
         (c.skill_char.resurrect_offer, c.unit.level)
@@ -208,8 +213,7 @@ pub fn threat_to_flee(
     note_attacker(state, attacker, now);
     let my_level = player.data().unit.level;
     let too_strong = attacker.level > my_level.saturating_add(state.max_target_level_gap);
-    let losing = hp < LOSING_BELOW
-        && super::target::attackers_on_me(server, player) > 1;
+    let losing = hp < LOSING_BELOW && super::target::attackers_on_me(server, player) > 1;
     (too_strong || losing).then_some(attacker)
 }
 
@@ -228,7 +232,10 @@ mod tests {
     #[test]
     fn rest_starts_below_the_threshold_and_ends_at_the_recovery_fraction() {
         // The flag logic is covered end-to-end in the flow test; the thresholds are the port.
-        assert_eq!(CombatState::default().rest_until(), ENGAGE_MIN.max(REST_UNTIL));
+        assert_eq!(
+            CombatState::default().rest_until(),
+            ENGAGE_MIN.max(REST_UNTIL)
+        );
     }
 
     #[test]
@@ -253,8 +260,14 @@ mod tests {
     #[test]
     fn the_revive_policy_goes_to_the_temple_when_the_killer_is_dangerous() {
         let now = 100_000;
-        assert_eq!(choose_revive(false, 5, 3, None, false, false, now).reason, "no_offer");
-        assert_eq!(choose_revive(true, 5, 3, None, false, false, now).reason, "safe");
+        assert_eq!(
+            choose_revive(false, 5, 3, None, false, false, now).reason,
+            "no_offer"
+        );
+        assert_eq!(
+            choose_revive(true, 5, 3, None, false, false, now).reason,
+            "safe"
+        );
         let strong = killer(20, now);
         assert_eq!(
             choose_revive(true, 5, 3, Some(&strong), false, false, now).reason,
