@@ -52,6 +52,9 @@ struct FailureGroup {
     races: Vec<String>,
     steps: BTreeMap<String, u64>,
     reasons: BTreeMap<String, u64>,
+    /// The most common `step: reason` pair, so the rendered row does not mix one race's step
+    /// with another race's reason.
+    causes: BTreeMap<String, u64>,
     reports: BTreeSet<String>,
 }
 
@@ -141,6 +144,7 @@ pub fn write(out: &Path) -> Result<()> {
                 races: Vec::new(),
                 steps: BTreeMap::new(),
                 reasons: BTreeMap::new(),
+                causes: BTreeMap::new(),
                 reports: BTreeSet::new(),
             });
             if !f.races.contains(&r.race) {
@@ -151,8 +155,10 @@ pub fn write(out: &Path) -> Result<()> {
             } else {
                 r.step.clone()
             };
-            *f.steps.entry(step).or_default() += 1;
-            *f.reasons.entry(trim(&r.reason)).or_default() += 1;
+            let reason = trim(&r.reason);
+            *f.steps.entry(step.clone()).or_default() += 1;
+            *f.reasons.entry(reason.clone()).or_default() += 1;
+            *f.causes.entry(format!("{step}: {reason}")).or_default() += 1;
             for p in &r.reports {
                 f.reports.insert(p.clone());
             }
@@ -286,18 +292,17 @@ fn render(d: &Dashboard) -> String {
         "| quest | level | name | races | failing step | reason |\n|---:|---:|---|---|---|---|\n",
     );
     for f in &d.top_failures {
-        let step = f
-            .steps
+        let cause = f
+            .causes
             .iter()
             .max_by_key(|(_, n)| **n)
-            .map(|(s, _)| s.clone())
+            .map(|(c, _)| c.clone())
             .unwrap_or_default();
-        let reason = f
-            .reasons
-            .iter()
-            .max_by_key(|(_, n)| **n)
-            .map(|(s, _)| s.clone())
-            .unwrap_or_default();
+        let (step, reason) = cause
+            .split_once(": ")
+            .map_or((cause.clone(), String::new()), |(s, r)| {
+                (s.to_string(), r.to_string())
+            });
         s.push_str(&format!(
             "| {} | {} | {} | {} | {} | {} |\n",
             f.quest,
