@@ -25,6 +25,7 @@ provisioning could not be brought up.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import random
@@ -194,6 +195,9 @@ class Lane:
             {
                 "AAEMU_LANE": self.name,
                 "AAEMU_PROFILE": self.profile,
+                # The shared MySQL is not the runner's to start or stop, even if it drops
+                # between the TCP precheck and live-stack.sh's authenticated mysql_up.
+                "AAEMU_LIVE_NO_MYSQL_START": "1",
                 "NO_COLOR": "1",
                 "RUST_LOG": os.environ.get("AAEMU_SOAK_RUST_LOG", "info"),
             }
@@ -208,10 +212,13 @@ class Lane:
             out.flush()
             kwargs = {}
             if os.name == "nt":
-                # Keep the stack (and any mysqld) out of the runner's console group: a
-                # Ctrl+C/Ctrl+Break aimed at the runner must not signal the processes it
-                # started. The finally block stops this lane's stack explicitly.
-                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+                # The stack runs without a console, in its own process group, so a Ctrl+C or
+                # Ctrl+Break aimed at the runner's console cannot reach it; redirected stdio
+                # still captures its output. The finally block stops it explicitly.
+                kwargs["creationflags"] = (
+                    subprocess.CREATE_NEW_PROCESS_GROUP
+                    | getattr(subprocess, "DETACHED_PROCESS", 0)
+                )
             proc = subprocess.Popen(
                 [self.bash, str(REPO / "Scripts/live-stack.sh"), action],
                 cwd=str(REPO),
@@ -430,6 +437,28 @@ def join_threads(threads: list[threading.Thread], timeout: float | None = None) 
             thread.join(timeout=0.5)
 
 
+@contextlib.contextmanager
+def interrupts_ignored():
+    """Ignore further SIGINT/SIGBREAK so the final stack stop cannot be cut short."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = {}
+    for sig in (signal.SIGINT, getattr(signal, "SIGBREAK", None)):
+        if sig is None:
+            continue
+        try:
+            previous[sig] = signal.getsignal(sig)
+            signal.signal(sig, signal.SIG_IGN)
+        except (ValueError, OSError):
+            pass
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
 def parse_outcome(path: Path) -> dict | None:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -623,10 +652,12 @@ class Runner:
         # Never let live-stack.sh start (and Ctrl+Break kill) the shared MySQL: if it is
         # down this run must refuse before it touches any stack process.
         self.require_mysql()
+        # We are about to touch this lane's stack: the final cleanup stop must run even if
+        # the interrupt lands in this initial stop.
+        self.stack_attempted = True
         log("[setup] stopping this lane's stack (MySQL stays up)")
         self.lane.stack("stop", self.run_dir / "stack-stop.log", abort=self.abort)
         log("[setup] starting the stack with bug reports enabled")
-        self.stack_attempted = True
         rc = self.lane.stack("start", self.run_dir / "stack-start.log", abort=self.abort)
         if rc != 0:
             tail = last_meaningful_line((self.run_dir / "stack-start.log").read_text(encoding="utf-8", errors="replace")[-4000:])
@@ -1415,12 +1446,13 @@ def run_soak(runner: Runner, args: argparse.Namespace) -> bool:
             runner.finished = time.monotonic()
         log("[runner] interrupted: killing bot clients and writing a partial dashboard")
     finally:
-        runner.kill_children()
-        runner.stop_workers()
-        runner.kill_children()
-        if not args.keep_stack and runner.stack_attempted:
-            log("[setup] stopping this lane's stack (MySQL stays up)")
-            runner.lane.stack("stop", runner.run_dir / "stack-stop.log")
+        with interrupts_ignored():
+            runner.kill_children()
+            runner.stop_workers()
+            runner.kill_children()
+            if not args.keep_stack and runner.stack_attempted:
+                log("[setup] stopping this lane's stack (MySQL stays up)")
+                runner.lane.stack("stop", runner.run_dir / "stack-stop.log")
     return interrupted
 
 

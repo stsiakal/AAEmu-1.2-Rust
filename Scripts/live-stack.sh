@@ -19,6 +19,9 @@
 # Every path is an environment variable so another machine can override it (e.g. AAEMU_DB_USER, the
 # MySQL user in generated lane configs, default aaemu; AAEMU_DRIVER_DLL / AAEMU_DRIVER_OUT). Secrets (DB and test
 # account passwords) live only in $LIVE/cfg and the runtime Config.Local.json files, never in git.
+#
+# AAEMU_LIVE_NO_MYSQL_START=1: never start or stop mysqld; refuse with a clear message when the
+# shared MySQL is not up (used by Scripts/bots-soak.sh, which must never touch the shared server).
 set -euo pipefail
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
@@ -137,6 +140,10 @@ EOF
 
 cmd_mysql() {
   if mysql_up; then return; fi
+  if [ "${AAEMU_LIVE_NO_MYSQL_START:-0}" = 1 ]; then
+    echo "MySQL on 127.0.0.1:$MYSQL_PORT is not up; start it outside live-stack.sh (AAEMU_LIVE_NO_MYSQL_START=1 forbids starting it)" >&2
+    exit 1
+  fi
   ("$MYSQL_BIN/mysqld.exe" --defaults-file="$LIVE/mysql/my.ini" >/dev/null 2>&1 &)
   for _ in $(seq 1 60); do mysql_up && return; sleep 1; done
   echo "MySQL did not start; see $LIVE/logs/mysqld.err" >&2; exit 1
@@ -242,7 +249,13 @@ cmd_stop() {
   for p in archeage.exe "$GAME_BIN" aaemu-login.exe; do
     for id in $(pids_of "$p"); do taskkill //F //PID "$id" >/dev/null 2>&1 || true; done
   done
-  if [ "${1:-}" = --mysql ] && mysql_up; then "${MYSQL[@]}" -e "SHUTDOWN"; fi
+  if [ "${1:-}" = --mysql ] && mysql_up; then
+    if [ "${AAEMU_LIVE_NO_MYSQL_START:-0}" = 1 ]; then
+      echo "AAEMU_LIVE_NO_MYSQL_START=1: not stopping the shared MySQL" >&2
+    else
+      "${MYSQL[@]}" -e "SHUTDOWN"
+    fi
+  fi
   echo "stopped"
 }
 
