@@ -203,6 +203,11 @@ impl Session {
 pub async fn run(cfg: &CrawlConfig, catalog: &Catalog) -> Result<()> {
     let result_path = cfg.result_path();
     let mut passed = load_passed(&result_path);
+    let failed = if cfg.skip_failed {
+        load_failed(&result_path)
+    } else {
+        HashSet::new()
+    };
     let mut results = ResultsFile::open(&result_path)?;
 
     let mut session = connect(cfg, catalog).await?;
@@ -218,7 +223,7 @@ pub async fn run(cfg: &CrawlConfig, catalog: &Catalog) -> Result<()> {
     quests.sort_by_key(|q| (q.level, q.id));
     let attemptable = quests
         .iter()
-        .filter(|q| is_attemptable(cfg, catalog, q, &passed))
+        .filter(|q| !failed.contains(&q.id) && is_attemptable(cfg, catalog, q, &passed))
         .count();
     let budget = cfg.limit.map(|n| n.min(attemptable));
     println!(
@@ -233,7 +238,7 @@ pub async fn run(cfg: &CrawlConfig, catalog: &Catalog) -> Result<()> {
         if budget.is_some_and(|b| visited >= b) {
             break;
         }
-        if passed.contains(&quest.id) {
+        if passed.contains(&quest.id) || failed.contains(&quest.id) {
             continue;
         }
         let attempt = is_attemptable(cfg, catalog, quest, &passed);
@@ -358,12 +363,20 @@ fn finish_result(
 }
 
 fn load_passed(path: &Path) -> HashSet<u32> {
+    load_with_status(path, "passed")
+}
+
+fn load_failed(path: &Path) -> HashSet<u32> {
+    load_with_status(path, "failed")
+}
+
+fn load_with_status(path: &Path, status: &str) -> HashSet<u32> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return HashSet::new();
     };
     text.lines()
         .filter_map(|line| serde_json::from_str::<QuestResult>(line).ok())
-        .filter(|r| r.status == "passed")
+        .filter(|r| r.status == status)
         .map(|r| r.quest)
         .collect()
 }

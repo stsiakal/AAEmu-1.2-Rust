@@ -109,6 +109,8 @@ pub struct CrawlConfig {
     pub min_level: u8,
     /// Do not update the account's access level through MySQL.
     pub no_grant_gm: bool,
+    /// Do not retry quests that already failed in the result file.
+    pub skip_failed: bool,
 }
 
 impl CrawlConfig {
@@ -133,6 +135,7 @@ impl CrawlConfig {
             objective_timeout: Duration::from_secs(45),
             min_level: 0,
             no_grant_gm: false,
+            skip_failed: false,
         }
     }
 

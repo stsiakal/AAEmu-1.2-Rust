@@ -18,7 +18,7 @@
 //! aaemu-testclient control --config private.json --login H:P --capture game.jsonl
 //!                          [--deadline-ms 570000]
 //! aaemu-testclient crawl --race nuian|elf|firran|harani --out DIR [--levels a-b]
-//!                        [--from-quest N] [--limit N] [--min-level N]
+//!                        [--from-quest N] [--limit N] [--min-level N] [--skip-failed]
 //!                        [--game-config F] [--server-log F] [--bugreports DIR]
 //!                        Play every quest of one race (see CRAWLER.md).
 //! aaemu-testclient crawl --dashboard --out DIR
@@ -49,7 +49,13 @@ struct Args {
 
 impl Args {
     fn parse() -> anyhow::Result<Self> {
-        const SWITCHES: &[&str] = &["list-bots", "describe", "dashboard", "no-grant-gm"];
+        const SWITCHES: &[&str] = &[
+            "list-bots",
+            "describe",
+            "dashboard",
+            "no-grant-gm",
+            "skip-failed",
+        ];
         let mut it = std::env::args().skip(1);
         let cmd = it.next().unwrap_or_else(|| "help".into());
         let argv: Vec<String> = it.collect();
@@ -206,6 +212,7 @@ fn crawl_config(args: &Args) -> anyhow::Result<CrawlConfig> {
         cfg.objective_timeout = Duration::from_secs(v.parse()?);
     }
     cfg.no_grant_gm = args.has("no-grant-gm");
+    cfg.skip_failed = args.has("skip-failed");
     Ok(cfg)
 }
 

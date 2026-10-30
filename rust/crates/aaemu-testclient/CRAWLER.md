@@ -46,7 +46,9 @@ $TC crawl --race nuian \
   in that file are skipped. Unsupported and skipped quests are re-recorded but do not consume
   the limit. A quest that passes (or that the server reports as already completed) unlocks the
   quests chained behind it later in the same run; a prerequisite that failed keeps its
-  dependants skipped until it passes in a later run.
+  dependants skipped until it passes in a later run. `--skip-failed` additionally skips quests
+  that already failed in the result file, so a full-band pass only spends time on quests that
+  were never attempted.
 - Enable `BugReports.Enabled` in the lane's `rs-game/Config.Local.json` (Directory empty =
   `<app>/BugReports`) to attach report paths to failures. The crawler ignores teleport /
   closed-zone report noise.
