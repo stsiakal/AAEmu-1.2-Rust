@@ -575,11 +575,10 @@ fn approach(
         return true;
     }
     if bot.walking() {
-        if let Some((wx, wy)) = state.walk_to {
-            if dist2(wx, wy, x, y) <= 3.0 {
-                return true;
-            }
-        }
+        // Let the running walk finish (it ends within `range` of where the target stood); the
+        // next think re-evaluates the target's new position. Restarting on every small move
+        // cancels the walk continuously and the bot never arrives.
+        return true;
     }
     let z = aaemu_game::systems::ai::nav::NavView::of_object(server, &WorldObject::from(player))
         .and_then(|v| v.terrain_height(x, y).or_else(|| v.height(x, y)))
