@@ -192,6 +192,25 @@ fn a_jumpable_fence_is_crossed_but_a_high_wall_is_not() {
 }
 
 #[test]
+fn a_jumpable_obstacle_produces_a_jump_step() {
+    struct Fence;
+    impl NavWorld for Fence {
+        fn height(&self, _x: f32, _y: f32) -> Option<f32> {
+            Some(100.0)
+        }
+        fn obstacle(&self, from: Vec3, to: Vec3) -> Option<Obstacle> {
+            ((from.x < 105.0 && to.x >= 105.0) || (from.x > 106.0 && to.x <= 106.0))
+                .then_some(Obstacle::Low(1.1))
+        }
+    }
+    let step = nav::next_step(&Fence, at(104.5, 100.0), at(107.0, 100.0)).expect("jump step");
+    assert!(
+        matches!(step.action, StepAction::Jump(h) if (h - 1.1).abs() < 0.01),
+        "{step:?}"
+    );
+}
+
+#[test]
 fn drops_are_limited_to_the_safe_fall_height() {
     struct Cliff;
     impl NavWorld for Cliff {
