@@ -22,6 +22,7 @@ use crate::models::unit::{BaseUnitType, Bonus};
 use crate::packets::world::SCUnitPointsPacket;
 use crate::packets::world_objects::SCUnitAttachedPacket;
 use crate::server::GameServer;
+use crate::systems::ai::collision::world::Owner;
 use crate::systems::economy::inventory::{self, Inv, ItemTxn};
 use crate::systems::economy::item_effect_packets::{
     ItemAndLocation, SCSlaveEquipmentChangedPacket,
@@ -39,7 +40,7 @@ use crate::systems::skills::types::{
 };
 use crate::world::{Entity, PlayerRef, SlaveRef, WorldInstance, WorldObject};
 
-use super::data::{attach_point, SlaveTemplate};
+use super::data::{attach_point, ShipModel, SlaveTemplate};
 use super::packets::{
     item_task_type, SCItemTaskSuccessPacket, SCMySlavePacket, SCSlaveBoundPacket,
     SCSlaveCreatedPacket, SCSlaveDespawnPacket, SCSlaveRemovedPacket, SCUnitDetachedPacket,
@@ -2004,6 +2005,174 @@ const OVERHEAD_CLEARANCE_MARGIN: f32 = 1.0;
 /// The overhead probe stops just above the water surface, so only structures above it count.
 const OVERHEAD_SURFACE_MARGIN: f32 = 0.05;
 
+/// The vertical hull envelope tested for overlap with static solids: the footprint plus the
+/// keel bottom and the hull top (plus the overhead margin), relative to the ship's waterline
+/// spawn z (the hull's z offset is already folded in).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct HullEnvelope {
+    pub footprint: HullFootprint,
+    /// Keel bottom relative to the waterline, metres.
+    pub bottom: f32,
+    /// Hull top + [`OVERHEAD_CLEARANCE_MARGIN`] relative to the waterline, metres.
+    pub top: f32,
+}
+
+impl HullEnvelope {
+    /// The envelope the solid CryPhysics hull occupies when it is placed on the water at its
+    /// spawn z: the clipped authored collision bounds, else the inertia mass box, at scale 1.0.
+    pub(crate) fn from_hull(
+        bounds: Option<&aaemu_physics::geometry::primitives::BoxPrim>,
+        ship: &ShipModel,
+        offset_z: f32,
+    ) -> Self {
+        let footprint = hull_footprint(bounds, ship.mass_box_size_x, ship.mass_box_size_y, 1.0);
+        let (bottom, top) = match bounds {
+            Some(b) => (b.center.z - b.size.z, b.center.z + b.size.z),
+            None => {
+                let half = ship.mass_box_size_z.max(0.01) * 0.5;
+                (ship.mass_center_z - half, ship.mass_center_z + half)
+            }
+        };
+        let bottom = offset_z + bottom;
+        let top = (offset_z + top).max(0.5).max(bottom + 0.5);
+        Self {
+            footprint,
+            bottom,
+            top: top + OVERHEAD_CLEARANCE_MARGIN,
+        }
+    }
+
+    /// The hull top without the margin, the start height of the overhead ray.
+    fn hull_top(&self) -> f32 {
+        self.top - OVERHEAD_CLEARANCE_MARGIN
+    }
+}
+
+/// A static collider must have a world AABB extent of at least this many metres to block a
+/// summoned hull. Buoys, bollards and small mooring posts are below it; piers, quays, decks,
+/// bridges and rocks are far above. Vegetation is ignored regardless of size.
+const HULL_OBSTACLE_MIN_SIZE: f32 = 2.0;
+
+/// Whether a static collider can reject a hull summon spot: terrain always can; vegetation
+/// never (reeds, kelp and trees are not hull obstacles); any other static only when its world
+/// AABB is at least [`HULL_OBSTACLE_MIN_SIZE`] metres across in some axis.
+fn hull_obstacle(owner: Owner, bounds: [aaemu_physics::math::Vec3; 2]) -> bool {
+    if matches!(owner, Owner::Vegetation { .. }) {
+        return false;
+    }
+    if matches!(owner, Owner::Terrain) {
+        return true;
+    }
+    let d = bounds[1] - bounds[0];
+    d.x.max(d.y).max(d.z) >= HULL_OBSTACLE_MIN_SIZE
+}
+
+/// True when `p` lies inside a hull-blocking static solid: a downward ray that reports exit
+/// faces hits a surface with a downward normal (the ray leaves the solid through its bottom).
+/// A deck or bridge above the point is hit from outside first (upward normal) and does not
+/// count; vegetation and tiny statics are ignored like in the box overlap.
+fn point_inside_static(server: &GameServer, instance_id: u32, p: [f32; 3]) -> bool {
+    let hit = crate::systems::ai::collision::raycast(
+        server,
+        instance_id,
+        p,
+        [p[0], p[1], p[2] - 1024.0],
+        crate::systems::ai::collision::query::mask::STATIC,
+        crate::systems::ai::collision::query::ray_flags::WITH_BACK_FACES,
+    );
+    let Some(Some(hit)) = hit else {
+        return false;
+    };
+    if hit.normal.z >= 0.0 {
+        return false;
+    }
+    match crate::systems::ai::collision::entity_owner_bounds(server, instance_id, hit.ent) {
+        Some((owner, bounds)) => hull_obstacle(owner, bounds),
+        None => false,
+    }
+}
+
+/// The terrain part of the hull-envelope overlap: the collision heightfield must stay below
+/// the keel at the candidate centre and the nine hull points. The PWI box intersect does not
+/// report the heightfield entity, so this samples the collision terrain directly (the same
+/// terrain-in-the-envelope rule as the `STATIC|TERRAIN` box mask intent).
+fn hull_terrain_clear(
+    server: &GameServer,
+    instance_id: u32,
+    x: f32,
+    y: f32,
+    hull_z: f32,
+    yaw: f32,
+    envelope: HullEnvelope,
+) -> bool {
+    let keel = hull_z + envelope.bottom;
+    hull_probe_points(x, y, yaw, envelope.footprint)
+        .into_iter()
+        .chain(std::iter::once((x, y)))
+        .all(|(px, py)| {
+            crate::systems::ai::collision::terrain_height_or(server, instance_id, px, py, || {
+                f32::NEG_INFINITY
+            }) <= keel
+        })
+}
+
+/// True when the hull envelope at (`x`, `y`, `hull_z`) and the final yaw does not intersect a
+/// static collider. The box spans the keel to just above the hull top, so a thick deck or a
+/// solid quay that a downward ray misses (the ray starts inside it and ignores exit faces)
+/// still rejects the spot. The terrain heightfield is sampled separately at the same points (a
+/// harbour platform above the water must reject the spot even when its top is above the depth
+/// probe start), while the depth probes still keep legitimate keels above the seabed. The
+/// box-box test emits only clipped edge points, so a solid that fully contains the box reports
+/// no contact; the same nine hull grid points are then checked for point containment.
+fn hull_clear_at(
+    server: &GameServer,
+    instance_id: u32,
+    x: f32,
+    y: f32,
+    hull_z: f32,
+    yaw: f32,
+    envelope: HullEnvelope,
+) -> bool {
+    let (fx, fy) = (-yaw.sin(), yaw.cos());
+    let fp = envelope.footprint;
+    let mid = fp.mid_length();
+    let center = [
+        x + fx * mid,
+        y + fy * mid,
+        hull_z + (envelope.bottom + envelope.top) * 0.5,
+    ];
+    let half = [
+        fp.half_beam,
+        (fp.length.1 - fp.length.0) * 0.5,
+        (envelope.top - envelope.bottom) * 0.5,
+    ];
+    let obstacles = crate::systems::ai::collision::box_obstacles(
+        server,
+        instance_id,
+        center,
+        half,
+        yaw,
+        crate::systems::ai::collision::query::mask::STATIC_TERRAIN,
+    );
+    match obstacles {
+        // No collision service: the depth probes and overhead rays already passed.
+        None => true,
+        Some(list)
+            if list
+                .iter()
+                .any(|(owner, bounds)| hull_obstacle(*owner, *bounds)) =>
+        {
+            false
+        }
+        Some(_) => {
+            hull_terrain_clear(server, instance_id, x, y, hull_z, yaw, envelope)
+                && !hull_probe_points(x, y, yaw, fp)
+                    .into_iter()
+                    .any(|(px, py)| point_inside_static(server, instance_id, [px, py, center[2]]))
+        }
+    }
+}
+
 /// The overhead clearance decision for one probe point: a downward ray from above the hull to
 /// just above the water surface blocks the spot when it hits a collider above the surface
 /// (a pier, bridge or deck). A miss, or no collision service, is clear.
@@ -2011,9 +2180,11 @@ fn overhead_clear(hit: Option<Option<f32>>, water: f32) -> bool {
     !matches!(hit, Some(Some(z)) if z > water + OVERHEAD_SURFACE_MARGIN)
 }
 
-/// [`overhead_clear`] with the production ray: from `water + hull_top + margin` down to just
-/// above the water at (`x`, `y`), against static, rigid and terrain colliders.
-fn overhead_clear_at(
+/// [`overhead_clear`] with the production rays between `water + hull_top + margin` and just
+/// above the water at (`x`, `y`), against static, rigid and terrain colliders. The downward ray
+/// finds the top of a pier, bridge or deck; a ray does not hit the solid it starts in, so the
+/// upward ray finds the underside of a deck thick enough to contain the downward ray's start.
+pub(crate) fn overhead_clear_at(
     server: &GameServer,
     instance_id: u32,
     x: f32,
@@ -2021,15 +2192,20 @@ fn overhead_clear_at(
     water: f32,
     hull_top: f32,
 ) -> bool {
-    let hit = crate::systems::ai::collision::raycast(
-        server,
-        instance_id,
-        [x, y, water + hull_top + OVERHEAD_CLEARANCE_MARGIN],
-        [x, y, water + OVERHEAD_SURFACE_MARGIN],
-        crate::systems::ai::collision::query::mask::SOLID_TERRAIN,
-        crate::systems::ai::collision::query::ray_flags::DEFAULT,
-    );
-    overhead_clear(hit.map(|hit| hit.map(|h| h.pos.z)), water)
+    let low = [x, y, water + OVERHEAD_SURFACE_MARGIN];
+    let high = [x, y, water + hull_top + OVERHEAD_CLEARANCE_MARGIN];
+    let ray = |from: [f32; 3], to: [f32; 3]| {
+        crate::systems::ai::collision::raycast(
+            server,
+            instance_id,
+            from,
+            to,
+            crate::systems::ai::collision::query::mask::SOLID_TERRAIN,
+            crate::systems::ai::collision::query::ray_flags::DEFAULT,
+        )
+        .map(|hit| hit.map(|h| h.pos.z))
+    };
+    overhead_clear(ray(high, low), water) && overhead_clear(ray(low, high), water)
 }
 
 /// The `!deep` summon fallback: 5 m in front of the owner along its facing, at the water
@@ -2049,7 +2225,10 @@ pub(crate) fn fallback_summon_point(
 /// The authored hull bounds `physics::add_ship` gives the CryPhysics hull: the prefab collision
 /// proxies clipped to the hull envelope. `None` when the physics uses the mass box instead
 /// (CryPhysics ships off, or the client assets/model reference are unavailable).
-fn summon_hull_bounds(
+/// The unclipped model bbox (the union of the prefab collision proxies): the 1.2 client's
+/// summon box. The Rust hull collider clips the z range ([`summon_hull_bounds`]); the client's
+/// box keeps the whole model (masts included).
+fn summon_model_bounds(
     server: &GameServer,
     model_id: u32,
 ) -> Option<aaemu_physics::geometry::primitives::BoxPrim> {
@@ -2057,14 +2236,22 @@ fn summon_hull_bounds(
         return None;
     }
     let ai = &server.game_data.systems.ai.ai;
-    let model = ai.ship_model(model_id)?;
+    ai.ship_model(model_id)?;
     let reference = ai.ship_model_refs.get(&model_id)?;
     let files = crate::systems::ai::collision::files(server)?;
     let models = crate::systems::ai::collision::model_cache(server, &files);
-    let bounds =
-        crate::systems::ai::physics::cry::model_collision_bounds(&files, &models, reference)?;
+    crate::systems::ai::physics::cry::model_collision_bounds(&files, &models, reference)
+}
+
+/// The clipped hull collider bounds (the 1.2 client's hull envelope, masts trimmed).
+fn summon_hull_bounds(
+    server: &GameServer,
+    model_id: u32,
+) -> Option<aaemu_physics::geometry::primitives::BoxPrim> {
+    let bounds = summon_model_bounds(server, model_id)?;
+    let model = *server.game_data.systems.ai.ai.ship_model(model_id)?;
     Some(crate::systems::ai::physics::cry::clip_hull_bounds(
-        bounds, model,
+        bounds, &model,
     ))
 }
 
@@ -2315,12 +2502,35 @@ async fn create_for_owner_job(
         .vehicles
         .slave_template(slave_id)?
         .clone();
+    // The 1.2 client search needs the zone collision world. Without it (tests, physics off)
+    // the old C#-style placement stays in charge.
+    let collision = crate::systems::ai::collision::files(server).is_some();
     let position_override = if placement.is_some() {
-        Some(validated_summon_placement(
-            server, &world, owner, &template, placement, max_range,
-        )?)
-    } else {
+        let Some(transform) =
+            validated_summon_placement(server, &world, owner, &template, placement, max_range)
+        else {
+            // The placement was refused (error 583): the summon never happens, so do not leave
+            // the skill cooldown/GCD that the skill system started.
+            refund_summon_cooldown(server, owner, item.template_id);
+            return None;
+        };
+        if collision && !summon_placement_clear_1_2(server, &world, owner, &template, &transform) {
+            error(owner, error::SLAVE_SPAWN_SHIP_NEED_MORE_SPACE);
+            refund_summon_cooldown(server, owner, item.template_id);
+            return None;
+        }
+        Some(transform)
+    } else if position_override.is_some() || !collision {
         position_override
+    } else {
+        match summon_candidate_1_2(server, &world, owner, &template) {
+            Some(transform) => Some(transform),
+            None => {
+                error(owner, error::SLAVE_SPAWN_SHIP_NEED_MORE_SPACE);
+                refund_summon_cooldown(server, owner, item.template_id);
+                return None;
+            }
+        }
     };
     create_with_placement(
         server,
@@ -2546,9 +2756,15 @@ async fn create_with_placement(
                     .systems
                     .vehicles
                     .slave_template(template_id)?;
-                position_override = Some(validated_summon_placement(
+                let Some(transform) = validated_summon_placement(
                     server, world, owner, template, placement, max_range,
-                )?);
+                ) else {
+                    if let Some(item) = &item {
+                        refund_summon_cooldown(server, owner, item.template_id);
+                    }
+                    return None;
+                };
+                position_override = Some(transform);
             }
             let prior = owned_roots(server, owner_id);
             if prior
@@ -3061,12 +3277,7 @@ fn create_spawn_committed(
                 return None;
             };
             let min_depth = ship.mass_box_size_z - ship.mass_center_z + 1.0;
-            let mut offset_z = 0.0;
-            offset_z += (if ship.mass_center_z < 0.0 {
-                ship.mass_center_z / 2.0
-            } else {
-                0.0
-            }) - ship.keel_height;
+            let offset_z = summon_offset_z(&ship);
             // Enough water for the whole hull: the actual collision-world ground (terrain,
             // rocks, piers), not just the heightmap. A shallow spot under the 30 m hull lets
             // its collision box overlap the ground and CryPhysics ejects the summoned hull.
@@ -3075,19 +3286,15 @@ fn create_spawn_committed(
             // the ship's final (turned) yaw, including the asymmetric bow/stern extents and
             // the middle of the long sides. A downward ray from above the hull rejects spots
             // under a pier, bridge or deck (those are above the water and invisible to the
-            // ground probe, which starts only 2 m above the surface).
+            // ground probe, which starts only 2 m above the surface). The rays miss a solid
+            // they start inside (back faces are ignored), so the whole hull envelope from the
+            // keel to just above the hull top is also tested for overlap with static
+            // colliders: a thick deck or a quay that contains the hull centre is rejected even
+            // when every probe ray passes through it.
             let hull_bounds = summon_hull_bounds(server, template.model_id);
-            let footprint = hull_footprint(
-                hull_bounds.as_ref(),
-                ship.mass_box_size_x,
-                ship.mass_box_size_y,
-                1.0,
-            );
-            let hull_top = match &hull_bounds {
-                Some(b) => offset_z + b.center.z + b.size.z,
-                None => offset_z + ship.mass_center_z + ship.mass_box_size_z.max(0.01) * 0.5,
-            }
-            .max(0.5);
+            let envelope = HullEnvelope::from_hull(hull_bounds.as_ref(), &ship, offset_z);
+            let footprint = envelope.footprint;
+            let hull_top = envelope.hull_top();
             let spawn_z = spawn_pos.z;
             let spot_ok = |x: f32, y: f32| {
                 let surface = super::ship_physics::water_surface(server, world, [x, y, spawn_z]);
@@ -3113,10 +3320,13 @@ fn create_spawn_committed(
             };
             let mut in_front = 0.0f32;
             let mut deep = false;
+            let mut chosen = "initial";
             while in_front < 50.0 + ship.mass_box_size_x {
                 let mut check = spawn_pos;
                 add_distance_to_front(&mut check, in_front);
-                if spot_ok(check.x, check.y)
+                if hull_clear_at(
+                    server, world.id, check.x, check.y, check.z, final_yaw, envelope,
+                ) && spot_ok(check.x, check.y)
                     && hull_probe_points(check.x, check.y, final_yaw, footprint)
                         .into_iter()
                         .all(|(px, py)| spot_ok(px, py))
@@ -3129,6 +3339,7 @@ fn create_spawn_committed(
                         check.rot_y,
                         check.rot_z,
                     );
+                    chosen = "search";
                     deep = true;
                     break;
                 }
@@ -3151,7 +3362,11 @@ fn create_spawn_committed(
                         spawn_pos.rot_y,
                         spawn_pos.rot_z,
                     );
-                    if spot_ok(fallback.x, fallback.y) {
+                    if hull_clear_at(
+                        server, world.id, fallback.x, fallback.y, fallback.z, final_yaw, envelope,
+                    ) && spot_ok(fallback.x, fallback.y)
+                    {
+                        chosen = "fallback";
                         spawn_pos = fallback;
                     }
                 }
@@ -3178,8 +3393,17 @@ fn create_spawn_committed(
                     spawn_pos.y,
                     || f32::NAN,
                 );
+                let hull_clear = hull_clear_at(
+                    server,
+                    world.id,
+                    spawn_pos.x,
+                    spawn_pos.y,
+                    spawn_pos.z,
+                    final_yaw,
+                    envelope,
+                );
                 tracing::debug!(
-                    "Slave {} summon at ({:.1},{:.1},{:.1}) water {water:.1} yaw {final_yaw:.2} adrift {}: ground probe {probe:?}, terrain {terrain:.1}, hull top {hull_top:.1} (model {} mcz {:.2} boxz {:.2} keel {:.2} offset {:.2} bounds top {:?})",
+                    "Slave {} summon at ({:.1},{:.1},{:.1}) water {water:.1} yaw {final_yaw:.2} adrift {} path {chosen} hull_clear {hull_clear}: ground probe {probe:?}, terrain {terrain:.1}, hull top {hull_top:.1} (model {} mcz {:.2} boxz {:.2} keel {:.2} offset {:.2} bounds top {:?})",
                     template.id,
                     spawn_pos.x,
                     spawn_pos.y,
@@ -3192,6 +3416,34 @@ fn create_spawn_committed(
                     offset_z,
                     hull_bounds.as_ref().map(|b| b.center.z + b.size.z)
                 );
+                if !deep {
+                    for (px, py) in
+                        hull_probe_points(spawn_pos.x, spawn_pos.y, final_yaw, footprint)
+                    {
+                        let surface =
+                            super::ship_physics::water_surface(server, world, [px, py, spawn_z]);
+                        let probe = crate::systems::ai::collision::ground_height_probe(
+                            server, world.id, px, py, spawn_z, 2.0, 2048.0,
+                        );
+                        let terrain = crate::systems::ai::collision::terrain_height_or(
+                            server,
+                            world.id,
+                            px,
+                            py,
+                            || {
+                                crate::systems::npcs::heightmap::world_height(server, world, px, py)
+                                    .unwrap_or(0.0)
+                            },
+                        );
+                        let floor = summon_floor(probe, || terrain);
+                        tracing::debug!(
+                            "Slave {} summon point ({px:.1},{py:.1}) water {surface:.2} probe {probe:?} terrain {terrain:.2} floor {floor:.2} spot_ok {}",
+                            template.id,
+                            surface - floor > min_depth
+                                && overhead_clear_at(server, world.id, px, py, surface, hull_top)
+                        );
+                    }
+                }
             }
             spawn_pos.z += offset_z;
         } else {
@@ -4718,4 +4970,961 @@ mod summon_probe_tests {
             fallback_summon_point(100.0, 200.0, std::f32::consts::FRAC_PI_2, |_, _| water);
         assert!((x - 95.0).abs() < 1e-4 && (y - 200.0).abs() < 1e-4);
     }
+}
+
+#[cfg(test)]
+mod summon_hull_overlap_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use aaemu_physics::geometry::primitives::{BoxPrim, Primitive};
+    use aaemu_physics::math::{Quat, Vec3};
+    use aaemu_physics::world::World;
+
+    use crate::data::items::{ItemTemplate, TemplateKind};
+    use crate::models::container::slot_type;
+    use crate::models::item::Item;
+    use crate::models::transform::Transform;
+    use crate::systems::ai::collision::models::{ModelPart, ModelPhys};
+    use crate::systems::ai::collision::terrain::tests::Plane;
+    use crate::systems::ai::collision::world::{CellContent, StaticInstance};
+    use crate::systems::skills::data::SkillTemplate;
+    use crate::systems::vehicles::data::{slave_kind, SlaveTemplate};
+    use crate::test_support::{spawn_player, test_character, TestClient};
+
+    use super::{
+        create_for_owner, get_active_slave_by_owner_obj_id, hull_clear_at, model_box_clear_at,
+        overhead_clear_at, summon_candidate_1_2, summon_candidate_points, summon_offset_z,
+        summon_placement_clear_1_2, HullEnvelope, HullFootprint, ShipModel,
+    };
+
+    /// Waterline and seabed of the synthetic world; the seabed is deep enough for the Cutter
+    /// (min depth 19.5 m), so only the hull-envelope overlap can reject these spots.
+    const WATER: f32 = 100.0;
+    const GROUND: f32 = 60.0;
+
+    /// Cutter-sized envelope: keel 2 m below the waterline, hull top 2 m above it, plus the
+    /// 1 m overhead margin.
+    fn envelope() -> HullEnvelope {
+        HullEnvelope {
+            footprint: HullFootprint {
+                half_beam: 5.0,
+                length: (-15.0, 15.0),
+            },
+            bottom: -2.0,
+            top: 3.0,
+        }
+    }
+
+    fn static_box(half: Vec3, center: Vec3, vegetation: bool) -> StaticInstance {
+        let w = World::new();
+        let g = w
+            .register_primitive(&Primitive::Box(BoxPrim::aligned(Vec3::ZERO, half)))
+            .expect("box geometry");
+        StaticInstance {
+            model: Arc::new(ModelPhys {
+                path: "test/box.cgf".into(),
+                parts: vec![ModelPart { slot: 0, geom: g }],
+                blob_bytes: 0,
+            }),
+            pos: center,
+            q: Quat::IDENTITY,
+            scale: 1.0,
+            flags_default: if vegetation { 0x0401_8FFF } else { 0x18FFF },
+            density: 0.0,
+            ent_flags_or: 0x8000,
+            vegetation,
+        }
+    }
+
+    /// A test server whose instance-0 collision world has the terrain plane and the given
+    /// static boxes in cell (0, 0).
+    fn world_at(ground: f32, statics: &[(Vec3, Vec3, bool)]) -> Arc<crate::GameServer> {
+        world_at_with(crate::data::GameData::empty(), ground, statics)
+    }
+
+    fn world_at_with(
+        data: crate::data::GameData,
+        ground: f32,
+        statics: &[(Vec3, Vec3, bool)],
+    ) -> Arc<crate::GameServer> {
+        let s = Arc::new(crate::test_support::test_server_with(data));
+        s.set_self();
+        s.systems
+            .ai
+            .collision
+            .test_files
+            .set(Arc::new(HashMap::new()))
+            .unwrap();
+        s.systems
+            .ai
+            .collision
+            .test_terrain
+            .set(Arc::new(Plane {
+                a: ground,
+                b: 0.0,
+                c: 0.0,
+                n: 1024,
+            }))
+            .unwrap_or_else(|_| panic!("terrain"));
+        let pw = crate::systems::ai::collision::phys_world(&s, 0).expect("physics world");
+        let mut content = CellContent {
+            cell: (0, 0),
+            ..Default::default()
+        };
+        for (center, half, vegetation) in statics {
+            content
+                .instances
+                .push(static_box(*half, *center, *vegetation));
+        }
+        // PWI's entity-box lookup returns nothing until the entity pools exist (the first
+        // static creates them); keep a tiny far-away static so an empty test cell still has
+        // them. It is far outside every query below.
+        content.instances.push(static_box(
+            Vec3::splat(0.1),
+            Vec3::new(1000.0, 1000.0, 1000.0),
+            false,
+        ));
+        assert!(pw.lock().insert_cell(content), "cell (0, 0)");
+        s
+    }
+
+    fn world(statics: &[(Vec3, Vec3)]) -> Arc<crate::GameServer> {
+        let statics: Vec<_> = statics
+            .iter()
+            .map(|(center, half)| (*center, *half, false))
+            .collect();
+        world_at(GROUND, &statics)
+    }
+
+    fn clear(s: &crate::GameServer) -> bool {
+        hull_clear_at(s, 0, 500.0, 500.0, WATER, 0.0, envelope())
+    }
+
+    const RULE_MODEL_ID: u32 = 1000;
+    const RULE_SLAVE: u32 = 21;
+    const RULE_ITEM: u32 = 52_230;
+    const RULE_SKILL: u32 = 58_002;
+
+    /// A Cutter-shaped template and its ship model, for the 1.2 summon rule tests.
+    fn ship_template() -> SlaveTemplate {
+        SlaveTemplate {
+            id: RULE_SLAVE,
+            name: "Cutter".into(),
+            model_id: RULE_MODEL_ID,
+            spawn_x_offset: 30.0,
+            spawn_y_offset: 20.0,
+            slave_kind: slave_kind::BOAT,
+            ..Default::default()
+        }
+    }
+
+    fn with_ship_data(mut data: crate::data::GameData) -> crate::data::GameData {
+        let ship = ShipModel {
+            id: 6,
+            mass: 45_000.0,
+            mass_center_z: -4.0,
+            mass_box_size_x: 6.5,
+            mass_box_size_y: 30.0,
+            mass_box_size_z: 14.5,
+            keel_height: 0.2,
+            ..Default::default()
+        };
+        data.systems
+            .vehicles
+            .model_types
+            .insert(RULE_MODEL_ID, (6, "ShipModel".into()));
+        data.systems.vehicles.ship_models.insert(6, ship);
+        data.systems
+            .vehicles
+            .slave_templates
+            .insert(RULE_SLAVE, ship_template());
+        data
+    }
+
+    fn ship_server_at(ground: f32, statics: &[(Vec3, Vec3)]) -> Arc<crate::GameServer> {
+        let statics: Vec<_> = statics
+            .iter()
+            .map(|(center, half)| (*center, *half, false))
+            .collect();
+        world_at_with(
+            with_ship_data(crate::data::GameData::empty()),
+            ground,
+            &statics,
+        )
+    }
+
+    fn search_player(s: &crate::GameServer) -> (TestClient, crate::world::PlayerRef) {
+        let mut client = TestClient::new(s, 1, 1);
+        let p = spawn_player(s, &client, test_character(1, "P", 500.0, 500.0), 0x100);
+        client.conn.active_char = Some(p.clone());
+        (client, p)
+    }
+
+    /// A thick deck slab whose top is above the overhead ray start (water + hull top + 1 m =
+    /// 103). The upward ray finds its underside, the strict hull envelope overlaps it and the
+    /// player 1.2 model box does too.
+    #[tokio::test]
+    async fn a_thick_deck_the_downward_ray_starts_inside_is_rejected() {
+        let s = world(&[(Vec3::new(500.0, 500.0, 102.75), Vec3::new(20.0, 20.0, 1.25))]);
+        assert!(
+            !overhead_clear_at(&s, 0, 500.0, 500.0, WATER, 2.0),
+            "the upward ray finds the deck underside"
+        );
+        assert!(!clear(&s), "the hull envelope overlaps the deck slab");
+        let model = BoxPrim::aligned(Vec3::new(0.0, 0.0, 1.0), Vec3::new(5.0, 15.0, 2.0));
+        assert!(
+            !model_box_clear_at(&s, 0, 500.0, 500.0, WATER, 0.0, &model, 0.0),
+            "the 1.2 model box overlaps the deck slab"
+        );
+    }
+
+    /// A stone quay from the seabed to above the water that fully contains the hull box.
+    #[tokio::test]
+    async fn a_solid_quay_containing_the_hull_centre_is_rejected() {
+        let s = world(&[(Vec3::new(500.0, 500.0, 97.5), Vec3::new(30.0, 30.0, 7.5))]);
+        assert!(!clear(&s));
+    }
+
+    #[tokio::test]
+    async fn open_water_is_accepted() {
+        let s = world(&[]);
+        assert!(clear(&s));
+    }
+
+    /// A bridge whose underside is above the hull top + 1 m margin clearance.
+    #[tokio::test]
+    async fn a_bridge_above_the_margin_is_accepted() {
+        let s = world(&[(Vec3::new(500.0, 500.0, 105.0), Vec3::new(20.0, 20.0, 1.0))]);
+        assert!(clear(&s));
+    }
+
+    /// A harbour platform that is terrain (heightmap) above the water: the box includes the
+    /// heightfield, so the spot is rejected even though the depth ray starts below its top.
+    #[tokio::test]
+    async fn a_terrain_platform_above_the_water_is_rejected() {
+        let s = world_at(101.0, &[]);
+        assert!(!clear(&s));
+    }
+
+    /// A mooring post crossing the hull box edge is below [`HULL_OBSTACLE_MIN_SIZE`] and must
+    /// not reject the spot (the point-containment rays ignore it too).
+    #[tokio::test]
+    async fn a_small_post_at_the_envelope_edge_is_ignored() {
+        let s = world(&[(Vec3::new(505.0, 500.0, 100.0), Vec3::new(0.3, 0.3, 0.6))]);
+        let found = crate::systems::ai::collision::box_obstacles(
+            &s,
+            0,
+            [500.0, 500.0, 100.5],
+            [5.0, 15.0, 2.5],
+            0.0,
+            crate::systems::ai::collision::query::mask::STATIC_TERRAIN,
+        )
+        .unwrap();
+        assert!(!found.is_empty(), "the post intersects the envelope box");
+        assert!(clear(&s));
+    }
+
+    /// Vegetation is decorative for hull placement, whatever its size.
+    #[tokio::test]
+    async fn vegetation_inside_the_envelope_is_ignored() {
+        let s = world_at(
+            GROUND,
+            &[(
+                Vec3::new(505.0, 500.0, 100.0),
+                Vec3::new(3.0, 3.0, 3.0),
+                true,
+            )],
+        );
+        let found = crate::systems::ai::collision::box_obstacles(
+            &s,
+            0,
+            [500.0, 500.0, 100.5],
+            [5.0, 15.0, 2.5],
+            0.0,
+            crate::systems::ai::collision::query::mask::STATIC_TERRAIN,
+        )
+        .unwrap();
+        assert!(
+            found.iter().any(|(owner, _)| matches!(
+                owner,
+                crate::systems::ai::collision::world::Owner::Vegetation { .. }
+            )),
+            "the vegetation entity intersects the envelope box"
+        );
+        assert!(clear(&s));
+    }
+
+    /// Yaw 90: the off-centre footprint must put the box mid 5 m along -X with the length
+    /// along X and the beam along Y. A pier near the stern only overlaps the correctly placed
+    /// box; a pier beyond the bow must not overlap (it would if the mid offset were negated).
+    #[tokio::test]
+    async fn a_yaw_90_off_centre_pier_is_rejected_with_the_ship_length_axis() {
+        let envelope = HullEnvelope {
+            footprint: HullFootprint {
+                half_beam: 3.0,
+                length: (-5.0, 15.0),
+            },
+            bottom: -2.0,
+            top: 3.0,
+        };
+        let yaw = std::f32::consts::FRAC_PI_2;
+        let stern_pier = world(&[(Vec3::new(488.0, 502.0, 100.0), Vec3::new(1.0, 2.0, 2.0))]);
+        assert!(
+            !hull_clear_at(&stern_pier, 0, 500.0, 500.0, WATER, yaw, envelope),
+            "the stern-side pier is inside the yaw-90 envelope"
+        );
+        let bow_pier = world(&[(Vec3::new(512.0, 502.0, 100.0), Vec3::new(1.0, 2.0, 2.0))]);
+        assert!(
+            hull_clear_at(&bow_pier, 0, 500.0, 500.0, WATER, yaw, envelope),
+            "the pier beyond the bow is outside the yaw-90 envelope"
+        );
+    }
+
+    /// The 1.2 player box is the model bbox: no +1 m margin and the model top (masts), not the
+    /// clipped hull top. A bridge 1.5 m above the old hull box is inside the model box.
+    #[tokio::test]
+    async fn the_model_box_has_no_overhead_margin() {
+        let s = world(&[(Vec3::new(500.0, 500.0, 104.5), Vec3::new(20.0, 20.0, 0.5))]);
+        let model = BoxPrim::aligned(Vec3::new(0.0, 0.0, 3.0), Vec3::new(5.0, 15.0, 2.0));
+        assert!(
+            !model_box_clear_at(&s, 0, 500.0, 500.0, WATER, 0.0, &model, 0.0),
+            "the bridge is inside the model bbox top"
+        );
+        assert!(
+            hull_clear_at(&s, 0, 500.0, 500.0, WATER, 0.0, envelope()),
+            "the old hull box (+1 m margin) ends below the bridge"
+        );
+    }
+
+    /// The model box includes the terrain (mask 0x10f in 1.2): a seabed below the water but
+    /// inside the model box rejects the spot even without the old point sampling.
+    #[tokio::test]
+    async fn the_model_box_terrain_part_rejects_a_shallow_seabed() {
+        let s = world_at(95.0, &[]);
+        let into_seabed = BoxPrim::aligned(Vec3::new(0.0, 0.0, -2.0), Vec3::new(5.0, 15.0, 5.0));
+        assert!(!model_box_clear_at(
+            &s,
+            0,
+            500.0,
+            500.0,
+            WATER,
+            0.0,
+            &into_seabed,
+            0.0
+        ));
+        let above_seabed = BoxPrim::aligned(Vec3::new(0.0, 0.0, 10.0), Vec3::new(5.0, 15.0, 2.0));
+        assert!(model_box_clear_at(
+            &s,
+            0,
+            500.0,
+            500.0,
+            WATER,
+            0.0,
+            &above_seabed,
+            0.0
+        ));
+    }
+
+    // ---- the 1.2 client summon rule -----------------------------------------------------
+
+    #[test]
+    fn the_1_2_candidates_are_40_forward_steps_with_three_lateral_offsets() {
+        let points = summon_candidate_points(0.0, 0.0, 0.0, 30.0, 20.0);
+        assert_eq!(points.len(), 120);
+        assert_eq!(
+            &points[..6],
+            &[
+                (0.0, 30.0),
+                (20.0, 30.0),
+                (-20.0, 30.0),
+                (0.0, 31.0),
+                (20.0, 31.0),
+                (-20.0, 31.0),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_1_2_search_takes_the_forward_offset_candidate() {
+        let s = ship_server_at(GROUND, &[]);
+        let (_client, p) = search_player(&s);
+        let world = s.world.world(0).unwrap();
+        let t = summon_candidate_1_2(&s, &world, &p, &ship_template()).expect("candidate");
+        assert!(
+            (t.x - 500.0).abs() < 1e-4 && (t.y - 530.0).abs() < 1e-4,
+            "{t:?}"
+        );
+        assert!(
+            (t.z - (WATER
+                + summon_offset_z(&ShipModel {
+                    mass_center_z: -4.0,
+                    keel_height: 0.2,
+                    ..Default::default()
+                })))
+            .abs()
+                < 1e-4
+        );
+        assert!((t.rot_z - std::f32::consts::FRAC_PI_2).abs() < 1e-4);
+    }
+
+    #[tokio::test]
+    async fn the_1_2_search_rejects_land_above_the_water() {
+        let s = ship_server_at(101.0, &[]);
+        let (_client, p) = search_player(&s);
+        let world = s.world.world(0).unwrap();
+        assert!(summon_candidate_1_2(&s, &world, &p, &ship_template()).is_none());
+    }
+
+    #[tokio::test]
+    async fn the_1_2_search_rejects_a_blocked_line_of_sight() {
+        let s = ship_server_at(
+            GROUND,
+            &[(Vec3::new(500.0, 510.0, 100.0), Vec3::new(100.0, 5.0, 10.0))],
+        );
+        let (_client, p) = search_player(&s);
+        let world = s.world.world(0).unwrap();
+        assert!(summon_candidate_1_2(&s, &world, &p, &ship_template()).is_none());
+    }
+
+    #[tokio::test]
+    async fn the_1_2_search_skips_a_blocked_box_and_takes_the_lateral_candidate() {
+        let s = ship_server_at(
+            GROUND,
+            &[(Vec3::new(500.0, 530.0, 100.0), Vec3::new(1.5, 1.5, 5.0))],
+        );
+        let (_client, p) = search_player(&s);
+        let world = s.world.world(0).unwrap();
+        let t = summon_candidate_1_2(&s, &world, &p, &ship_template()).expect("candidate");
+        assert!(
+            (t.x - 520.0).abs() < 1e-4 && (t.y - 530.0).abs() < 1e-4,
+            "{t:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_1_2_search_caps_the_candidate_distance_at_80_m() {
+        let s = ship_server_at(GROUND, &[]);
+        let (_client, p) = search_player(&s);
+        let world = s.world.world(0).unwrap();
+        let mut template = ship_template();
+        template.spawn_x_offset = 81.0;
+        template.spawn_y_offset = 0.0;
+        assert!(summon_candidate_1_2(&s, &world, &p, &template).is_none());
+    }
+
+    #[tokio::test]
+    async fn the_1_2_land_rule_limits_the_terrain_step_to_10_m() {
+        let mut template = ship_template();
+        template.slave_kind = slave_kind::MACHINE;
+        template.model_id = 0;
+        template.spawn_x_offset = 5.0;
+        template.spawn_y_offset = 5.0;
+        let near = ship_server_at(109.0, &[]);
+        let (_client, p) = search_player(&near);
+        let world = near.world.world(0).unwrap();
+        let t = summon_candidate_1_2(&near, &world, &p, &template).expect("candidate");
+        assert!((t.z - 109.0).abs() < 1e-4, "{t:?}");
+        let far = ship_server_at(111.0, &[]);
+        let (_client, p) = search_player(&far);
+        let world = far.world.world(0).unwrap();
+        assert!(summon_candidate_1_2(&far, &world, &p, &template).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_provided_placement_is_validated_with_the_same_1_2_checks() {
+        let s = ship_server_at(GROUND, &[]);
+        let (_client, p) = search_player(&s);
+        let world = s.world.world(0).unwrap();
+        let t = Transform {
+            x: 500.0,
+            y: 530.0,
+            z: WATER,
+            ..Default::default()
+        };
+        assert!(summon_placement_clear_1_2(
+            &s,
+            &world,
+            &p,
+            &ship_template(),
+            &t
+        ));
+        let platform = ship_server_at(101.0, &[]);
+        let (_client, p) = search_player(&platform);
+        let world = platform.world.world(0).unwrap();
+        assert!(!summon_placement_clear_1_2(
+            &platform,
+            &world,
+            &p,
+            &ship_template(),
+            &t
+        ));
+    }
+
+    #[tokio::test]
+    async fn no_candidate_sends_error_100_keeps_the_item_and_refunds_the_cooldown() {
+        let mut data = with_ship_data(crate::data::GameData::empty());
+        data.items.templates.insert(
+            RULE_ITEM,
+            ItemTemplate {
+                kind: TemplateKind::SummonSlave {
+                    slave_id: RULE_SLAVE,
+                },
+                use_skill_id: RULE_SKILL,
+                ..ItemTemplate::plain(RULE_ITEM, 1)
+            },
+        );
+        data.systems.skills.add_skill(SkillTemplate {
+            id: RULE_SKILL,
+            ..Default::default()
+        });
+        let s = world_at_with(data, 101.0, &[]);
+        let (mut client, p) = search_player(&s);
+        client.conn.active_char = Some(p.clone());
+        let bag = p
+            .data()
+            .inventory
+            .get(slot_type::INVENTORY)
+            .unwrap()
+            .clone();
+        let template = s.game_data.items.template(RULE_ITEM).unwrap().clone();
+        let mut item = Item::create(0x9001, &template, 1, 0, 1, &s.game_data.items, 0);
+        item.owner_id = u64::from(p.character_id);
+        item.slot_type = slot_type::INVENTORY;
+        item.slot = 0;
+        bag.lock().unwrap().items.push(item);
+        s.items.add_container(bag);
+        p.data().unit.cooldowns.add_cooldown(RULE_SKILL, 10_000, 0);
+        p.data().unit.global_cooldown_ms = 10_000;
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            create_for_owner(&s, &p, 0x9001, RULE_ITEM, false, None, None, 0.0),
+        )
+        .await
+        .expect("summon job");
+        assert!(result.is_none());
+        assert!(get_active_slave_by_owner_obj_id(&s.world.world(0).unwrap(), p.obj_id).is_none());
+        assert!(s.items.item_by_id(0x9001).is_some());
+        let codes: Vec<i16> = client
+            .drain()
+            .iter()
+            .filter(|f| f.0 == crate::opcodes::sc::SCErrorMsgPacket)
+            .map(|f| i16::from_le_bytes([f.1[0], f.1[1]]))
+            .collect();
+        assert!(codes.contains(&100), "{codes:?}");
+        assert!(!p.data().unit.cooldowns.cooldowns.contains_key(&RULE_SKILL));
+        assert_eq!(p.data().unit.global_cooldown_ms, 0);
+    }
+
+    /// A SummonPos placement outside the data range fails with error 583 before any spawn; the
+    /// skill cooldown/GCD must be refunded like the no-candidate refusal.
+    #[tokio::test]
+    async fn an_invalid_placement_refunds_the_cooldown() {
+        let mut data = with_ship_data(crate::data::GameData::empty());
+        data.items.templates.insert(
+            RULE_ITEM,
+            ItemTemplate {
+                kind: TemplateKind::SummonSlave {
+                    slave_id: RULE_SLAVE,
+                },
+                use_skill_id: RULE_SKILL,
+                ..ItemTemplate::plain(RULE_ITEM, 1)
+            },
+        );
+        data.systems.skills.add_skill(SkillTemplate {
+            id: RULE_SKILL,
+            ..Default::default()
+        });
+        data.systems
+            .vehicles
+            .slave_templates
+            .get_mut(&RULE_SLAVE)
+            .unwrap()
+            .spawn_valid_area_range = 10;
+        let s = world_at_with(data, GROUND, &[]);
+        let (mut client, p) = search_player(&s);
+        let bag = p
+            .data()
+            .inventory
+            .get(slot_type::INVENTORY)
+            .unwrap()
+            .clone();
+        let template = s.game_data.items.template(RULE_ITEM).unwrap().clone();
+        let mut item = Item::create(0x9002, &template, 1, 0, 1, &s.game_data.items, 0);
+        item.owner_id = u64::from(p.character_id);
+        item.slot_type = slot_type::INVENTORY;
+        item.slot = 0;
+        bag.lock().unwrap().items.push(item);
+        s.items.add_container(bag);
+        p.data().unit.cooldowns.add_cooldown(RULE_SKILL, 10_000, 0);
+        p.data().unit.global_cooldown_ms = 10_000;
+        let placement = crate::systems::skills::ext::SummonPlacement {
+            x: 530.0,
+            y: 500.0,
+            z: WATER,
+            yaw: 0.0,
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            create_for_owner(&s, &p, 0x9002, RULE_ITEM, false, None, Some(placement), 0.0),
+        )
+        .await
+        .expect("summon job");
+        assert!(result.is_none());
+        assert!(s.items.item_by_id(0x9002).is_some());
+        assert!(get_active_slave_by_owner_obj_id(&s.world.world(0).unwrap(), p.obj_id).is_none());
+        let codes: Vec<i16> = client
+            .drain()
+            .iter()
+            .filter(|f| f.0 == crate::opcodes::sc::SCErrorMsgPacket)
+            .map(|f| i16::from_le_bytes([f.1[0], f.1[1]]))
+            .collect();
+        assert!(codes.contains(&583), "{codes:?}");
+        assert!(!p.data().unit.cooldowns.cooldowns.contains_key(&RULE_SKILL));
+        assert_eq!(p.data().unit.global_cooldown_ms, 0);
+    }
+
+    /// GM `/slave spawn` bypasses the client-side rule: it keeps the C# in-front placement and
+    /// still spawns when the 1.2 search would refuse.
+    #[tokio::test]
+    async fn gm_spawn_bypasses_the_1_2_search() {
+        let s = ship_server_at(101.0, &[]);
+        let world = s.world.world(0).unwrap();
+        s.systems.npcs.spawns.get_or_create(&world);
+        let (_client, p) = search_player(&s);
+        // `/slave spawn` passes no item and no placement, so the item search is skipped and the
+        // C# in-front placement in `create_spawn_committed` is used (the async GM wrapper only
+        // adds the DB/hull bookkeeping).
+        let slave = super::create_core(
+            &s,
+            &world,
+            Some(&p),
+            None,
+            RULE_SLAVE,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("GM spawn must bypass the 1.2 search");
+        let t = slave.data().unit.transform;
+        assert_eq!(slave.data().summoner_obj_id, p.obj_id);
+        assert!(
+            (t.x - 500.0).abs() < 1e-4 && (t.y - 520.0).abs() < 1e-4,
+            "GM keeps the in-front placement: {t:?}"
+        );
+    }
+}
+
+/// The hull's vertical offset from the waterline at creation:
+/// `(mass_center_z < 0 ? mass_center_z / 2 : 0) - keel_height`.
+fn summon_offset_z(ship: &ShipModel) -> f32 {
+    (if ship.mass_center_z < 0.0 {
+        ship.mass_center_z / 2.0
+    } else {
+        0.0
+    }) - ship.keel_height
+}
+
+/// The 1.2 client's summon candidates in order: 40 forward steps
+/// (`spawn_x_offset + i`, i = 0..39) with the lateral offsets `{0, +spawn_y_offset,
+/// -spawn_y_offset}` (120 points). `yaw` is the player's facing.
+pub(crate) fn summon_candidate_points(
+    x: f32,
+    y: f32,
+    yaw: f32,
+    spawn_x_offset: f32,
+    spawn_y_offset: f32,
+) -> Vec<(f32, f32)> {
+    let (fx, fy) = (-yaw.sin(), yaw.cos());
+    let (rx, ry) = (yaw.cos(), yaw.sin());
+    let mut out = Vec::with_capacity(120);
+    for i in 0..40 {
+        let forward = spawn_x_offset + i as f32;
+        for lateral in [0.0, spawn_y_offset, -spawn_y_offset] {
+            out.push((
+                x + fx * forward + rx * lateral,
+                y + fy * forward + ry * lateral,
+            ));
+        }
+    }
+    out
+}
+
+/// The collision terrain height at (x, y), the heightmap when the service has no terrain.
+fn summon_terrain(server: &GameServer, world: &WorldInstance, x: f32, y: f32) -> f32 {
+    crate::systems::ai::collision::terrain_height_or(server, world.id, x, y, || {
+        crate::systems::npcs::heightmap::world_height(server, world, x, y).unwrap_or(0.0)
+    })
+}
+
+/// The 1.2 line-of-sight rule: a ray from the player's eyes to the candidate hits nothing
+/// (static + terrain, rays 0x8F). No collision service counts as clear.
+fn summon_los_clear(server: &GameServer, instance_id: u32, from: [f32; 3], to: [f32; 3]) -> bool {
+    !matches!(
+        crate::systems::ai::collision::raycast(
+            server,
+            instance_id,
+            from,
+            to,
+            crate::systems::ai::collision::query::mask::SOLID_TERRAIN,
+            crate::systems::ai::collision::query::ray_flags::DEFAULT,
+        ),
+        Some(Some(_))
+    )
+}
+
+/// The ship model, its waterline z offset and the hull envelope of a boat template.
+fn summon_ship_hull(
+    server: &GameServer,
+    template: &SlaveTemplate,
+) -> Option<(ShipModel, f32, HullEnvelope)> {
+    if !template.is_a_boat() {
+        return None;
+    }
+    let ship = server
+        .game_data
+        .systems
+        .vehicles
+        .ship_model(template.model_id)
+        .copied()?;
+    let offset_z = summon_offset_z(&ship);
+    let bounds = summon_hull_bounds(server, template.model_id);
+    let envelope = HullEnvelope::from_hull(bounds.as_ref(), &ship, offset_z);
+    Some((ship, offset_z, envelope))
+}
+
+/// The 1.2 model box: the unclipped model bbox when the client assets provide it, else the
+/// clipped hull bounds (the only bounds available without the model reference; the client
+/// model box is then approximated by the hull collider box).
+fn summon_model_box(
+    server: &GameServer,
+    template: &SlaveTemplate,
+) -> Option<aaemu_physics::geometry::primitives::BoxPrim> {
+    summon_model_bounds(server, template.model_id)
+        .or_else(|| summon_hull_bounds(server, template.model_id))
+}
+
+/// The 1.2 player-summon model-box check at (`x`, `y`, `hull_z`) and the final yaw: the
+/// oriented model bbox against statics (small/vegetation filtered) and the collision terrain
+/// heightfield. No size margin, terrain point sampling or containment rays; those remain in
+/// [`hull_clear_at`] for the GM/spawner path.
+#[allow(clippy::too_many_arguments)]
+fn model_box_clear_at(
+    server: &GameServer,
+    instance_id: u32,
+    x: f32,
+    y: f32,
+    hull_z: f32,
+    yaw: f32,
+    bounds: &aaemu_physics::geometry::primitives::BoxPrim,
+    offset_z: f32,
+) -> bool {
+    let (fx, fy) = (-yaw.sin(), yaw.cos());
+    let (rx, ry) = (yaw.cos(), yaw.sin());
+    let center = [
+        x + rx * bounds.center.x + fx * bounds.center.y,
+        y + ry * bounds.center.x + fy * bounds.center.y,
+        hull_z + offset_z + bounds.center.z,
+    ];
+    let half = [bounds.size.x, bounds.size.y, bounds.size.z];
+    if let Some(list) = crate::systems::ai::collision::box_obstacles(
+        server,
+        instance_id,
+        center,
+        half,
+        yaw,
+        crate::systems::ai::collision::query::mask::STATIC,
+    ) {
+        if list
+            .iter()
+            .any(|(owner, entity_bounds)| hull_obstacle(*owner, *entity_bounds))
+        {
+            return false;
+        }
+    }
+    !matches!(
+        crate::systems::ai::collision::box_overlaps_terrain(server, instance_id, center, half, yaw,),
+        Some(true)
+    )
+}
+
+/// The 1.2 client summon search (`FUN_39347fb0`): the first candidate that passes all four
+/// checks wins. The candidate z is the water surface for ships (terrain must not be above it)
+/// and the terrain for land slaves (at most 10 m above the player). The model box is the
+/// unclipped model bbox clamped to the candidate (statics + terrain) rotated by the player yaw
+/// plus 90 degrees; the distance cap is 80 m. Returns the final spawn transform, or `None` when
+/// none of the 120 candidates passes. Debug logs the per-check rejection counts and the old
+/// `hull_clear_at` box count for comparison.
+pub(crate) fn summon_candidate_1_2(
+    server: &GameServer,
+    world: &WorldInstance,
+    owner: &PlayerRef,
+    template: &SlaveTemplate,
+) -> Option<Transform> {
+    let me = world.world_pos_rot(&WorldObject::from(owner));
+    let final_yaw = me.rot_z + std::f32::consts::PI / 2.0;
+    let is_boat = template.is_a_boat();
+    let ship_hull = summon_ship_hull(server, template);
+    let offset_z = ship_hull.as_ref().map_or(0.0, |(_, z, _)| *z);
+    let envelope = ship_hull.as_ref().map(|(_, _, e)| *e);
+    let model_box = summon_model_box(server, template);
+    let debug = tracing::enabled!(tracing::Level::DEBUG);
+    let (mut terrain_rej, mut distance_rej, mut los_rej, mut old_box_rej, mut new_box_rej) =
+        (0u32, 0u32, 0u32, 0u32, 0u32);
+    let mut chosen = None;
+    let max_d2 = 80.0 * 80.0;
+    for (x, y) in summon_candidate_points(
+        me.x,
+        me.y,
+        me.rot_z,
+        template.spawn_x_offset,
+        template.spawn_y_offset,
+    ) {
+        let terrain = summon_terrain(server, world, x, y);
+        let water = if is_boat {
+            Some(super::ship_physics::water_surface(
+                server,
+                world,
+                [x, y, me.z],
+            ))
+        } else {
+            None
+        };
+        let z = water.unwrap_or(terrain);
+        let terrain_ok = water.map_or(terrain - me.z <= 10.0, |water| terrain <= water);
+        if !terrain_ok {
+            terrain_rej += 1;
+        }
+        let (dx, dy, dz) = (x - me.x, y - me.y, z - me.z);
+        let distance_ok = dx * dx + dy * dy + dz * dz <= max_d2;
+        if !distance_ok {
+            distance_rej += 1;
+        }
+        // Ships are seen against the water surface; land candidates at eye height (the ground
+        // ray would otherwise end on the target terrain itself).
+        let los_to = if is_boat { [x, y, z] } else { [x, y, me.z] };
+        let los_ok = summon_los_clear(server, world.id, [me.x, me.y, me.z + 1.0], los_to);
+        if !los_ok {
+            los_rej += 1;
+        }
+        let prior_ok = terrain_ok && distance_ok && los_ok;
+        let new_box_ok = if prior_ok || debug {
+            match &model_box {
+                Some(bounds) => {
+                    model_box_clear_at(server, world.id, x, y, z, final_yaw, bounds, offset_z)
+                }
+                None => true,
+            }
+        } else {
+            true
+        };
+        if (prior_ok || debug) && !new_box_ok {
+            new_box_rej += 1;
+        }
+        if debug {
+            if let Some(envelope) = envelope {
+                if !hull_clear_at(server, world.id, x, y, z, final_yaw, envelope) {
+                    old_box_rej += 1;
+                }
+            }
+        }
+        if chosen.is_none() && prior_ok && new_box_ok {
+            let mut transform = Transform {
+                instance_id: world.id,
+                zone_id: owner.data().unit.transform.zone_id,
+                ..Default::default()
+            };
+            transform.set_position(x, y, z + offset_z, 0.0, 0.0, final_yaw);
+            chosen = Some(transform);
+            if !debug {
+                break;
+            }
+        }
+    }
+    if debug {
+        tracing::debug!(
+            "Slave {} summon search: terrain {terrain_rej} dist {distance_rej} los {los_rej} old_box {old_box_rej} new_box {new_box_rej} of 120 chosen {}",
+            template.id,
+            chosen.is_some()
+        );
+    }
+    chosen
+}
+
+/// The same 1.2 checks for a client-provided `SummonPos` placement (the client searched before
+/// sending). `transform.z` is the waterline for ships / the ground for land, as produced by
+/// [`validated_summon_placement`].
+pub(super) fn summon_placement_clear_1_2(
+    server: &GameServer,
+    world: &WorldInstance,
+    owner: &PlayerRef,
+    template: &SlaveTemplate,
+    transform: &Transform,
+) -> bool {
+    let me = world.world_pos_rot(&WorldObject::from(owner));
+    let final_yaw = me.rot_z + std::f32::consts::PI / 2.0;
+    let is_boat = template.is_a_boat();
+    let (dx, dy, dz) = (transform.x - me.x, transform.y - me.y, transform.z - me.z);
+    if dx * dx + dy * dy + dz * dz > 80.0 * 80.0 {
+        return false;
+    }
+    let terrain = summon_terrain(server, world, transform.x, transform.y);
+    if is_boat {
+        if terrain > transform.z {
+            return false;
+        }
+    } else if terrain - me.z > 10.0 {
+        return false;
+    }
+    let los_to = if is_boat {
+        [transform.x, transform.y, transform.z]
+    } else {
+        [transform.x, transform.y, me.z]
+    };
+    if !summon_los_clear(server, world.id, [me.x, me.y, me.z + 1.0], los_to) {
+        return false;
+    }
+    if let Some(bounds) = summon_model_box(server, template) {
+        if !model_box_clear_at(
+            server,
+            world.id,
+            transform.x,
+            transform.y,
+            transform.z,
+            final_yaw,
+            &bounds,
+            summon_ship_hull(server, template).map_or(0.0, |(_, z, _)| z),
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The 1.2 client refuses before sending, so a server-side refusal must not leave the skill's
+/// cooldown or the GCD that the skill system started before the effect ran.
+fn refund_summon_cooldown(server: &GameServer, owner: &PlayerRef, item_template_id: u32) {
+    let Some(skill_id) = server
+        .game_data
+        .items
+        .template(item_template_id)
+        .map(|t| t.use_skill_id)
+        .filter(|id| *id != 0)
+    else {
+        return;
+    };
+    let tag = server
+        .game_data
+        .systems
+        .skills
+        .skill(skill_id)
+        .map_or(0, |s| s.cooldown_tag_id.max(0) as u32);
+    let mut c = owner.data();
+    c.unit.cooldowns.remove_cooldown(skill_id);
+    if tag != 0 {
+        c.unit.cooldowns.tag_cooldowns.remove(&tag);
+    }
+    c.unit.global_cooldown_ms = 0;
 }

@@ -125,6 +125,9 @@ pub struct AppConfig {
     /// `Physics` (`systems::ai::collision::config`, Rust only: the CryPhysics collision world).
     #[serde(rename = "physics")]
     pub physics: crate::systems::ai::collision::config::PhysicsConfig,
+    /// `Bots` (Rust only: the player-bots crate, linked only by `aaemu-game-bots`).
+    #[serde(rename = "bots")]
+    pub bots: BotsConfig,
     /// `FileManager.AppPath`: the directory holding `Config.json` and `Data/compact.sqlite3`.
     #[serde(skip)]
     pub app_path: PathBuf,
@@ -165,7 +168,36 @@ impl Default for AppConfig {
             dungeons: Default::default(),
             heightmaps_enable: false,
             physics: Default::default(),
+            bots: BotsConfig::default(),
             app_path: PathBuf::from("."),
+        }
+    }
+}
+
+/// `Bots`: the in-server player bots (`aaemu-bots`, Rust only, private bots branch).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct BotsConfig {
+    /// Start the bots host and register the operator `/bot` commands.
+    #[serde(rename = "enabled", deserialize_with = "lenient")]
+    pub enabled: bool,
+    /// First of the dedicated bot account ids: bot `n` uses `AccountBase + n`, one character
+    /// each, so no two bots share account state (labor, account attributes) or log in on one
+    /// account. The game auto-creates the `accounts` rows (`get_account_details`); the login
+    /// database does not need them because bots never authenticate through the login server.
+    #[serde(rename = "accountbase", deserialize_with = "lenient")]
+    pub account_base: u32,
+    /// Number of bot accounts (and the upper bound for `/bot add`).
+    #[serde(rename = "maxbots", deserialize_with = "lenient")]
+    pub max_bots: usize,
+}
+
+impl Default for BotsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            account_base: 1_000_000,
+            max_bots: 10,
         }
     }
 }
@@ -610,7 +642,7 @@ pub const USER_SECRETS_ID: &str = "426ad5c3-9a72-44e9-88f5-4b5940b98c28";
 
 /// The top-level `AppConfiguration` members (environment variables are only applied below
 /// these keys; anything else could never bind).
-const TOP_LEVEL_KEYS: [&str; 30] = [
+const TOP_LEVEL_KEYS: [&str; 31] = [
     "physics",
     "id",
     "additionalesid",
@@ -641,6 +673,7 @@ const TOP_LEVEL_KEYS: [&str; 30] = [
     "defaultlanguage",
     "debuginfo",
     "debuginfolevel",
+    "bots",
 ];
 
 impl AppConfig {
@@ -1353,6 +1386,21 @@ mod tests {
         assert!(!cfg.events.halloween.enabled);
         assert_eq!(cfg.events.halloween.start, "2026-10-14T00:00:00Z");
         assert_eq!(cfg.events.halloween.end, "2026-11-01T00:00:00Z");
+    }
+
+    #[test]
+    fn bots_section_defaults_off_and_binds_leniently() {
+        let cfg = AppConfig::from_value(json!({})).unwrap();
+        assert!(!cfg.bots.enabled);
+        assert_eq!(cfg.bots.account_base, 1_000_000);
+        assert_eq!(cfg.bots.max_bots, 10);
+        let cfg = AppConfig::from_value(json!({
+            "Bots": { "Enabled": "True", "AccountBase": "1000042", "MaxBots": "3" }
+        }))
+        .unwrap();
+        assert!(cfg.bots.enabled);
+        assert_eq!(cfg.bots.account_base, 1_000_042);
+        assert_eq!(cfg.bots.max_bots, 3);
     }
 
     #[test]

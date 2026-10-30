@@ -42,7 +42,7 @@ pub mod vehicles;
 mod integration_tests;
 
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use rusqlite::Connection;
 use sqlx::MySql;
@@ -128,6 +128,25 @@ pub fn register_packets(reg: &mut PacketRegistry) {
     vehicles::register(reg);
     services::register(reg);
     ai::register(reg);
+}
+
+/// Work a binary that links the game library adds to the stock startup (the bots build installs
+/// its host and `/bot` commands). Called once from `main.rs` after `SaveManager::start`.
+pub type StartupExtension = dyn Fn(&Arc<GameServer>) -> anyhow::Result<()> + Send + Sync;
+
+static STARTUP_EXTENSION: OnceLock<Box<StartupExtension>> = OnceLock::new();
+
+/// Installs the process-wide startup extension (`false` = one is already installed).
+pub fn set_startup_extension(extension: Box<StartupExtension>) -> bool {
+    STARTUP_EXTENSION.set(extension).is_ok()
+}
+
+/// Runs the installed extension; a no-op for the stock `aaemu-game` binary.
+pub fn run_startup_extensions(server: &Arc<GameServer>) -> anyhow::Result<()> {
+    match STARTUP_EXTENSION.get() {
+        Some(extension) => extension(server),
+        None => Ok(()),
+    }
 }
 
 /// Starts every subsystem after the phase-1/2 managers are up (`ManagerOrchestrator` order:

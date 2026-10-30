@@ -1,0 +1,28 @@
+[package]
+name = "aaemu-bots"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "In-server player bots for AAEmu (private bots branch)"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "aaemu-game-bots"
+path = "src/bin/aaemu-game-bots.rs"
+
+[dependencies]
+aaemu-commons.workspace = true
+aaemu-game = { path = "../aaemu-game" }
+anyhow.workspace = true
+chrono.workspace = true
+futures.workspace = true
+rusqlite.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# `test_support`: GameServer without MySQL, TestClient, character fixtures for the flow tests.
+aaemu-game = { path = "../aaemu-game", features = ["test-support"] }
