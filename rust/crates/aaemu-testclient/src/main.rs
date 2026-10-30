@@ -235,7 +235,8 @@ async fn main() -> anyhow::Result<()> {
             let cfg = bot_config(&args)?;
             let out = args.get("out").map(PathBuf::from);
             let o = run_one(kind, &cfg, out.as_deref(), "run").await?;
-            // Machine-readable result for soak runners: written even when the run fails.
+            // Machine-readable result for soak runners, written whenever the scenario ran,
+            // including scenario failures.
             if let Some(p) = args.get("outcome-json") {
                 std::fs::write(p, serde_json::to_vec_pretty(&o)?)?;
             }

@@ -30,6 +30,7 @@ import os
 import random
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -197,15 +198,29 @@ class Lane:
         with log_path.open("ab") as out:
             out.write(f"\n== {datetime.now().isoformat(timespec='seconds')} live-stack.sh {action}\n".encode())
             out.flush()
-            return subprocess.run(
+            kwargs = {}
+            if os.name == "nt":
+                # A Ctrl+Break aimed at the runner must not kill the servers behind its back;
+                # the finally block stops this lane's stack explicitly.
+                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            proc = subprocess.Popen(
                 [self.bash, str(REPO / "Scripts/live-stack.sh"), action],
                 cwd=str(REPO),
                 env=env,
                 stdout=out,
                 stderr=subprocess.STDOUT,
-                check=False,
-                timeout=1800,
-            ).returncode
+                **kwargs,
+            )
+            try:
+                return proc.wait(timeout=1800)
+            except subprocess.TimeoutExpired:
+                kill_tree(proc.pid)
+                proc.wait(timeout=30)
+                log(f"[setup] live-stack.sh {action} timed out after 1800s; see {log_path}")
+                return 124
+            except BaseException:
+                kill_tree(proc.pid)
+                raise
 
     def mysql_cmd(self, sql: str, database: str | None = None) -> str:
         cmd = [
@@ -257,6 +272,90 @@ def strip_error_prefix(text: str) -> str:
     return re.sub(r"^Error:\s*", "", text.strip())
 
 
+def classify_attempt(
+    rc: int | None,
+    timed_out: bool,
+    outcome: dict | None,
+    stdout: str,
+    stderr: str,
+    timeout_seconds: int,
+) -> tuple[bool, str | None, list[str]]:
+    """True when the scenario succeeded; (ok, error, failed step names)."""
+    failed_steps: list[str] = []
+    error: str | None = None
+    ok = False
+    if timed_out:
+        error = f"timeout after {timeout_seconds}s"
+    elif outcome is not None:
+        failed_steps = [str(s.get("name")) for s in outcome.get("steps", []) if not s.get("ok")]
+        ok = outcome.get("error") is None and not failed_steps
+        if not ok:
+            error = outcome.get("error")
+            if not error and failed_steps:
+                step = next((s for s in outcome.get("steps", []) if not s.get("ok")), {})
+                error = f"{step.get('name')}: {step.get('note') or 'failed'}"
+    elif rc == 0:
+        # The testclient always writes the outcome file when it ran the scenario; a clean exit
+        # without one means the result is unknown, so do not count it as a success.
+        error = "no outcome file"
+    else:
+        error = strip_error_prefix(
+            last_meaningful_line(stderr) or last_meaningful_line(stdout) or f"exit code {rc}"
+        )
+    if rc not in (0, None) and outcome is not None and ok:
+        ok = False
+        error = error or f"testclient exited with code {rc}"
+    if not ok and not error:
+        error = f"exit code {rc}" if rc is not None else "testclient failed"
+    return ok, error, failed_steps
+
+
+def run_account_prefix(prefix: str, stamp: datetime) -> str:
+    """Per-run account prefix: the user prefix plus month/day/hour/minute of the run."""
+    return f"{prefix}{stamp.strftime('%m%d%H%M')}"
+
+
+def npc_character_name(account: str, seq: int, retries: int) -> str:
+    """Unique disposable npc-return character per attempt and per transient retry."""
+    suffix = "abcdefghijklmnopqrstuvwxyz"[retries % 26]
+    return f"{account}n{seq:02d}{suffix}"
+
+
+def remaining_scenarios(scenarios: list[str], skipped: set[str]) -> list[str]:
+    """Per-bot scenarios that still have work; `load` runs once as its own phase."""
+    return [name for name in scenarios if name != "load" and name not in skipped]
+
+
+def kill_tree(pid: int) -> None:
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            capture_output=True,
+            check=False,
+        )
+        return
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def install_break_handler() -> None:
+    """Ctrl+Break is the only console event a new Windows process group still receives."""
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, signal.default_int_handler)
+
+
+def join_threads(threads: list[threading.Thread], timeout: float | None = None) -> None:
+    """Join in short slices so a console interrupt reaches the main thread promptly."""
+    deadline = None if timeout is None else time.monotonic() + timeout
+    for thread in threads:
+        while thread.is_alive():
+            if deadline is not None and time.monotonic() >= deadline:
+                return
+            thread.join(timeout=0.5)
+
+
 def parse_outcome(path: Path) -> dict | None:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -306,14 +405,18 @@ class Runner:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.lane = Lane()
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        self.run_id = stamp
-        self.run_dir = self.lane.live / "soak" / stamp
+        self.run_stamp = datetime.now()
+        self.run_id = self.run_stamp.strftime("%Y%m%d-%H%M%S")
+        self.run_dir = self.lane.live / "soak" / self.run_id
         self.bug_root = self.run_dir / "bugreports"
         self.logs_dir = self.run_dir / "logs"
         self.attempts_path = self.run_dir / "attempts.jsonl"
         self.attempts: list[dict] = []
         self.lock = threading.Lock()
+        self.children: dict[int, subprocess.Popen] = {}
+        self.children_lock = threading.Lock()
+        self.worker_threads: list[threading.Thread] = []
+        self.interrupted = False
         self.next_seq_map: dict[str, int] = {}
         self.home: dict[str, dict] = {}
         self.abort = threading.Event()
@@ -331,6 +434,69 @@ class Runner:
         self.bug_run_dir: Path | None = None
         self.server_down_reason = ""
         self.stack_started = False
+
+    # ---- child processes ---------------------------------------------------------------------
+    def spawn(self, cmd, **kwargs) -> subprocess.Popen:
+        # Isolate console events: a Ctrl+C/Ctrl+Break aimed at the runner must not decide the
+        # bots' fate; the runner kills its children by pid in the finally block.
+        if os.name == "nt":
+            kwargs.setdefault("creationflags", subprocess.CREATE_NEW_PROCESS_GROUP)
+        proc = subprocess.Popen(cmd, **kwargs)
+        with self.children_lock:
+            self.children[proc.pid] = proc
+        return proc
+
+    def forget(self, proc: subprocess.Popen) -> None:
+        with self.children_lock:
+            self.children.pop(proc.pid, None)
+
+    def run_capture(
+        self, cmd, timeout: float, **kwargs
+    ) -> tuple[int | None, str, str, bool]:
+        proc = self.spawn(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            **kwargs,
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+            return proc.returncode, stdout or "", stderr or "", False
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            stdout, stderr = proc.communicate()
+            return None, stdout or "", stderr or "", True
+        finally:
+            # Keep a child that was interrupted mid-communicate in the registry so the
+            # finally in main can still kill it by pid.
+            if proc.poll() is not None:
+                self.forget(proc)
+
+    def kill_children(self) -> None:
+        with self.children_lock:
+            procs = list(self.children.values())
+            self.children.clear()
+        for proc in procs:
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+        for proc in procs:
+            try:
+                proc.wait(timeout=5)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+
+    def stop_workers(self, timeout: float = 10) -> None:
+        join_threads(self.worker_threads, timeout)
+        self.worker_threads.clear()
 
     # ---- setup -------------------------------------------------------------------------------
     def build(self) -> None:
@@ -401,7 +567,7 @@ class Runner:
             ok = False
             error = ""
             for attempt in (1, 2):
-                proc = subprocess.run(
+                rc, stdout, stderr, timed_out = self.run_capture(
                     [
                         str(self.lane.testclient),
                         "run",
@@ -416,17 +582,17 @@ class Runner:
                         "--outcome-json",
                         str(outcome),
                     ],
-                    cwd=str(self.run_dir),
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
                     timeout=180,
+                    cwd=str(self.run_dir),
                 )
-                if proc.returncode == 0:
+                if not timed_out and rc == 0:
                     ok = True
                     break
-                error = strip_error_prefix(last_meaningful_line(proc.stderr or proc.stdout))
+                error = (
+                    "timeout after 180s"
+                    if timed_out
+                    else strip_error_prefix(last_meaningful_line(stderr or stdout))
+                )
                 time.sleep(1)
             if not ok:
                 log(f"[setup] WARN: AutoAccount login failed for {account}: {error}")
@@ -449,11 +615,18 @@ class Runner:
 
     def provision_all(self) -> None:
         # Fresh accounts (and therefore fresh spawn characters) per run: no stale positions,
-        # quest state or dead characters from an earlier soak leak into this one.
-        self.account_prefix = f"{self.args.prefix}{datetime.now().strftime('%H%M%S')}"
+        # quest state or dead characters from an earlier soak leak into this one. The prefix
+        # carries the run's date and time, so a rerun never reuses an account.
+        self.account_prefix = run_account_prefix(self.args.prefix, self.run_stamp)
         self.bot_accounts = [f"{self.account_prefix}b{i}" for i in range(self.args.bots)]
         load_count = 0 if "load" not in self.args.scenarios else self.args.load_bots
         self.load_accounts = [f"{self.account_prefix}l{i}" for i in range(load_count)]
+        longest = max(self.bot_accounts + self.load_accounts, key=len, default="")
+        if longest and len(npc_character_name(longest, 99, 0)) > 18:
+            fail(
+                "--prefix is too long: character names must stay within 18 characters "
+                f"({npc_character_name(longest, 99, 0)})"
+            )
         log(f"[setup] account prefix {self.account_prefix}; provisioning {len(self.bot_accounts) + len(self.load_accounts)} account(s)")
         alive = self.provision(self.bot_accounts + self.load_accounts)
         self.accounts = alive
@@ -511,12 +684,13 @@ class Runner:
                 log(f"[{account}] position reset failed: {exc}")
                 return
 
-    def prepare_attempt(self, name: str, account: str, seq: int) -> Path | None:
+    def prepare_attempt(self, name: str, account: str, seq: int, retries: int) -> Path | None:
         if name == "npc-return":
             # The scenario needs a character with no quest 330 history; the server keeps a
             # logged-out character cached, so deleting quest rows from the DB is not enough.
-            character = f"{account}n{seq:02d}"
-            config = self.run_dir / "configs" / f"{account}-{seq:04d}-npc-return.json"
+            # A retry must not reuse the name the failed try may already have created.
+            character = npc_character_name(account, seq, retries)
+            config = self.run_dir / "configs" / f"{account}-{seq:04d}-npc-return-r{retries}.json"
             config.parent.mkdir(parents=True, exist_ok=True)
             config.write_text(
                 json.dumps({"character": character, "create_new_character": True}),
@@ -536,7 +710,7 @@ class Runner:
         seq = self.next_seq(account)
         retries = 0
         while True:
-            config = self.prepare_attempt(name, account, seq)
+            config = self.prepare_attempt(name, account, seq, retries)
             record = self.run_attempt_once(name, account, seq, retries, config)
             record["retries"] = retries
             if (
@@ -596,28 +770,12 @@ class Runner:
         display = [c if c != self.lane.password else "***" for c in cmd]
         started = iso_now()
         t0 = time.monotonic()
-        timed_out = False
-        rc: int | None = None
-        stdout = ""
-        stderr = ""
-        try:
-            proc = subprocess.run(
-                cmd,
-                cwd=str(self.run_dir),
-                env=self.testclient_env(),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=self.args.attempt_timeout,
-            )
-            rc = proc.returncode
-            stdout = proc.stdout or ""
-            stderr = proc.stderr or ""
-        except subprocess.TimeoutExpired as exc:
-            timed_out = True
-            stdout = (exc.stdout or b"").decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-            stderr = (exc.stderr or b"").decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        rc, stdout, stderr, timed_out = self.run_capture(
+            cmd,
+            timeout=self.args.attempt_timeout,
+            cwd=str(self.run_dir),
+            env=self.testclient_env(),
+        )
         ms = int((time.monotonic() - t0) * 1000)
 
         with log_path.open("w", encoding="utf-8", errors="replace") as out:
@@ -626,31 +784,9 @@ class Runner:
             out.write("\n--- stderr ---\n")
             out.write(stderr)
 
-        outcome = parse_outcome(outcome_path)
-        failed_steps: list[str] = []
-        error: str | None = None
-        ok = False
-        if timed_out:
-            error = f"timeout after {self.args.attempt_timeout}s"
-        elif outcome is not None:
-            failed_steps = [str(s.get("name")) for s in outcome.get("steps", []) if not s.get("ok")]
-            ok = outcome.get("error") is None and not failed_steps
-            if not ok:
-                error = outcome.get("error")
-                if not error and failed_steps:
-                    step = next((s for s in outcome.get("steps", []) if not s.get("ok")), {})
-                    error = f"{step.get('name')}: {step.get('note') or 'failed'}"
-        elif rc == 0:
-            ok = True
-        else:
-            error = strip_error_prefix(
-                last_meaningful_line(stderr) or last_meaningful_line(stdout) or f"exit code {rc}"
-            )
-        if rc not in (0, None) and outcome is not None and ok:
-            ok = False
-            error = error or f"testclient exited with code {rc}"
-        if not ok and not error:
-            error = f"exit code {rc}" if rc is not None else "testclient failed"
+        ok, error, failed_steps = classify_attempt(
+            rc, timed_out, parse_outcome(outcome_path), stdout, stderr, self.args.attempt_timeout
+        )
 
         record = {
             "scenario": name,
@@ -701,24 +837,12 @@ class Runner:
             "500",
         ]
         t0 = time.monotonic()
-        timed_out = False
-        try:
-            proc = subprocess.run(
-                cmd,
-                cwd=str(self.run_dir),
-                env=self.testclient_env(),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=self.args.attempt_timeout,
-            )
-            rc, stdout, stderr = proc.returncode, proc.stdout or "", proc.stderr or ""
-        except subprocess.TimeoutExpired as exc:
-            timed_out = True
-            rc = None
-            stdout = (exc.stdout or b"").decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-            stderr = (exc.stderr or b"").decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        rc, stdout, stderr, timed_out = self.run_capture(
+            cmd,
+            timeout=self.args.attempt_timeout,
+            cwd=str(self.run_dir),
+            env=self.testclient_env(),
+        )
         ms = int((time.monotonic() - t0) * 1000)
         log_path.write_text(stdout + "\n--- stderr ---\n" + stderr, encoding="utf-8", errors="replace")
         ok = not timed_out and rc == 0
@@ -730,7 +854,7 @@ class Runner:
             error = errors[0] if errors else strip_error_prefix(last_meaningful_line(stderr) or last_meaningful_line(stdout))
         record = {
             "scenario": name,
-            "account": f"{self.args.prefix}l*",
+            "account": f"{self.account_prefix}l*",
             "seq": 0,
             "started": iso_now(),
             "ms": ms,
@@ -773,8 +897,14 @@ class Runner:
     def bot_worker(self, account: str, index: int, stop_at: float) -> None:
         rng = random.Random(self.args.seed * 100003 + index)
         while not self.abort.is_set() and time.monotonic() < stop_at:
-            order = [name for name in self.args.scenarios if name != "load"]
+            with self.lock:
+                skipped = {name for name, stats in self.stats.items() if stats.skipped}
+            order = remaining_scenarios(self.args.scenarios, skipped)
+            if not order:
+                log(f"[{account}] no per-bot scenarios left to run (all skipped or only load); leaving the soak")
+                return
             rng.shuffle(order)
+            ran_any = False
             for name in order:
                 if self.abort.is_set() or time.monotonic() >= stop_at:
                     break
@@ -789,6 +919,7 @@ class Runner:
                         continue
                 try:
                     self.run_attempt(name, account)
+                    ran_any = True
                 except Exception as exc:  # never let one bot kill the soak
                     log(f"[{account}] {name} runner error: {exc}")
                     with self.lock:
@@ -798,6 +929,9 @@ class Runner:
                         self.exclusive[name].release()
                 if self.args.between_seconds > 0 and time.monotonic() < stop_at:
                     time.sleep(self.args.between_seconds)
+            if not ran_any and not self.abort.is_set():
+                # Nothing became runnable (e.g. every lock holder timed out): never spin.
+                self.abort.wait(1)
 
     def prepare_homes(self) -> None:
         if not self.bot_accounts:
@@ -816,10 +950,11 @@ class Runner:
                     self.home[account] = position
 
         threads = [threading.Thread(target=worker, args=(account,), daemon=True) for account in self.bot_accounts]
+        self.worker_threads = threads
         for thread in threads:
             thread.start()
-        for thread in threads:
-            thread.join()
+        join_threads(threads)
+        self.worker_threads = []
         log(f"[setup] spawn position known for {len(self.home)}/{len(self.bot_accounts)} bot(s)")
 
     def soak(self) -> None:
@@ -832,15 +967,16 @@ class Runner:
         ]
         watch = threading.Thread(target=self.watchdog, args=(stop_at,), daemon=True)
         log(f"[soak] {len(threads)} bot(s), {self.args.minutes:g} min, seed {self.args.seed}, scenarios: {', '.join(n for n in self.args.scenarios if n != 'load')}")
+        self.worker_threads = threads
         watch.start()
         for thread in threads:
             thread.start()
-        for thread in threads:
-            thread.join()
+        join_threads(threads)
+        self.worker_threads = []
         self.finished = time.monotonic()
         self.server_alive_at_end = port_open(self.lane.game_port)
         self.abort.set()
-        watch.join(timeout=15)
+        join_threads([watch], 15)
         log(f"[soak] done after {(self.finished - self.started) / 60:.1f} min")
 
     # ---- reporting ---------------------------------------------------------------------------
@@ -1000,6 +1136,7 @@ class Runner:
             "bug_reports": bugs,
             "aborted": self.abort.is_set() and bool(self.abort_reason),
             "abort_reason": self.abort_reason or None,
+            "interrupted": self.interrupted,
             "server_alive_at_end": self.server_alive_at_end,
             "totals": {
                 "attempts": total_attempts,
@@ -1028,6 +1165,8 @@ class Runner:
         add(f"- Login: `{self.lane.login}`; runtime: `{self.lane.live.as_posix()}`")
         add(f"- Game log: `{data['game_log']}`")
         add(f"- Server alive at end: {'yes' if data['server_alive_at_end'] else 'no'}")
+        if data["interrupted"]:
+            add("- **INTERRUPTED**: partial run; the bot clients were killed and the stack stopped")
         if data["aborted"]:
             add(f"- **ABORTED**: {data['abort_reason']}")
         totals = data["totals"]
@@ -1153,6 +1292,7 @@ def parse_scenarios(value: str) -> list[str]:
 
 
 def main(argv: list[str]) -> int:
+    install_break_handler()
     parser = argparse.ArgumentParser(
         description="Run the headless-client scenarios with N bots against this lane's stack and write a dashboard.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1234,21 +1374,32 @@ def main(argv: list[str]) -> int:
 
     runner.run_dir.mkdir(parents=True, exist_ok=True)
     runner.attempts_path.touch()
-    if not args.no_build:
-        runner.build()
-    if not args.no_sync:
-        runner.sync_and_configure()
-    else:
-        runner.configure_runtime()
-    runner.restart_stack()
-    runner.provision_all()
+    interrupted = False
     try:
+        if not args.no_build:
+            runner.build()
+        if not args.no_sync:
+            runner.sync_and_configure()
+        else:
+            runner.configure_runtime()
+        runner.restart_stack()
+        runner.provision_all()
         runner.prepare_homes()
         runner.run_load_phase()
         runner.soak()
         log("[report] waiting 12 s for the bug reporter's summary refresh")
         time.sleep(12)
+    except KeyboardInterrupt:
+        interrupted = True
+        runner.interrupted = True
+        runner.abort.set()
+        if runner.started:
+            runner.finished = time.monotonic()
+        log("[runner] interrupted: killing bot clients and writing a partial dashboard")
     finally:
+        runner.kill_children()
+        runner.stop_workers()
+        runner.kill_children()
         if not args.keep_stack:
             log("[setup] stopping this lane's stack (MySQL stays up)")
             runner.lane.stack("stop", runner.run_dir / "stack-stop.log")
@@ -1260,7 +1411,7 @@ def main(argv: list[str]) -> int:
         f"WARN {data['server_log']['warn']} / ERROR {data['server_log']['error']}"
     )
     log(f"[report] dashboard: {md}")
-    return 0
+    return 130 if interrupted else 0
 
 
 if __name__ == "__main__":
