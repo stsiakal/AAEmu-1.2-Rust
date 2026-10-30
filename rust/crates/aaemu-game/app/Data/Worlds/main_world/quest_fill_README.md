@@ -30,8 +30,8 @@ spawn Z. The ignored test `real_data_quest_fill_spawns_on_terrain` checks exactl
   quests are in zones closed in 1.2 (Airain Rock 192/193, Sunbite Wilds 157/190, Cradle of
   Genesis 328, Golden Ruins 281/203, Mistmerrow 307) or are test/dummy quests (Maisky 13877,
   Sephvell 14147).
-- The 5 open-zone missing NPCs without a position in both sources (Tame Yata 3450, Asam 1266,
-  Freeblood Maurauder 1772, Trafficker Pirate 12509, and the other one-source NPCs).
+- The open-zone missing NPCs without a position in both sources (Tame Yata 3450, Asam 1266,
+  Freeblood Maurauder 1772, Trafficker Pirate 12509 and the other one-source/no-source NPCs).
 - Library doodads 7992/7993/7994 (level 51-55 later-patch content) and the remaining missing
   doodads (1082, 2770, 6197, 7404, 4380): no `doodad.g` + `doodad_map` pair.
 - All missing entities with no 10.x position at all (the majority of the 179 candidates).
