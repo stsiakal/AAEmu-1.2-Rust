@@ -1460,6 +1460,16 @@ pub fn jump_arc(from: Vec3, to: Vec3, t: f32) -> Vec3 {
     )
 }
 
+/// The height a jump from `from_z` falls from its apex to a landing at `landing_z`, in metres
+/// (`0` when the landing is above the apex). A jump rises [`JUMP_HEIGHT_M`] above the take-off
+/// before it falls, so a jump down falls that much further than the ledge is deep: the zone
+/// counts the highest point since the bot left the ground as the start of the fall (a jump
+/// down 9.5 m falls about 10.8 m, past the damage-free 10 m). It is an upper bound for the
+/// arc the walker sends, whose descent is flatter for a deep landing.
+pub fn jump_fall_height(from_z: f32, landing_z: f32) -> f32 {
+    (from_z + JUMP_HEIGHT_M - landing_z).max(0.0)
+}
+
 /// Walks the straight segment in 2 m samples and applies the same terrain / obstacle rules
 /// the step executor and the grid planner use, so a long navmesh leg that gently climbs a
 /// few metres is not mistaken for one impossible step.
@@ -2010,11 +2020,12 @@ fn jump_over(
     Err(last)
 }
 
-/// A jump step only when the landing has ground, is neither above a jump's reach nor beyond
-/// the safe fall below, is not deep water and the whole arc is free. The landing height is the
-/// terrain at the landing point (the arc interpolates to it, so it never ends at the take-off
-/// height). Every jump (an obstacle jump of any length and a climb onto the next step's
-/// ledge) is made here, so the limits hold on every path.
+/// A jump step only when the landing has ground, is neither above a jump's reach nor so far
+/// below that the fall from the jump's apex is unsafe ([`jump_fall_height`]), is not deep
+/// water and the whole arc is free. The landing height is the terrain at the landing point
+/// (the arc interpolates to it, so it never ends at the take-off height). Every jump (an
+/// obstacle jump of any length and a climb onto the next step's ledge) is made here, so the
+/// limits hold on every path.
 fn jump_step(
     world: &dyn NavWorld,
     from: Vec3,
@@ -2028,8 +2039,8 @@ fn jump_step(
     if jz - from.z > JUMP_HEIGHT_M {
         return Err("the jump would land above a jump's height");
     }
-    if from.z - jz > MAX_SAFE_DROP_M {
-        return Err("the jump would land below a safe fall");
+    if jump_fall_height(from.z, jz) > MAX_SAFE_DROP_M {
+        return Err("the jump would fall further than a safe fall");
     }
     if world.water_depth(to.x, to.y, to.z) > SWIM_DEPTH_M {
         return Err("the jump would land in deep water");

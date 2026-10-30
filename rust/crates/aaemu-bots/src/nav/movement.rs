@@ -440,15 +440,57 @@ impl RouteWalker {
     }
 }
 
+/// One jump in flight: airborne samples, then the landing.
 struct JumpState {
     from: Vec3,
     to: Vec3,
     elapsed: f32,
-    /// `fallVel` when the landing is lower than the take-off (the normal fall-damage path).
-    fall_vel: u16,
+    /// The `fallVel` of the landing packet: the fall from the jump's apex to the landing
+    /// ([`nav::jump_fall_height`]; a jump rises before it falls). Like a real client, the walker
+    /// reports it in the packet of the touchdown only, never while the bot is still in the air.
+    landing_fall_vel: u16,
+}
+
+/// What the walker sends for one tick of a jump.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum JumpTick {
+    /// An airborne sample (no `fallVel`).
+    Air {
+        at: Vec3,
+        delta: (f32, f32),
+        vel_z: f32,
+    },
+    /// The touchdown at the landing point, carrying the landing's `fallVel`.
+    Landing { fall_vel: u16 },
 }
 
 impl JumpState {
+    fn new(from: Vec3, to: Vec3) -> Self {
+        Self {
+            from,
+            to,
+            elapsed: 0.0,
+            landing_fall_vel: aaemu_game::systems::ai::nav::fall_velocity(nav::jump_fall_height(
+                from.z, to.z,
+            )),
+        }
+    }
+
+    /// Advances the flight by one [`STEP_MS`] tick.
+    fn tick(&mut self) -> JumpTick {
+        self.elapsed += STEP_MS as f32 / 1000.0;
+        if self.elapsed >= JUMP_AIR_TIME_S {
+            return JumpTick::Landing {
+                fall_vel: self.landing_fall_vel,
+            };
+        }
+        JumpTick::Air {
+            at: self.position(),
+            delta: self.step_delta(),
+            vel_z: self.vertical_velocity(),
+        }
+    }
+
     fn position(&self) -> Vec3 {
         nav::jump_arc(self.from, self.to, self.elapsed)
     }
@@ -550,37 +592,46 @@ async fn walk(
         }
         walker.set_speeds(run_speed, swim_speed);
         if let Some(state) = jump.as_mut() {
-            state.elapsed += STEP_MS as f32 / 1000.0;
-            let at = state.position();
-            let (_, _, rotation_z) =
-                roll_pitch_yaw_sbytes_movement(0.0, 0.0, heading(state.from, state.to));
-            if let Err(failure) = send_move(
-                bot,
-                server,
-                &player,
-                generation,
-                at,
-                state.step_delta(),
-                state.vertical_velocity(),
-                rotation_z,
-                GameStanceType::COMBAT,
-                MoveTypeFlags::MOVING | MoveTypeFlags::JUMPING,
-                MoveTypeActorFlags(MoveTypeActorFlags::JUMPING.0 | MoveTypeActorFlags::FLAG2.0),
-                state.fall_vel,
-                run_speed,
-            )
-            .await
-            {
-                return NavOutcome::Failed(failure);
-            }
-            if state.elapsed >= JUMP_AIR_TIME_S {
-                let to = state.to;
-                jump = None;
-                if let Err(failure) =
-                    send_stop(bot, server, &player, generation, to, heading(pos, to)).await
-                {
-                    return NavOutcome::Failed(failure);
+            let (from, to) = (state.from, state.to);
+            let sent = match state.tick() {
+                JumpTick::Air { at, delta, vel_z } => {
+                    let (_, _, rotation_z) =
+                        roll_pitch_yaw_sbytes_movement(0.0, 0.0, heading(from, to));
+                    send_move(
+                        bot,
+                        server,
+                        &player,
+                        generation,
+                        at,
+                        delta,
+                        vel_z,
+                        rotation_z,
+                        GameStanceType::COMBAT,
+                        MoveTypeFlags::MOVING | MoveTypeFlags::JUMPING,
+                        MoveTypeActorFlags(
+                            MoveTypeActorFlags::JUMPING.0 | MoveTypeActorFlags::FLAG2.0,
+                        ),
+                        0,
+                        run_speed,
+                    )
+                    .await
                 }
+                JumpTick::Landing { fall_vel } => {
+                    jump = None;
+                    send_stop(
+                        bot,
+                        server,
+                        &player,
+                        generation,
+                        to,
+                        heading(pos, to),
+                        fall_vel,
+                    )
+                    .await
+                }
+            };
+            if let Err(failure) = sent {
+                return NavOutcome::Failed(failure);
             }
             last_pos = position(&player);
             continue;
@@ -801,12 +852,7 @@ async fn send_step(
             .await?;
         }
         StepAction::Jump(_) => {
-            *jump = Some(JumpState {
-                from: pos,
-                to: step.to,
-                elapsed: 0.0,
-                fall_vel: aaemu_game::systems::ai::nav::fall_velocity((pos.z - step.to.z).max(0.0)),
-            });
+            *jump = Some(JumpState::new(pos, step.to));
             return Ok(false);
         }
         StepAction::Drop(height) => {
@@ -895,17 +941,16 @@ async fn send_move(
     .ok(bot)
 }
 
-/// The packet that ends a movement (the `stopping` flag) at `pos`.
-async fn send_stop(
-    bot: &BotSession,
-    server: &GameServer,
-    player: &PlayerRef,
-    generation: u64,
-    pos: Vec3,
-    rot_z: f32,
-) -> Result<(), NavFailure> {
+/// The unit movement of a stop at `pos`; the fall velocity block is on the wire only with the
+/// actor flag 0x80, so the flag goes with a non-zero `fall_vel`.
+fn stop_move(pos: Vec3, rot_z: f32, fall_vel: u16) -> UnitMove {
     let (_, _, rotation_z) = roll_pitch_yaw_sbytes_movement(0.0, 0.0, rot_z);
-    let unit = UnitMove {
+    let fall_flag = if fall_vel > 0 {
+        MoveTypeActorFlags::FLAG8.0
+    } else {
+        0
+    };
+    UnitMove {
         x: pos.x,
         y: pos.y,
         z: pos.z,
@@ -913,11 +958,25 @@ async fn send_stop(
         stance: GameStanceType::COMBAT,
         alertness: MoveTypeAlertness::IDLE,
         actor_flags: MoveTypeActorFlags(
-            MoveTypeActorFlags::STANDING_ON_SOLID.0 | MoveTypeActorFlags::FLAG2.0,
+            MoveTypeActorFlags::STANDING_ON_SOLID.0 | MoveTypeActorFlags::FLAG2.0 | fall_flag,
         ),
+        fall_vel,
         ..UnitMove::default()
-    };
-    let mut mt = MoveType::new(MoveKind::Unit(unit));
+    }
+}
+
+/// The packet that ends a movement (the `stopping` flag) at `pos`; after a jump it is the
+/// landing packet and carries the landing's `fall_vel` (on the wire only with actor flag 0x80).
+async fn send_stop(
+    bot: &BotSession,
+    server: &GameServer,
+    player: &PlayerRef,
+    generation: u64,
+    pos: Vec3,
+    rot_z: f32,
+    fall_vel: u16,
+) -> Result<(), NavFailure> {
+    let mut mt = MoveType::new(MoveKind::Unit(stop_move(pos, rot_z, fall_vel)));
     mt.flags = MoveTypeFlags::STOPPING;
     mt.time = bot.next_move_time_ms();
     bot.dispatch_walk(
@@ -950,6 +1009,7 @@ async fn stop_and_end(
         generation,
         pos,
         heading(pos, final_target),
+        0,
     )
     .await
     {

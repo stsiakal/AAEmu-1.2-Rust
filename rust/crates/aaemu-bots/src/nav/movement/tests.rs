@@ -992,15 +992,89 @@ fn no_jump_path_lands_above_the_jump_height() {
 }
 
 #[test]
+fn a_jump_down_counts_the_apex_in_the_safe_fall() {
+    // A jump rises 1.3 m before it falls: a landing 9.5 m below really falls about 10.8 m,
+    // past the damage-free 10 m, so a jump down is safe only up to MAX_SAFE_DROP_M - 1.3.
+    let from = Vec3::new(104.5, 100.0, 100.0);
+    let safe = nav::next_step(&FenceThenLedge { rise: -8.0 }, from, at(110.0, 100.0))
+        .expect("an 8 m jump down falls 9.3 m from its apex: safe");
+    assert!(matches!(safe.action, StepAction::Jump(_)), "{safe:?}");
+    assert!((safe.to.z - 92.0).abs() < 0.01, "{safe:?}");
+    for rise in [-8.5, -9.0, -9.5] {
+        assert!(
+            nav::next_step(&FenceThenLedge { rise }, from, at(110.0, 100.0)).is_none(),
+            "a jump {rise} m down falls {:.1} m from its apex",
+            nav::jump_fall_height(100.0, 100.0 + rise)
+        );
+    }
+    // Walking off the same ledge needs no jump (a drop falls only its own height).
+    assert!((nav::jump_fall_height(100.0, 92.0) - 9.3).abs() < 1e-4);
+    assert_eq!(nav::jump_fall_height(100.0, 105.0), 0.0, "above the apex");
+}
+
+/// Flies a jump to the end: the airborne ticks and the landing's `fallVel`.
+fn fly(from: Vec3, to: Vec3) -> (usize, u16) {
+    let mut state = super::JumpState::new(from, to);
+    let mut airborne = 0;
+    loop {
+        match state.tick() {
+            super::JumpTick::Air { .. } => airborne += 1,
+            super::JumpTick::Landing { fall_vel } => return (airborne, fall_vel),
+        }
+        assert!(airborne < 20, "the jump never lands");
+    }
+}
+
+#[test]
+fn a_jump_reports_its_fall_velocity_on_the_landing_only() {
+    use aaemu_game::systems::ai::nav::fall_velocity;
+
+    // A flat jump: six airborne samples (no fall velocity in any of them: `JumpTick::Air`
+    // has none), then the touchdown, which falls from the 1.3 m apex.
+    let (airborne, landing) = fly(Vec3::new(0.0, 0.0, 100.0), Vec3::new(3.0, 0.0, 100.0));
+    assert_eq!(airborne, 6);
+    assert_eq!(landing, fall_velocity(nav::JUMP_HEIGHT_M));
+    assert!(landing > 0);
+    // Onto a ledge 1.0 m up: the fall from the apex is 0.3 m.
+    let (_, up) = fly(Vec3::new(0.0, 0.0, 100.0), Vec3::new(2.0, 0.0, 101.0));
+    assert_eq!(up, fall_velocity(0.3));
+    // Down 8 m: 9.3 m from the apex, still below the damage-free 10 m (about 19.3 m/s).
+    let (_, down) = fly(Vec3::new(0.0, 0.0, 100.0), Vec3::new(2.0, 0.0, 92.0));
+    assert_eq!(down, fall_velocity(9.3));
+    assert!(
+        f32::from(down) < 20.0 * aaemu_game::systems::ai::collision::fall::FALL_VEL_UNITS_PER_MPS,
+        "{down}"
+    );
+    // A landing at the apex or above has no fall at all.
+    let (_, none) = fly(Vec3::new(0.0, 0.0, 100.0), Vec3::new(2.0, 0.0, 101.3));
+    assert_eq!(none, 0);
+}
+
+#[test]
+fn only_a_landing_stop_carries_the_fall_velocity_block() {
+    let pos = Vec3::new(1.0, 2.0, 3.0);
+    let plain = super::stop_move(pos, 0.0, 0);
+    assert!(!plain.actor_flags.contains(MoveTypeActorFlags::FLAG8));
+    assert_eq!(plain.fall_vel, 0);
+    assert!(plain
+        .actor_flags
+        .contains(MoveTypeActorFlags::STANDING_ON_SOLID));
+    let landing = super::stop_move(pos, 0.0, 9_000);
+    assert!(
+        landing.actor_flags.contains(MoveTypeActorFlags::FLAG8),
+        "the wire carries `fallVel` only with actor flag 0x80"
+    );
+    assert!(landing
+        .actor_flags
+        .contains(MoveTypeActorFlags::STANDING_ON_SOLID));
+    assert_eq!(landing.fall_vel, 9_000);
+}
+
+#[test]
 fn a_jump_reports_its_real_horizontal_speed() {
     // A 1.57 m jump takes the full air time: its per-tick displacement is a tenth of the
     // flight's, not the whole 1.57 m (the packet velocity is the real, slow, horizontal speed).
-    let state = super::JumpState {
-        from: Vec3::new(0.0, 0.0, 0.0),
-        to: Vec3::new(1.57, 0.0, 0.0),
-        elapsed: 0.0,
-        fall_vel: 0,
-    };
+    let state = super::JumpState::new(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.57, 0.0, 0.0));
     let (dx, dy) = state.step_delta();
     let speed = (dx * dx + dy * dy).sqrt() / (nav::STEP_MS as f32 / 1000.0);
     assert!(
