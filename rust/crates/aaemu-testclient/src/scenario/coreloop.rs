@@ -82,6 +82,8 @@ pub(super) struct HouseView {
     pub co_owner_id: u32,
     pub owner_id: u32,
     pub permission: u8,
+    pub all_action: i32,
+    pub current_action: i32,
     pub pos: (f32, f32, f32),
     pub name: String,
 }
@@ -99,8 +101,8 @@ pub(super) fn house_view(body: &[u8]) -> anyhow::Result<HouseView> {
     s.read_string()?; // owner name
     s.read_u32()?; // account id
     let permission = s.read_u8()?;
-    s.read_i32()?; // all actions / 0
-    s.read_i32()?; // current action / 0
+    let all_action = s.read_i32()?;
+    let current_action = s.read_i32()?;
     s.read_i32()?; // tax
     let x = convert_long_to_coord(s.read_i64()?);
     let y = convert_long_to_coord(s.read_i64()?);
@@ -113,6 +115,8 @@ pub(super) fn house_view(body: &[u8]) -> anyhow::Result<HouseView> {
         co_owner_id,
         owner_id,
         permission,
+        all_action,
+        current_action,
         pos: (x, y, z),
         name,
     })
@@ -162,4 +166,133 @@ pub(super) fn loot_bag_templates(body: &[u8]) -> anyhow::Result<Vec<u32>> {
 /// `SCLootItemTookPacket` item template id.
 pub(super) fn loot_took_template(p: &Packet) -> anyhow::Result<u32> {
     Ok(p.stream().read_u32()?)
+}
+
+/// One item entry of an `SCItemTaskSuccessPacket` (the count is what the task added).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ItemStack {
+    pub template: u32,
+    pub item_id: u64,
+    pub slot_type: u8,
+    pub slot: u8,
+    pub count: i32,
+}
+
+/// The item entries of `template` in an `SCItemTaskSuccessPacket` among `packets`, including
+/// `AddStack` entries (which `scenario::parse_item_task` does not read).
+pub(super) fn item_stacks(packets: &[Packet], template: u32) -> Vec<ItemStack> {
+    let mut out = Vec::new();
+    for p in packets
+        .iter()
+        .filter(|p| p.is_sc(sc::SCItemTaskSuccessPacket))
+    {
+        let mut s = p.stream();
+        let parsed = (|| -> anyhow::Result<()> {
+            s.read_u8()?; // task type
+            let count = s.read_u8()?;
+            for _ in 0..count {
+                match s.read_u8()? {
+                    4 => {
+                        let slot_type = s.read_u8()?;
+                        let slot = s.read_u8()?;
+                        let item_id = s.read_u64()?;
+                        let count = s.read_i32()?;
+                        let tpl = s.read_u32()?;
+                        if tpl == template {
+                            out.push(ItemStack {
+                                template: tpl,
+                                item_id,
+                                slot_type,
+                                slot,
+                                count,
+                            });
+                        }
+                    }
+                    5 | 6 | 15 => {
+                        let slot_type = s.read_u8()?;
+                        let slot = s.read_u8()?;
+                        let tpl = s.read_u32()?;
+                        let item_id = s.read_u64()?;
+                        s.read_u8()?; // grade
+                        s.read_u8()?; // flags
+                        let count = s.read_i32()?;
+                        let len = s.read_i16()?;
+                        if len < 0 {
+                            anyhow::bail!("negative item detail length");
+                        }
+                        s.read_bytes(len as usize)?;
+                        s.read_i64()?; // create time
+                        s.read_i32()?; // lifespan
+                        s.read_u32()?; // made unit
+                        s.read_u8()?; // world id
+                        s.read_i64()?; // unsecure time
+                        s.read_i64()?; // unpack time
+                        if tpl == template {
+                            out.push(ItemStack {
+                                template: tpl,
+                                item_id,
+                                slot_type,
+                                slot,
+                                count,
+                            });
+                        }
+                    }
+                    _ => anyhow::bail!("unsupported item task action"),
+                }
+            }
+            Ok(())
+        })();
+        if parsed.is_err() {
+            break;
+        }
+    }
+    out
+}
+
+/// `CSDestroyItemPacket(itemId, slotType, slot, count)`.
+pub(super) async fn destroy_item(game: &mut GameClient, item: &ItemStack) -> anyhow::Result<()> {
+    let mut s = PacketStream::new();
+    s.write_u64(item.item_id)
+        .write_u8(item.slot_type)
+        .write_u8(item.slot)
+        .write_i32(item.count.max(1));
+    game.send_cs(aaemu_game::opcodes::cs::CSDestroyItemPacket, s.as_bytes())
+        .await
+}
+
+/// `SCUnitsRemovedPacket` object ids.
+pub(super) fn removed_ids(p: &Packet) -> anyhow::Result<Vec<u32>> {
+    let mut s = p.stream();
+    let n = s.read_u16()?;
+    let mut ids = Vec::new();
+    for _ in 0..n {
+        ids.push(s.read_bc()?);
+    }
+    Ok(ids)
+}
+
+/// The bot's own server position (`/position`), for checks the movement echo does not expose
+/// (a rider is a child transform while mounted).
+pub(super) async fn self_position(game: &mut GameClient) -> anyhow::Result<(f32, f32, f32)> {
+    let reply = gm_command(game, "position").await?;
+    let line = reply
+        .iter()
+        .filter_map(chat_text)
+        .find(|t| t.contains("X:"))
+        .context("no /position reply")?;
+    let axis = |name: &str| -> anyhow::Result<f32> {
+        let rest = line
+            .split(&format!("{name}: "))
+            .nth(1)
+            .with_context(|| format!("missing {name} in {line:?}"))?;
+        let raw = rest
+            .split_whitespace()
+            .next()
+            .context("missing axis value")?
+            .trim_start_matches("|cFFFFFFFF")
+            .trim_end_matches("|r");
+        raw.parse()
+            .with_context(|| format!("axis {name} in {line:?} is not a number"))
+    };
+    Ok((axis("X")?, axis("Y")?, axis("Z")?))
 }

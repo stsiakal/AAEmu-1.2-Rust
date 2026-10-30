@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 use aaemu_game::opcodes::{cs, sc};
 use anyhow::{bail, ensure, Context};
 
-use super::coreloop::{gm_access, loot_bag_templates, loot_took_template};
+use super::coreloop::{
+    destroy_item, gm_access, item_stacks, loot_bag_templates, loot_took_template, ItemStack,
+};
 use super::questitem::{chat_text, gm_command, last_quest_state};
 use super::{own_skill_response, packet_obj_id, quest_template_id, skill_response_result, Runner};
 use crate::game::{GameClient, Packet, UnitInfo};
@@ -31,8 +33,30 @@ const REWARD: u32 = 18791;
 /// Melee attack skill of the created fighter.
 const ATTACK: u32 = 2;
 
+#[derive(Default)]
+struct Cleanup {
+    giver: Option<u32>,
+    boars: Vec<u32>,
+    reward: Option<ItemStack>,
+}
+
 pub(super) async fn run(game: &mut GameClient, r: &mut Runner<'_>) -> anyhow::Result<()> {
     gm_access(game, r).await?;
+    let mut cleanup = Cleanup::default();
+    let result = run_inner(game, r, &mut cleanup).await;
+    let cleanup_result = cleanup_quest(game, r, &mut cleanup).await;
+    let leave = super::coreloop::leave_world(game).await;
+    result?;
+    cleanup_result?;
+    leave?;
+    Ok(())
+}
+
+async fn run_inner(
+    game: &mut GameClient,
+    r: &mut Runner<'_>,
+    cleanup: &mut Cleanup,
+) -> anyhow::Result<()> {
     // A previous run (or another scenario) may have completed the quest: reset it first.
     let _ = gm_command(game, &format!("quest uncomplete {QUEST}")).await?;
     game.drain(Duration::from_millis(300), Duration::from_secs(2))
@@ -42,6 +66,7 @@ pub(super) async fn run(game: &mut GameClient, r: &mut Runner<'_>) -> anyhow::Re
     let s = r.begin("game.questchain.giver");
     let giver = spawn_npc(game, GIVER).await?;
     let giver_obj = giver.obj_id;
+    cleanup.giver = Some(giver_obj);
     move_near(game, giver.pos).await?;
     r.var("giver_obj", giver_obj);
     r.end(s, format!("NPC {GIVER} obj {giver_obj} at {:?}", giver.pos));
@@ -98,6 +123,7 @@ pub(super) async fn run(game: &mut GameClient, r: &mut Runner<'_>) -> anyhow::Re
         let s = r.begin(&format!("game.questchain.boar{boar_no}"));
         let boar = spawn_npc(game, BOAR).await?;
         let boar_obj = boar.obj_id;
+        cleanup.boars.push(boar_obj);
         move_near(game, boar.pos).await?;
         game.change_target(boar_obj).await?;
         // Setup: leave the boar at 1 % so the player's next hit is the killing blow. Send it
@@ -203,7 +229,8 @@ pub(super) async fn run(game: &mut GameClient, r: &mut Runner<'_>) -> anyhow::Re
         .iter()
         .find(|p| p.is_sc(sc::SCQuestContextCompletedPacket))
         .and_then(|p| p.stream().read_u32().ok());
-    let reward = super::questitem::stack_location(&answers, REWARD).is_some();
+    cleanup.reward = item_stacks(&answers, REWARD).into_iter().next();
+    let reward = cleanup.reward.is_some();
     let tasks: Vec<String> = answers
         .iter()
         .filter(|p| p.is_sc(sc::SCItemTaskSuccessPacket))
@@ -235,20 +262,36 @@ pub(super) async fn run(game: &mut GameClient, r: &mut Runner<'_>) -> anyhow::Re
     );
     r.end(s, note);
 
-    // ---- tidy up: the GM-spawned NPC and the completion flag ----
-    let s = r.begin("game.questchain.cleanup");
-    let _ = gm_command(game, &format!("quest uncomplete {QUEST}")).await?;
-    let _ = gm_command(game, &format!("despawn npc {giver_obj}")).await?;
-    game.drain(Duration::from_millis(300), Duration::from_secs(2))
-        .await?;
-    r.end(s, "spawned NPC removed, quest completion reset");
-
-    let s = r.begin("game.leave");
-    super::coreloop::leave_world(game).await?;
-    r.end(s, "left");
     Ok(())
 }
 
+/// Drops/resets the quest, removes the spawned NPCs and destroys the reward, also after a
+/// failed run.
+async fn cleanup_quest(
+    game: &mut GameClient,
+    r: &mut Runner<'_>,
+    cleanup: &mut Cleanup,
+) -> anyhow::Result<()> {
+    let s = r.begin("game.questchain.cleanup");
+    let mut body = aaemu_commons::PacketStream::new();
+    body.write_u32(QUEST);
+    game.send_cs(cs::CSDropQuestContextPacket, body.as_bytes())
+        .await?;
+    let _ = gm_command(game, &format!("quest uncomplete {QUEST}")).await?;
+    for boar in cleanup.boars.drain(..) {
+        let _ = gm_command(game, &format!("despawn npc {boar}")).await?;
+    }
+    if let Some(giver) = cleanup.giver.take() {
+        let _ = gm_command(game, &format!("despawn npc {giver}")).await?;
+    }
+    if let Some(reward) = cleanup.reward.take() {
+        destroy_item(game, &reward).await?;
+    }
+    game.drain(Duration::from_millis(300), Duration::from_secs(2))
+        .await?;
+    r.end(s, "quest dropped/reset, NPCs removed, reward destroyed");
+    Ok(())
+}
 /// Spawns NPC `template` in front of the bot and returns the new unit once it is announced.
 async fn spawn_npc(game: &mut GameClient, template: u32) -> anyhow::Result<UnitInfo> {
     let before: Vec<u32> = game.state.units.keys().copied().collect();

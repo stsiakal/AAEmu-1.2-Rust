@@ -289,16 +289,17 @@ mate with `CSMoveUnit` (20 m at 20 m/s, echoed by `SCOneUnitMovement`), then `CS
 and `CSRemoveMate`.
 
 `questchain` (GM account) spawns the quest giver 3512 and quest 251 "Angry Boars" in front of the bot, accepts with
-`CSStartQuestContext`, spawns a boar 3475 per objective, weakens it with the GM `/damage 99%` setup command, kills it
+`CSStartQuestContext`, spawns a boar 3475 per objective, weakens it with the GM `/damage 99%` setup command (this skips the server's damage/HP calculation and the boar combat AI), kills it
 with the player's melee `CSStartSkill` 2 and loots the corpse with `CSLootOpenBag(lootAll)`; the quest must count
 3 x boar meat (item 4058). It then reports with `CSCompleteQuestContext` and requires `SCQuestContextCompleted` and
 the reward item 18791. The completion flag and the spawned NPC are reset with GM commands so the next run can
 accept the quest again.
 
 `gather` (GM account) tops labor up, spawns iron vein 1671 with `/spawn doodad` and mines it with the vein's
-`DoodadFuncUse` skill 13986 (doodad target, 10 labor, range 4). It requires `SkillResult` 0, a
-`SCCharacterLaborPowerChanged` of -10, the vein's phase change and an item task creating iron ore (item 8022, loot
-pack 6359). The GM-placed vein is removed afterwards.
+`DoodadFuncUse` skill 13986 (doodad target, 10 labor, 4.5 s cast, range 4). It requires `SkillResult` 0, a
+`SCCharacterLaborPowerChanged` of -10, the vein's phase change and a loot item from pack 6359 (iron ore 8022,
+rare 8081 or stone 8008); a genuine empty roll is retried on a fresh vein, while a labor mismatch or error fails at
+once. The ore and the GM-placed vein are removed afterwards.
 
 `m*` script commands (`aaemu-testclient/src/scenario/music.rs`, used by `rust/verify/musicrun1.vtest` /
 `musicrun2.vtest`) replay the 1.2 client's music wire sequence and fail on a missing callback:

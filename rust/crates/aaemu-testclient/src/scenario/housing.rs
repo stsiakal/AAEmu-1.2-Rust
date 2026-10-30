@@ -16,7 +16,7 @@ use anyhow::{bail, ensure, Context};
 
 use super::coreloop::{floor_height, gm_access, house_view, teleport_to, HouseView};
 use super::questitem::{gm_command, stack_id};
-use super::{skill_response_result, Runner, QUIET};
+use super::{skill_response_result, Runner};
 use crate::game::{GameClient, Packet};
 
 /// Design 172 "cozy Nuian house" and its design item.
@@ -93,9 +93,28 @@ fn coord_pos(s: &mut PacketStream, x: f32, y: f32, z: f32) {
         .write_f32(z);
 }
 
+#[derive(Default)]
+struct Cleanup {
+    house: Option<(u32, u16)>,
+}
+
 pub(super) async fn run(game: &mut GameClient, r: &mut Runner<'_>) -> anyhow::Result<()> {
     gm_access(game, r).await?;
+    let mut cleanup = Cleanup::default();
+    let result = run_inner(game, r, &mut cleanup).await;
+    let cleanup_result = cleanup_house(game, r, &mut cleanup).await;
+    let leave = super::coreloop::leave_world(game).await;
+    result?;
+    cleanup_result?;
+    leave?;
+    Ok(())
+}
 
+async fn run_inner(
+    game: &mut GameClient,
+    r: &mut Runner<'_>,
+    cleanup: &mut Cleanup,
+) -> anyhow::Result<()> {
     // ---- design, build materials, tax certificates ----
     let s = r.begin("game.housing.items");
     let reply = gm_command(game, &format!("item add self {DESIGN_ITEM} 1")).await?;
@@ -225,6 +244,17 @@ pub(super) async fn run(game: &mut GameClient, r: &mut Runner<'_>) -> anyhow::Re
     );
     let house_obj = house.obj_id;
     let house_tl = house.tl;
+    cleanup.house = Some((house_obj, house_tl));
+    ensure!(
+        removed_item_id(&answers, design_item),
+        "the design item {DESIGN_ITEM} was not consumed: {}",
+        packet_summary(&answers)
+    );
+    ensure!(
+        taken_template(&answers, TAX_CERTIFICATE),
+        "the tax certificates ({TAX_CERTIFICATE}) were not consumed: {}",
+        packet_summary(&answers)
+    );
     r.var("house_obj", house_obj);
     r.var("house_tl", u32::from(house_tl));
     r.end(
@@ -310,19 +340,52 @@ pub(super) async fn run(game: &mut GameClient, r: &mut Runner<'_>) -> anyhow::Re
         "house is not finished: progress {last_step}/{all_steps} after {progress_seen} actions"
     );
 
+    // A finished house writes `all_action = current_action = 0`. Re-selecting the character
+    // gives a fresh owned-house snapshot (`SCLoginCharInfoHousePacket`) to assert that state.
     let s = r.begin("game.housing.finished");
-    let extra = game.drain(QUIET, Duration::from_secs(6)).await?;
-    let done = answers
-        .iter()
-        .chain(extra.iter())
-        .any(|p| p.is_sc(sc::SCDoodadCreatedPacket) || p.is_sc(sc::SCDoodadsCreatedPacket));
+    let char_id = game.state.selected_char;
+    game.leave_world(1).await?;
+    game.wait_sc(sc::SCPrepareLeaveWorldPacket).await?;
+    game.wait_sc(sc::SCLeaveWorldGrantedPacket).await?;
+    game.drain(Duration::from_millis(300), Duration::from_secs(2))
+        .await?;
+    game.list_characters().await?;
+    game.wait_for("SCCharacterListPacket", |p| {
+        p.is_sc(sc::SCCharacterListPacket) && p.body.first() == Some(&1)
+    })
+    .await?;
+    game.select_character(char_id).await?;
+    let packet = game
+        .wait_for("SCLoginCharInfoHousePacket", |p| {
+            p.is_sc(sc::SCLoginCharInfoHousePacket)
+                && p.body.len() > 4
+                && house_view(&p.body[4..]).is_ok_and(|h| h.tl == house_tl)
+        })
+        .await
+        .context("no SCLoginCharInfoHousePacket for the built house")?;
+    let view = house_view(&packet.body[4..])?;
+    ensure!(
+        view.all_action == 0 && view.current_action == 0,
+        "house {house_tl} still reports build actions {}/{} after the last step",
+        view.current_action,
+        view.all_action
+    );
+    game.spawn_character().await?;
+    game.wait_for("own SCUnitStatePacket after re-select", |p| {
+        p.is_sc(sc::SCUnitStatePacket)
+    })
+    .await?;
+    game.notify_in_game().await?;
+    game.notify_in_game_completed().await?;
+    game.drain(Duration::from_millis(500), Duration::from_secs(4))
+        .await?;
     r.end(
         s,
         format!(
-            "build step -1 at {last_step}/{all_steps}; attached house doodads announced: {done}"
+            "finished house state tl {house_tl}: actions {}/{}, progress {last_step}/{all_steps}",
+            view.current_action, view.all_action
         ),
     );
-
     // ---- tax info (the 1.2 client cannot prepay tax: `CSChangeHousePayPacket` has no opcode) --
     let s = r.begin("game.housing.taxinfo");
     let mut body = PacketStream::new();
@@ -343,8 +406,20 @@ pub(super) async fn run(game: &mut GameClient, r: &mut Runner<'_>) -> anyhow::Re
     ensure!(tl == house_tl, "tax info for tl {tl}, want {house_tl}");
     r.end(s, format!("SCHouseTaxInfo for tl {house_tl}"));
 
-    // ---- demolition so the plot stays free ----
-    let s = r.begin("game.housing.demolish");
+    Ok(())
+}
+
+/// Removes the house (finished or not) so the next run can build on the plot again.
+async fn cleanup_house(
+    game: &mut GameClient,
+    r: &mut Runner<'_>,
+    cleanup: &mut Cleanup,
+) -> anyhow::Result<()> {
+    let s = r.begin("game.housing.cleanup");
+    let Some((house_obj, house_tl)) = cleanup.house.take() else {
+        r.end(s, "no house to demolish");
+        return Ok(());
+    };
     game.change_target(house_obj).await?;
     game.drain(Duration::from_millis(300), Duration::from_secs(1))
         .await?;
@@ -353,11 +428,11 @@ pub(super) async fn run(game: &mut GameClient, r: &mut Runner<'_>) -> anyhow::Re
         .iter()
         .filter_map(super::questitem::chat_text)
         .collect();
-    let deadline = Instant::now() + Duration::from_secs(10);
     let is_demolished = |p: &Packet| {
         (p.is_sc(sc::SCHouseDemolishedPacket) || p.is_sc(sc::SCMyHouseRemovedPacket))
             && p.stream().read_u16().ok() == Some(house_tl)
     };
+    let deadline = Instant::now() + Duration::from_secs(10);
     let mut demolished = reply.iter().any(is_demolished);
     while !demolished && Instant::now() < deadline {
         let batch = game
@@ -365,18 +440,94 @@ pub(super) async fn run(game: &mut GameClient, r: &mut Runner<'_>) -> anyhow::Re
             .await?;
         demolished = batch.iter().any(is_demolished);
     }
-    ensure!(
-        demolished,
-        "no SCHouseDemolished(tl {house_tl}) after /house forcedemo: {texts:?}"
-    );
-    r.end(s, format!("house {house_obj} demolished ({texts:?})"));
-
-    let s = r.begin("game.leave");
-    super::coreloop::leave_world(game).await?;
-    r.end(s, "left");
-    Ok(())
+    if demolished {
+        r.end(s, format!("house {house_obj} demolished ({texts:?})"));
+        Ok(())
+    } else {
+        r.fail(
+            s,
+            format!("no SCHouseDemolished(tl {house_tl}) after /house forcedemo: {texts:?}"),
+        );
+        anyhow::bail!("house cleanup failed for tl {house_tl}")
+    }
 }
 
+/// Whether an item task removed/took `template` (design or tax certificates).
+fn taken_template(packets: &[Packet], template: u32) -> bool {
+    !super::coreloop::item_stacks(packets, template).is_empty()
+}
+
+/// Whether an item task removed the exact item id (design items are removed with `Seize`,
+/// which carries only the item id).
+fn removed_item_id(packets: &[Packet], item_id: u64) -> bool {
+    packets
+        .iter()
+        .filter(|p| p.is_sc(sc::SCItemTaskSuccessPacket))
+        .any(|p| {
+            let mut s = p.stream();
+            let parsed = (|| -> anyhow::Result<bool> {
+                s.read_u8()?; // task type
+                let count = s.read_u8()?;
+                for _ in 0..count {
+                    match s.read_u8()? {
+                        7 => {
+                            s.read_u8()?; // slot type
+                            s.read_u8()?; // slot
+                            let id = s.read_u64()?;
+                            s.read_u32()?; // template
+                            if id == item_id {
+                                return Ok(true);
+                            }
+                        }
+                        13 => {
+                            s.read_u8()?; // slot type
+                            s.read_u8()?; // slot
+                            let id = s.read_u64()?;
+                            if id == item_id {
+                                return Ok(true);
+                            }
+                        }
+                        4 => {
+                            s.read_u8()?;
+                            s.read_u8()?;
+                            let id = s.read_u64()?;
+                            s.read_i32()?;
+                            s.read_u32()?;
+                            if id == item_id {
+                                return Ok(true);
+                            }
+                        }
+                        5 | 6 | 15 => {
+                            s.read_u8()?;
+                            s.read_u8()?;
+                            s.read_u32()?;
+                            let id = s.read_u64()?;
+                            if id == item_id {
+                                return Ok(true);
+                            }
+                            s.read_u8()?;
+                            s.read_u8()?;
+                            s.read_i32()?;
+                            let len = s.read_i16()?;
+                            if len < 0 {
+                                anyhow::bail!("negative details");
+                            }
+                            s.read_bytes(len as usize)?;
+                            s.read_i64()?;
+                            s.read_i32()?;
+                            s.read_u32()?;
+                            s.read_u8()?;
+                            s.read_i64()?;
+                            s.read_i64()?;
+                        }
+                        _ => anyhow::bail!("unsupported item action"),
+                    }
+                }
+                Ok(false)
+            })();
+            parsed.unwrap_or(false)
+        })
+}
 /// Walk right next to `pos`.
 async fn move_near(game: &mut GameClient, pos: (f32, f32, f32)) -> anyhow::Result<()> {
     game.move_to_facing((pos.0 + 1.2, pos.1, pos.2), pos, 6000)
