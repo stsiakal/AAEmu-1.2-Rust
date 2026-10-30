@@ -301,6 +301,7 @@ async fn run_inner(
 
     // ---- turn in ----
     let s = r.begin("game.questchain.report");
+    let giver_known = game.state.units.contains_key(&giver_obj);
     let giver_at = game
         .state
         .units
@@ -339,9 +340,15 @@ async fn run_inner(
             )
         })
         .collect();
+    // A refused report means the server no longer has the giver in the character's world (an
+    // object id reused after a despawn): say whether the client was still shown it.
+    let giver_note = format!(
+        "giver {giver_obj} announced before the walk: {giver_known}, afterwards: {}",
+        game.state.units.contains_key(&giver_obj)
+    );
     let note = format!(
         "SCQuestContextCompleted {:?}; reward item {REWARD} received {reward}; item tasks \
-         {tasks:?}; answers {}",
+         {tasks:?}; {giver_note}; answers {}",
         completed,
         packet_summary(&answers)
     );
