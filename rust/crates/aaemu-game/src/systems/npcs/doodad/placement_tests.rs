@@ -750,12 +750,14 @@ fn real_seed_and_sapling_templates_use_the_1_2_placement_rules() {
     assert!(placement::doodad_overlaps(rice_shape, fig_shape));
     let fig_shape = placement::Shape::of(fig, (1.6, 0.0, 110.0));
     assert!(!placement::doodad_overlaps(rice_shape, fig_shape));
-    // The 30 m rule is inclusive (`> 900` refuses) and uses z.
-    let far = |x: f32, z: f32| x.powi(2) + (z - 110.0).powi(2) >= 900.0;
-    assert!(!far(29.0, 110.0));
-    assert!(far(30.0, 110.0));
-    assert!(far(0.0, 140.0));
-    assert!(!far(0.0, 139.0));
+    // The 30 m rule is inclusive (`> 900` refuses) and uses z: run the production check.
+    let player = (0.0, 0.0, 110.0);
+    assert!(placement::in_place_range(player, (29.0, 0.0, 110.0)));
+    assert!(placement::in_place_range(player, (30.0, 0.0, 110.0)));
+    assert!(!placement::in_place_range(player, (30.01, 0.0, 110.0)));
+    assert!(placement::in_place_range(player, (0.0, 0.0, 139.0)));
+    assert!(placement::in_place_range(player, (0.0, 0.0, 140.0)));
+    assert!(!placement::in_place_range(player, (0.0, 0.0, 140.01)));
 }
 
 /// The real rice seed and fig sapling driven through `CSCreateDoodadPacket`'s handler: the real

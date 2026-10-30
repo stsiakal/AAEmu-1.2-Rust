@@ -713,19 +713,14 @@ const FAKE_PINE_DOODAD: u32 = 398;
 const FAKE_PINE_ITEM: u32 = 14898;
 const UPROOT_SKILL: u32 = 13789;
 
-/// Test-only override of the fake trial's evidence kind (`0` damage, `1` kill, `2` fake pine).
-#[cfg(test)]
-static FORCED_FAKE_TRIAL_RNG: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
-
-fn fake_trial_evidence_kind() -> u32 {
+/// `0` damage, `1` kill, `2` fake pine; tests queue exact kinds on the server's crime manager.
+fn fake_trial_evidence_kind(crimes: &crate::systems::social::crime::CrimeManager) -> u32 {
     #[cfg(test)]
-    if let Some(v) = FORCED_FAKE_TRIAL_RNG
-        .lock()
-        .expect("fake trial rng poisoned")
-        .take()
-    {
+    if let Some(v) = crimes.next_forced_fake_trial_rng() {
         return v;
     }
+    #[cfg(not(test))]
+    let _ = crimes;
     rand::random::<u32>() % 3
 }
 
@@ -788,7 +783,7 @@ impl CrimeFakeTrialSubCommand {
             let pos = world_position(server, &target_obj);
             let mut fake_pine = None;
             let mut skill_id = 0u32;
-            let rng: u32 = fake_trial_evidence_kind();
+            let rng: u32 = fake_trial_evidence_kind(crimes);
             // rng = 1; // for fixed murder
             let evidence = match rng {
                 0 => crimes.generate_evidence_from_damage(
@@ -1570,7 +1565,7 @@ mod tests {
         for (id, name) in [(1, "Gm"), (2, "Crook"), (3, "Victim")] {
             server.names.add_character(id, name, 1000 + id);
         }
-        *super::FORCED_FAKE_TRIAL_RNG.lock().expect("fake trial rng") = Some(2); // the fake-pine branch
+        server.systems.social.crimes.queue_fake_trial_rng(&[2]); // the fake-pine branch
         let (_, out) = harness::run(&server, &gm.p, "crime fake crook victim evidence=1").await;
         assert_eq!(
             out,

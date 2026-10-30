@@ -101,6 +101,13 @@ fn distance_squared(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
     (a.0 - b.0).powi(2) + (a.1 - b.1).powi(2) + (a.2 - b.2).powi(2)
 }
 
+/// `FUN_393a8fa0` step 3: the spot is at most 30 m from the player in 3D (`900.0 < d²` refuses,
+/// so exactly 30 m is allowed).
+pub fn in_place_range(player: (f32, f32, f32), pos: (f32, f32, f32)) -> bool {
+    let distance_squared = distance_squared(player, pos);
+    distance_squared.is_finite() && distance_squared <= PLACE_RANGE * PLACE_RANGE
+}
+
 /// The 1.2 doodad-overlap test: spheres on the sum of radii when both doodads are round. Every
 /// other pair uses an oriented box test (`FUN_390318f0` / `FUN_39030ae0`) that is not decoded, so
 /// it is skipped: the server must never be stricter than the client (groups 72/69 plantables keep
@@ -152,9 +159,8 @@ pub fn refusal(
     }
     let player_pos = world.world_pos_rot(&WorldObject::from(player));
     let player_pos = (player_pos.x, player_pos.y, player_pos.z);
-    let distance_squared = distance_squared(player_pos, pos);
     // `_DAT_399d2464 < d²` in `FUN_393a8fa0` (~761319): exactly 900 (30 m) is allowed.
-    if !distance_squared.is_finite() || distance_squared > PLACE_RANGE * PLACE_RANGE {
+    if !in_place_range(player_pos, pos) {
         return Some(Refusal::TooFar);
     }
     let new = Shape::of(template, pos);
