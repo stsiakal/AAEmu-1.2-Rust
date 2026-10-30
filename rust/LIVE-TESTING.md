@@ -313,8 +313,9 @@ within 1 m of the point straight north of its slot that its own command asked fo
 announcement, hostile boars run off at once) and walks back to where it began in the cleanup. A boar that moved makes
 the bot walk up to it and hit again; the refused hits are counted in the run variables `retry_too_far`,
 `retry_out_of_angle` and `retry_obstacle` (an intermittent server facing / line-of-sight refusal shows there, the soak
-dashboard sums them). Note that the server respawns `/spawn npc` NPCs (the runtime spawner stays in the world), so
-every run leaves a giver and boars behind until the server restarts.
+dashboard sums them). Note that the runtime spawner of a `/spawn npc` NPC tries to respawn it 15 s after it died or
+was despawned and fails (`Can't spawn npc N from spawnerId 0 - Template is null`, one WARN and one ERROR line per
+NPC in the server log): that noise is not a bot failure.
 
 `gather` (GM account) tops labor up, spawns iron vein 1671 with `/spawn doodad` and mines it with the vein's
 `DoodadFuncUse` skill 13986 (doodad target, 10 labor, 4.5 s cast, range 4). It requires `SkillResult` 0, a

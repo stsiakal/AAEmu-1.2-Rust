@@ -448,8 +448,9 @@ async fn spawn_npc(
 /// observation `seq` within [`SPAWN_TOLERANCE`] of `spawn_at`, the point this bot's command
 /// requested (GM-spawned NPCs carry no owner). It is judged by where the announcement placed it,
 /// not by where it is now: hostile boars run off at once. Another bot's spawn is a whole slot
-/// spacing away from `spawn_at`; of several units at the spot (an earlier run's respawned
-/// leftovers) the earliest announcement is the command's own, which is created synchronously.
+/// spacing away from `spawn_at`; of several units at the spot (leftovers of an earlier run, if
+/// the server respawned them) the earliest announcement is the command's own, which is created
+/// synchronously.
 fn own_spawn(
     units: &HashMap<u32, UnitInfo>,
     template: u32,
