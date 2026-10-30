@@ -12,11 +12,11 @@ use aaemu_game::GameServer;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
+use crate::combat::{self, CombatState, Mode};
 use crate::nav::{PlanCancel, PlanGate, RoadGraphCache};
+use crate::rotation::ClassData;
 
 /// Idle cadence of a bot between thinks (the cadence table / governor comes in P2/P3).
-const IDLE_THINK: Duration = Duration::from_millis(1_000);
-
 /// A bot character in the world on a socketless connection.
 pub struct BotSession {
     pub character_id: u32,
@@ -48,6 +48,10 @@ pub struct BotSession {
     /// Test hook: parks the next walk step between choosing it and sending it.
     #[cfg(test)]
     step_pause: std::sync::Mutex<Option<Arc<StepPause>>>,
+    /// The combat / survival brain (target, rotation, resting, death, counters).
+    brain: Mutex<CombatState>,
+    /// A navigation task is running (started by `goto` / the combat approach).
+    walking: Arc<AtomicBool>,
 }
 
 /// What became of one packet of a walk ([`BotSession::dispatch_walk`]).
@@ -94,7 +98,43 @@ impl BotSession {
             walk_deadline_cap_ms: AtomicU64::new(0),
             #[cfg(test)]
             step_pause: std::sync::Mutex::new(None),
+            brain: Mutex::new(CombatState::default()),
+            walking: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// The combat brain (tests, the `/bot` commands and the live report).
+    pub fn brain(&self) -> &Mutex<CombatState> {
+        &self.brain
+    }
+
+    /// `/bot fight` / `/bot grind`: switch what the bot hunts and think right away.
+    pub async fn set_mode(&self, mode: Mode) {
+        self.brain.lock().await.mode = mode;
+        *self.next_think.lock().await = Instant::now();
+    }
+
+    /// A running navigation task (`goto`, the combat approach / flee / loot walks).
+    pub fn walking(&self) -> bool {
+        self.walking.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_walking(&self, walking: bool) {
+        self.walking.store(walking, Ordering::Relaxed);
+    }
+
+    /// Installs the class data of this bot: its archetype, rotation, level gap and cadence.
+    /// Called by the host before the bot is on the roster.
+    pub async fn configure(&self, class: Option<&ClassData>, max_gap: u8, tick_ms: u64) {
+        let ability = self.player().await.map(|p| p.data().ability1);
+        let archetype = ability
+            .and_then(|a| class.and_then(|c| c.for_ability(a)))
+            .cloned();
+        let rotation = archetype
+            .as_ref()
+            .and_then(|a| class.and_then(|c| c.rotation_for(a)));
+        let mut brain = self.brain.lock().await;
+        combat::configure(&mut brain, archetype, rotation, max_gap, tick_ms);
     }
 
     /// The active character (`None` in the lobby or after a logout).
@@ -300,25 +340,26 @@ impl BotSession {
     /// One scheduler pass. Services the connection's commands every tick; the think itself
     /// (draining replies; the AI in P2) runs on the per-bot `next_think` cadence.
     /// `false` = the connection is closing and the host must disconnect it.
-    pub async fn tick(&self, server: &GameServer) -> bool {
-        let mut conn = self.conn.lock().await;
-        if !conn.service_commands(server).await {
-            return false;
-        }
-        let now = Instant::now();
-        let mut next = self.next_think.lock().await;
-        if now >= *next {
-            let jitter = Duration::from_millis(u64::from(self.character_id % 250));
-            *next = now + IDLE_THINK + jitter;
-            let replies = conn.drain();
-            if !replies.is_empty() {
-                tracing::trace!(
-                    character_id = self.character_id,
-                    frames = replies.len(),
-                    "Bots: drained replies"
-                );
+    pub async fn tick(self: &Arc<Self>, server: &Arc<GameServer>) -> bool {
+        {
+            let mut conn = self.conn.lock().await;
+            if !conn.service_commands(server).await {
+                return false;
             }
         }
+        let due = {
+            let next = self.next_think.lock().await;
+            Instant::now() >= *next
+        };
+        if !due {
+            return true;
+        }
+        let mut next = self.next_think.lock().await;
+        if Instant::now() < *next {
+            return true;
+        }
+        let wait = combat::think(self, server).await;
+        *next = Instant::now() + wait.max(Duration::from_millis(20));
         true
     }
 

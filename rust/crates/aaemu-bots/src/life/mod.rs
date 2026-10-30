@@ -16,10 +16,9 @@ use aaemu_game::GameServer;
 
 use crate::host::BotSession;
 
-/// Race / gender / ability of a generated bot character (Nuian fighter, the first ability set).
+/// Race / gender of a generated bot character (Nuian; the archetype picks the creation tree).
 const BOT_RACE: u8 = 1;
 const BOT_GENDER: u8 = 1;
-const BOT_ABILITY: u8 = 1;
 
 /// What `CSSpawnCharacterPacket` carries for a client (every optional visual block present), so
 /// `SCUnitStatePacket` is complete for the observers of the bot.
@@ -42,6 +41,7 @@ pub async fn login(
     server: &GameServer,
     config: &BotsConfig,
     name: &str,
+    creation_ability: Option<u8>,
 ) -> anyhow::Result<Arc<BotSession>> {
     if server.world.character_by_name(name).is_some() {
         anyhow::bail!("'{name}' is already in the world");
@@ -49,7 +49,7 @@ pub async fn login(
     let (account, characters) = bot_account(server, config, name).await?;
     let mut conn = SocketlessConnection::new(server, account);
     // A failed add must not leave a phantom connection in `server.connections`.
-    match login_with(server, name, characters, &mut conn).await {
+    match login_with(server, name, characters, creation_ability, &mut conn).await {
         Ok((character_id, name, obj_id)) => {
             tracing::info!(
                 "Bots: '{name}' (character {character_id}, obj {obj_id}) entered the world on account {account}"
@@ -139,6 +139,7 @@ async fn login_with(
     server: &GameServer,
     name: &str,
     characters: Vec<Character>,
+    creation_ability: Option<u8>,
     conn: &mut SocketlessConnection,
 ) -> anyhow::Result<(u32, String, u32)> {
     conn.conn.characters = characters;
@@ -157,7 +158,7 @@ async fn login_with(
                 gender: BOT_GENDER,
                 body_items: [0; 7],
                 model_params: Default::default(),
-                ability1: BOT_ABILITY,
+                ability1: creation_ability.unwrap_or(1),
                 ability2: ability::NONE,
                 ability3: ability::NONE,
                 level: 1,

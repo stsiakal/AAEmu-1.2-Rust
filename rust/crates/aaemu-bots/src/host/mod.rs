@@ -21,8 +21,10 @@ pub use session::BotSession;
 pub(crate) use session::StepPause;
 pub(crate) use session::WalkSend;
 
+use crate::combat::Mode;
 use crate::nav::movement::Goto;
 use crate::nav::{PlanGate, RoadGraphCache};
+use crate::rotation::ClassData;
 
 /// The scheduler tick: connection commands are serviced this often.
 const HOST_TICK: Duration = Duration::from_millis(250);
@@ -44,6 +46,9 @@ pub struct BotHost {
     plan_gate: Arc<PlanGate>,
     /// The road graphs of this host's server, shared by all its bots.
     roads: RoadGraphCache,
+    /// The archetypes and rotations the bots grow and fight with (`None` without class data:
+    /// combat then scores the skill tables only).
+    class: Option<ClassData>,
     bots: Mutex<HashMap<u32, Arc<BotSession>>>,
 }
 
@@ -53,9 +58,15 @@ impl BotHost {
             server: Arc::downgrade(server),
             plan_gate: Arc::new(PlanGate::new(config.plan_concurrency)),
             roads: RoadGraphCache::default(),
+            class: None,
             config,
             bots: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Installs the class data loaded from `Bots.ArchetypesFile` / `Bots.RotationDir`.
+    pub fn install_class_data(&mut self, class: ClassData) {
+        self.class = Some(class);
     }
 
     /// Spawns the one host task (it exits once the server is dropped).
@@ -93,13 +104,30 @@ impl BotHost {
         }
     }
 
-    /// `/bot add <name>`: creates the character on the bot account when missing, then logs it in
-    /// through the real select/spawn/notify path. Returns the character id.
-    pub async fn add(&self, server: &GameServer, name: &str) -> anyhow::Result<u32> {
+    /// `/bot add <name> [archetype]`: creates the character (on the archetype's creation tree
+    /// when it is new) on the bot account, then logs it in through the real
+    /// select/spawn/notify path. Returns the character id.
+    pub async fn add(
+        &self,
+        server: &GameServer,
+        name: &str,
+        archetype: Option<&str>,
+    ) -> anyhow::Result<u32> {
         let name = name.trim();
         if name.is_empty() {
-            anyhow::bail!("usage: /bot add <name>");
+            anyhow::bail!("usage: /bot add <name> [archetype]");
         }
+        let creation_ability = match archetype {
+            Some(key) => match self.class.as_ref().and_then(|c| c.get(key)) {
+                Some(a) => Some(a.creation_ability()),
+                None => anyhow::bail!("unknown archetype '{key}' (see /bot list or Bots.ArchetypesFile)"),
+            },
+            None => self
+                .class
+                .as_ref()
+                .and_then(|c| c.default_archetype())
+                .map(|a| a.creation_ability()),
+        };
         {
             let roster = self.bots.lock().await;
             if roster.len() >= self.config.max_bots {
@@ -112,7 +140,7 @@ impl BotHost {
                 anyhow::bail!("'{name}' is already a live bot");
             }
         }
-        let bot = crate::life::login(server, &self.config, name).await?;
+        let bot = crate::life::login(server, &self.config, name, creation_ability).await?;
         self.adopt(server, bot).await
     }
 
@@ -123,6 +151,8 @@ impl BotHost {
         let character_id = bot.character_id;
         bot.install_plan_gate(self.plan_gate.clone());
         bot.install_road_cache(self.roads.clone());
+        bot.configure(self.class.as_ref(), self.config.max_target_level_gap, self.config.brain_tick_ms)
+            .await;
         let refusal = {
             let mut roster = self.bots.lock().await;
             if roster.len() >= self.config.max_bots {
@@ -200,6 +230,42 @@ impl BotHost {
             anyhow::bail!("no live bot named '{}'", name.trim());
         };
         Ok(bot.start_goto(server, target, radius))
+    }
+
+    /// `/bot fight <name> [template]`: hunt any monster (or only `template`) within `radius`.
+    pub async fn fight(&self, name: &str, wanted: Vec<u32>, radius: f32) -> anyhow::Result<()> {
+        let Some(bot) = self.bot(name.trim()).await else {
+            anyhow::bail!("no live bot named '{}'", name.trim());
+        };
+        bot.set_mode(Mode::Fight { wanted, radius }).await;
+        Ok(())
+    }
+
+    /// `/bot grind <name> <radius>`: kill and loot around the bot's current position.
+    pub async fn grind(&self, name: &str, radius: f32) -> anyhow::Result<()> {
+        let Some(bot) = self.bot(name.trim()).await else {
+            anyhow::bail!("no live bot named '{}'", name.trim());
+        };
+        let (x, y, _) = bot
+            .position()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("'{}' is not in the world", name.trim()))?;
+        bot.set_mode(Mode::Grind {
+            center: (x, y),
+            radius: radius.max(5.0),
+        })
+        .await;
+        Ok(())
+    }
+
+    /// `/bot stop <name>`: stop hunting (the bot stays logged in).
+    pub async fn stop(&self, name: &str) -> anyhow::Result<()> {
+        let Some(bot) = self.bot(name.trim()).await else {
+            anyhow::bail!("no live bot named '{}'", name.trim());
+        };
+        bot.cancel_navigation();
+        bot.set_mode(Mode::Idle).await;
+        Ok(())
     }
 
     /// `/bot list`.

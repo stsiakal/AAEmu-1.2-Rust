@@ -13,12 +13,18 @@
 //!
 //! [`GameConnection`]: aaemu_game::net::connection::GameConnection
 
+pub mod combat;
 pub mod commands;
+#[cfg(test)]
+mod combat_flow_tests;
+#[cfg(test)]
+mod combat_real_data_tests;
 #[cfg(test)]
 mod flow_tests;
 pub mod host;
 pub mod life;
 pub mod nav;
+pub mod rotation;
 #[cfg(test)]
 mod nav_flow_tests;
 #[cfg(test)]
@@ -38,7 +44,30 @@ pub fn install(server: &Arc<GameServer>) -> anyhow::Result<()> {
         tracing::info!("Bots: disabled (Bots.Enabled=false)");
         return Ok(());
     }
-    let host = Arc::new(BotHost::new(server, config.clone()));
+    let class = match rotation::ClassData::load(
+        &config.archetypes_file,
+        &config.rotation_dir,
+        &config.default_archetype,
+    ) {
+        Ok(class) => Some(class),
+        Err(e) => {
+            tracing::error!("Bots: class data not loaded ({e}); combat uses the data scoring");
+            None
+        }
+    };
+    let mut host = BotHost::new(server, config.clone());
+    if let Some(class) = class {
+        tracing::info!(
+            "Bots: {} archetypes, {} rotations loaded",
+            class.archetypes().len(),
+            class.archetypes()
+                .iter()
+                .filter(|a| class.rotation_for(a).is_some())
+                .count()
+        );
+        host.install_class_data(class);
+    }
+    let host = Arc::new(host);
     commands::register(server, &host);
     host.start();
     tracing::info!(
