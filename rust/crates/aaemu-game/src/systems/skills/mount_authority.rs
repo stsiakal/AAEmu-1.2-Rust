@@ -199,6 +199,22 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 0, "no vehicle bar skills loaded");
+        // Independent pairs from the 1.2 data: mount skill 16 -> 10473 is the steel cannon's
+        // bar (slave 10), mount skill 34 -> 13350 a slave bar skill.
+        assert_eq!(vehicles.mount_skill_skill_id(16), 10_473);
+        let cannon = Entity::new(0x301, crate::models::slave::Slave::new(2, 10));
+        assert!(may_use_vehicle_skill(
+            &server,
+            &WorldObject::from(&cannon),
+            10_473
+        ));
+        assert_eq!(vehicles.mount_skill_skill_id(34), 13_350);
+        let cart = Entity::new(0x302, crate::models::slave::Slave::new(3, 79));
+        assert!(may_use_vehicle_skill(
+            &server,
+            &WorldObject::from(&cart),
+            13_350
+        ));
         // Summonable vehicles with no `slave_mount_skills` rows in the 1.2 data: there is no
         // bar skill to authorize, so the strict allowlist must not invent one.
         for slave_id in [7u32, 9, 6, 3, 45, 52, 86, 18, 12, 13] {

@@ -334,6 +334,23 @@ pub trait NpcSkillHooks: Send + Sync {
         not_ported("Portals.AddPrivatePortal");
     }
 
+    /// [`Self::add_private_portal`] with an id already taken before the reagent was paid.
+    #[allow(clippy::too_many_arguments)]
+    fn add_private_portal_with_id(
+        &self,
+        _server: &GameServer,
+        _player: &PlayerRef,
+        _id: u32,
+        _x: f32,
+        _y: f32,
+        _z: f32,
+        _z_rot: f32,
+        _zone_id: u32,
+        _name: &str,
+    ) {
+        not_ported("Portals.AddPrivatePortal");
+    }
+
     /// `character.Portals.ChangePrivatePortalName(id, name)` (`SavePortal`).
     fn rename_private_portal(
         &self,
@@ -452,9 +469,41 @@ pub trait ItemSkillHooks: Send + Sync {
         None
     }
 
-    /// Atomically take `amount` of `template_id` from the player's inventory (bag / equipment /
-    /// bank). `None` when the implementation does not track items; `Some(false)` when the full
-    /// amount was not available (nothing is consumed then).
+    /// Reserve the owned item `item_id` for cast `token` (owner, template and count checked).
+    /// Trading, selling or destroying it is refused while reserved; `None` when the
+    /// implementation does not track items.
+    fn reserve_owned_item(
+        &self,
+        _server: &GameServer,
+        _player: &PlayerRef,
+        _item_id: u64,
+        _expected_template_id: u32,
+        _amount: i32,
+        _token: u64,
+    ) -> Option<bool> {
+        None
+    }
+
+    /// Release a reservation held by `token`; a different owner's reservation is untouched.
+    fn release_owned_item(&self, _server: &GameServer, _item_id: u64, _token: u64) {}
+
+    /// Consume a reserved item under one container lock and release the reservation.
+    fn consume_reserved_item(
+        &self,
+        _server: &GameServer,
+        _player: &PlayerRef,
+        _item_id: u64,
+        _expected_template_id: u32,
+        _amount: i32,
+        _token: u64,
+    ) -> Option<bool> {
+        None
+    }
+
+    /// Take `amount` of `template_id` from the player's inventory (bag / equipment / bank).
+    /// The full amount is checked under the economy operation lock before the debit, so
+    /// `Some(false)` means nothing was consumed. `None` when the implementation does not track
+    /// items.
     fn take_item_template(
         &self,
         _server: &GameServer,

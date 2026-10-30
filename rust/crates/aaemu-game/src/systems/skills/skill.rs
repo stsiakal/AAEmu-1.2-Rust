@@ -1640,6 +1640,26 @@ fn append_hostile_ships_hit_by_siege_hull_aoe(
     }
 }
 
+/// Releases an item reservation if the effect pipeline returns without consuming it.
+struct ItemCastReservation<'a> {
+    server: &'a GameServer,
+    item_id: u64,
+    token: u64,
+    active: bool,
+}
+
+impl Drop for ItemCastReservation<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.server.systems.skills.ext.items().release_owned_item(
+                self.server,
+                self.item_id,
+                self.token,
+            );
+        }
+    }
+}
+
 /// `Skill.ApplyEffects(caster, casterCaster, targetSelf, targetCaster, skillObject)`.
 pub fn apply_effects(server: &GameServer, skill: &SkillRef, ctx: &CastCtx) {
     let caster = &ctx.caster;
@@ -1969,6 +1989,41 @@ pub fn apply_effects(server: &GameServer, skill: &SkillRef, ctx: &CastCtx) {
         }
     }
 
+    // Reserve the cast item under one lock before any effect runs: the owner, template and
+    // count must still match, and trading / selling / destroying it is refused until this cast
+    // either consumes it or releases the reservation (on a cancelled effect).
+    let mut reservation = None;
+    if let (Some((item_id, template_id, amount)), Some(p)) = (owned_item_use, &player) {
+        let token = u64::from(skill.tl_id());
+        match items.reserve_owned_item(server, p, item_id, template_id, amount, token) {
+            Some(true) => {
+                reservation = Some(ItemCastReservation {
+                    server,
+                    item_id,
+                    token,
+                    active: true,
+                });
+            }
+            Some(false) => {
+                skill.state().cancelled = true;
+                stop(server, skill, caster, 0);
+                return;
+            }
+            None => {
+                // Hooks that do not track items: keep the owner-check semantics with the read
+                // API they provide.
+                let ok = items
+                    .owned_item(server, p, item_id)
+                    .is_some_and(|(tid, count)| tid == template_id && count >= amount.max(0));
+                if !ok {
+                    skill.state().cancelled = true;
+                    stop(server, skill, caster, 0);
+                    return;
+                }
+            }
+        }
+    }
+
     // Weighted selection
     let weighted_total: i32 = to_apply.iter().map(|(_, e)| e.weight).sum();
     let mut selected = -1i32;
@@ -2142,22 +2197,39 @@ pub fn apply_effects(server: &GameServer, skill: &SkillRef, ctx: &CastCtx) {
             }
         }
     }
-    if !skill.cancelled() {
-        if let (Some((item_id, template_id, amount)), Some(p)) = (owned_item_use, &player) {
-            if amount > 0 {
-                // Atomic check + consume: only the owned item with the validated template is
-                // taken, even if another task moved or used it since the cast began.
-                match items.consume_owned_item(server, p, item_id, template_id, amount) {
-                    Some(true) => {}
-                    Some(false) => tracing::warn!(
+    if let Some(mut reserved) = reservation {
+        if skill.cancelled() {
+            // Dropping the guard releases the reservation; a cancelled effect keeps the item.
+        } else if let (Some((item_id, template_id, amount)), Some(p)) = (owned_item_use, &player) {
+            match items.consume_reserved_item(
+                server,
+                p,
+                item_id,
+                template_id,
+                amount,
+                reserved.token,
+            ) {
+                Some(true) => reserved.active = false,
+                Some(false) => {
+                    // The reservation should make this unreachable; never grant the effect
+                    // without taking the item.
+                    tracing::error!(
                         item_id,
                         template_id,
-                        "SkillItem changed or left the bag before its consumption"
-                    ),
-                    None => consumed_items.push((item_id, amount)),
+                        "reserved SkillItem could not be consumed after the effect"
+                    );
+                    skill.state().cancelled = true;
+                }
+                None => {
+                    reserved.active = false;
+                    if amount > 0 {
+                        consumed_items.push((item_id, amount));
+                    }
                 }
             }
         }
+    }
+    if !skill.cancelled() {
         if let Some(p) = &player {
             for (item, amount) in consumed_items {
                 items.consume_item_by_id(server, p, item, amount);

@@ -947,7 +947,7 @@ impl ItemSkillHooks for EconomyForSkills {
     fn consume_owned_item(
         &self,
         server: &GameServer,
-        _player: &PlayerRef,
+        player: &PlayerRef,
         item_id: u64,
         expected_template_id: u32,
         amount: i32,
@@ -957,9 +957,10 @@ impl ItemSkillHooks for EconomyForSkills {
         };
         let mut txn = ItemTxn::begin(server);
         let mut guard = lock(&container);
-        let matches = guard
-            .get_item_by_id(item_id)
-            .is_some_and(|item| item.template_id == expected_template_id);
+        let matches = guard.get_item_by_id(item_id).is_some_and(|item| {
+            item.template_id == expected_template_id
+                && item.owner_id == u64::from(player.character_id)
+        });
         if !matches {
             return Some(false);
         }
@@ -978,6 +979,79 @@ impl ItemSkillHooks for EconomyForSkills {
         Some(true)
     }
 
+    fn reserve_owned_item(
+        &self,
+        server: &GameServer,
+        player: &PlayerRef,
+        item_id: u64,
+        expected_template_id: u32,
+        amount: i32,
+        token: u64,
+    ) -> Option<bool> {
+        if !server.items.reserve_item(item_id, token) {
+            return Some(false);
+        }
+        let ok = server
+            .items
+            .holding_container(item_id)
+            .is_some_and(|container| {
+                let guard = lock(&container);
+                guard.get_item_by_id(item_id).is_some_and(|item| {
+                    item.template_id == expected_template_id
+                        && item.owner_id == u64::from(player.character_id)
+                        && (amount <= 0 || item.count >= amount)
+                })
+            });
+        if !ok {
+            server.items.release_item(item_id, token);
+        }
+        Some(ok)
+    }
+
+    fn release_owned_item(&self, server: &GameServer, item_id: u64, token: u64) {
+        server.items.release_item(item_id, token);
+    }
+
+    fn consume_reserved_item(
+        &self,
+        server: &GameServer,
+        player: &PlayerRef,
+        item_id: u64,
+        expected_template_id: u32,
+        amount: i32,
+        token: u64,
+    ) -> Option<bool> {
+        if server.items.reserved_by(item_id) != Some(token) {
+            return Some(false);
+        }
+        let ok = if let Some(container) = server.items.holding_container(item_id) {
+            let mut txn = ItemTxn::begin(server);
+            let mut guard = lock(&container);
+            let matches = guard.get_item_by_id(item_id).is_some_and(|item| {
+                item.template_id == expected_template_id
+                    && item.owner_id == u64::from(player.character_id)
+                    && (amount <= 0 || item.count >= amount)
+            });
+            if !matches {
+                false
+            } else if amount > 0 {
+                guard.consume_item(
+                    task_type::SKILL_REAGENTS,
+                    expected_template_id,
+                    amount,
+                    Some(item_id),
+                    &mut txn.env,
+                ) == amount
+            } else {
+                true
+            }
+        } else {
+            false
+        };
+        server.items.release_item(item_id, token);
+        Some(ok)
+    }
+
     fn take_item_template(
         &self,
         server: &GameServer,
@@ -989,9 +1063,15 @@ impl ItemSkillHooks for EconomyForSkills {
             return Some(true);
         }
         let mut txn = ItemTxn::begin(server);
+        let inv = Inv::of(player);
+        // The economy operation lock serialises item moves, so this count cannot change before
+        // the debit below: a missing reagent consumes nothing.
+        if inv.items_count(template_id, -1) < amount {
+            return Some(false);
+        }
         let consumed = inventory::consume_item(
             &mut txn,
-            &Inv::of(player),
+            &inv,
             None,
             task_type::SKILL_EFFECT_CONSUMPTION,
             template_id,

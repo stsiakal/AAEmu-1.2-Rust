@@ -1436,3 +1436,133 @@ async fn plot_only_item_skill_requires_the_owned_item() {
     assert_eq!(result, super::types::skill_result::INVALID_SOURCE);
     assert!(skill.cancelled());
 }
+
+const CAST_ITEM_SKILL: u32 = 20_010;
+const CAST_ITEM: u32 = 6_010;
+
+/// A non-reagent item skill with a 50 ms cast whose effect consumes the source item.
+fn cast_item_data() -> GameData {
+    use crate::data::items::ItemTemplate;
+    let mut data = mate_cast_data();
+    let mut skill = super::tests::skill_template(CAST_ITEM_SKILL);
+    skill.target_type = 0;
+    skill.damage_type_id = 0;
+    skill.casting_time = 50;
+    let mut effect = super::tests::skill_effect(900_001, super::data::EffectKind::HealEffect, 1);
+    effect.consume_source_item = true;
+    effect.consume_item_count = 1;
+    skill.effects.push(effect);
+    data.systems.skills.add_skill(skill);
+    let mut item = ItemTemplate::plain(CAST_ITEM, 10);
+    item.use_skill_id = CAST_ITEM_SKILL;
+    item.use_skill_as_reagent = false;
+    data.items.templates.insert(CAST_ITEM, item);
+    data
+}
+
+fn cast_item_packet(
+    player: &crate::world::PlayerRef,
+    item_id: u64,
+) -> super::handlers::CSStartSkillPacket {
+    use super::types::{SkillCastTarget, SkillCaster, SkillObject};
+    super::handlers::CSStartSkillPacket {
+        skill_id: CAST_ITEM_SKILL,
+        caster: SkillCaster::Item {
+            obj_id: player.obj_id,
+            item_id,
+            item_template_id: CAST_ITEM,
+            type1: 0,
+            type2: 0,
+        },
+        target: SkillCastTarget::Unit(player.obj_id),
+        flag: 0,
+        skill_object: SkillObject::None,
+    }
+}
+
+#[tokio::test]
+async fn loot_box_destroyed_during_the_cast_grants_no_effect() {
+    use crate::net::registry::ClientPacket;
+    use crate::systems::economy::inventory::Inv;
+    use crate::systems::economy::item_handlers::CSDestroyItemPacket;
+
+    let server = Arc::new(test_server_with(cast_item_data()));
+    server.set_self();
+    super::bind(&server);
+    crate::systems::economy::bridges::install(&server);
+    let mut client = TestClient::new(&server, 1, 1);
+    let a = spawn_player(
+        &server,
+        &client,
+        test_character(1, "Caster", 100.0, 100.0),
+        0x100,
+    );
+    client.conn.active_char = Some(a.clone());
+    a.data().unit.hp = 500;
+    a.data().unit.max_hp = 1000;
+    give_test_item(&server, &a, 0x7010, CAST_ITEM, 1);
+    super::handlers::start_skill(&server, &mut client.conn, cast_item_packet(&a, 0x7010));
+    CSDestroyItemPacket {
+        item_id: 0x7010,
+        slot_type: crate::models::container::slot_type::INVENTORY,
+        slot: 0,
+        count: 1,
+    }
+    .handle(&server, &mut client.conn)
+    .await
+    .expect("destroy");
+    assert_eq!(Inv::of(&a).items_count(CAST_ITEM, -1), 0);
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(a.data().unit.hp, 500, "the effect must not be granted");
+}
+
+#[tokio::test]
+async fn loot_box_traded_during_the_cast_grants_no_effect_and_leaves_the_partner_item() {
+    use crate::models::container::slot_type;
+    use crate::systems::economy::inventory::Inv;
+
+    let server = Arc::new(test_server_with(cast_item_data()));
+    server.set_self();
+    super::bind(&server);
+    crate::systems::economy::bridges::install(&server);
+    let mut client = TestClient::new(&server, 1, 1);
+    let other = TestClient::new(&server, 2, 2);
+    let a = spawn_player(
+        &server,
+        &client,
+        test_character(1, "Caster", 100.0, 100.0),
+        0x100,
+    );
+    let b = spawn_player(
+        &server,
+        &other,
+        test_character(2, "Trader", 101.0, 100.0),
+        0x101,
+    );
+    client.conn.active_char = Some(a.clone());
+    a.data().unit.hp = 500;
+    a.data().unit.max_hp = 1000;
+    give_test_item(&server, &a, 0x7011, CAST_ITEM, 1);
+    super::handlers::start_skill(&server, &mut client.conn, cast_item_packet(&a, 0x7011));
+    // The completed trade moves the same item id to the partner's bag.
+    let item = {
+        let bag = Inv::of(&a).bag();
+        let mut bag = bag.lock().unwrap();
+        let index = bag.items.iter().position(|i| i.id == 0x7011).expect("item");
+        bag.items.remove(index)
+    };
+    let mut item = item;
+    item.owner_id = u64::from(b.character_id);
+    let bag = Inv::of(&b).bag();
+    bag.lock().unwrap().items.push(item);
+    server.items.add_container(bag);
+    assert_eq!(Inv::of(&b).items_count(CAST_ITEM, -1), 1);
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(a.data().unit.hp, 500, "the effect must not be granted");
+    assert_eq!(
+        Inv::of(&b).items_count(CAST_ITEM, -1),
+        1,
+        "the partner's item is untouched"
+    );
+    let _ = slot_type::INVENTORY;
+}

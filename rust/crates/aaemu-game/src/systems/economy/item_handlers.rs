@@ -211,6 +211,13 @@ impl CSDestroyItemPacket {
                 tracing::warn!("DestroyItem: Invalid item...");
                 return;
             }
+            if server.items.reserved_by(item.id).is_some() {
+                tracing::warn!(
+                    "DestroyItem: item {} is reserved by a running cast, refused",
+                    item.id
+                );
+                return;
+            }
             let mut count = self.count;
             if count <= 0 {
                 // SusManager.LogActivity(CategoryCheating, ...)

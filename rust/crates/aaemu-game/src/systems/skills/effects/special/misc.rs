@@ -318,8 +318,22 @@ fn save_portal_targets_its_doodad(server: &GameServer, args: &EffectArgs<'_>) ->
     let Some(doodad) = target.as_doodad() else {
         return false;
     };
+    let (group, owner_db_id) = {
+        let d = doodad.data();
+        (d.func_group_id, d.owner_db_id)
+    };
+    if owner_db_id > 0 {
+        let Some(player) = args.caster.as_ref().and_then(WorldObject::as_player) else {
+            return false;
+        };
+        let Some(house) = crate::systems::housing::house_by_id(server, owner_db_id) else {
+            return false;
+        };
+        if !crate::systems::housing::allowed_to_interact(server, &house, player) {
+            return false;
+        }
+    }
     let data = &server.game_data.systems.npcs.doodad;
-    let group = doodad.data().func_group_id;
     let Some(func) = data.func_for_skill(group, skill.template.id) else {
         return false;
     };
@@ -379,6 +393,11 @@ pub fn save_portal(server: &GameServer, args: &EffectArgs<'_>, v: [i32; 4]) {
             );
             return;
         }
+        // Take the book id before the ink: a full book must refuse without spending it.
+        let Some(portal_id) = crate::systems::npcs::portal::next_private_portal_id(server) else {
+            tracing::warn!("SavePortal refused: the portal book has no free id");
+            return;
+        };
         // A book entry is only recorded when the cast actually pays its Memory Ink. Take
         // `skill_reagents` (11215) and effect-level items (16387) atomically here; `skill.rs`
         // skips its own reagent/effect-item debit for SavePortal.
@@ -443,7 +462,9 @@ pub fn save_portal(server: &GameServer, args: &EffectArgs<'_>, v: [i32; 4]) {
         }
         let pos = world_pos(server, &Target::Obj(caster.clone()));
         let zone_id = p.data().unit.transform.zone_id;
-        npcs.add_private_portal(server, p, pos.x, pos.y, pos.z, pos.rot_z, zone_id, name);
+        npcs.add_private_portal_with_id(
+            server, p, portal_id, pos.x, pos.y, pos.z, pos.rot_z, zone_id, name,
+        );
     } else {
         npcs.rename_private_portal(server, p, *id as u32, name);
     }
