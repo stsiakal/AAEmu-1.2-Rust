@@ -351,7 +351,12 @@ impl AreaTrigger {
     /// `OnDelete()`.
     pub fn on_delete(&self, server: &GameServer) {
         if let Some(buff_id) = self.inside_buff_id {
-            let units = self.state().units.clone();
+            // Deviation: the C# iterates `Units` again on every `RemoveAreaTrigger` call, and
+            // the same trigger is removed twice (`Doodad.Delete` and `DoodadFuncCloutTask`;
+            // also `Doodad.Delete` after a phase change). The second `OnDelete` then dropped a
+            // buff still held by another trigger of the same buff (two casters' comets on one
+            // ally). Taking the units makes removal idempotent.
+            let units = std::mem::take(&mut self.state().units);
             for unit in &units {
                 leave_unit(server, unit, buff_id);
             }
@@ -573,10 +578,24 @@ pub fn add_area_trigger(server: &GameServer, trigger: Arc<AreaTrigger>) {
 }
 
 /// `AreaTriggerManager.RemoveAreaTrigger(trigger)`: `OnDelete` now, removal at the end of the
-/// next tick. Note (C#): calling it twice runs `OnDelete` twice (trigger counts decremented
-/// twice).
+/// next tick. Deviation: the trigger is also dropped from its owner's `AttachAreaTriggers`
+/// (the C# leaves it there until the doodad's own `Delete`), so a later doodad delete does not
+/// run `OnDelete` on a trigger that already left, and `attached_to` reflects the live triggers.
+/// `OnDelete` itself takes its units, so a repeated removal is harmless (the C# decremented
+/// twice, see `AreaTrigger::on_delete`).
 pub fn remove_area_trigger(server: &GameServer, trigger: &Arc<AreaTrigger>) {
     trigger.on_delete(server);
+    if let Some(owner) = &trigger.owner {
+        let mut attached = lock(&server.systems.npcs.area_triggers.attached);
+        if let Some(list) = attached.get_mut(&owner.obj_id) {
+            if let Some(i) = list.iter().position(|t| Arc::ptr_eq(t, trigger)) {
+                list.remove(i);
+            }
+            if list.is_empty() {
+                attached.remove(&owner.obj_id);
+            }
+        }
+    }
     lock(&server.systems.npcs.area_triggers.remove_queue).push(trigger.clone());
 }
 

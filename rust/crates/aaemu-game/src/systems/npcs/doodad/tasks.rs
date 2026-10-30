@@ -45,6 +45,11 @@ pub enum FuncTaskKind {
     Tod { next_phase: i32 },
     /// `DoodadDeleteTask(owner)`.
     Delete,
+    /// `SpecialType.SpawnDoodad`'s delayed `doodad.Spawn()` (`SpawnDoodad.cs`:
+    /// `InitDoodad(); if (delay > 0) Thread.Sleep(delay); Spawn()`). The spawn runs first here
+    /// and then `InitDoodad`, because the C# effect held the game loop through the sleep: its
+    /// area triggers could not tick before the spawn, while the port's do.
+    Spawn,
     /// A family/link signal deferred while the target is processing an interaction.
     Pulse { source: DoodadRef, value: bool },
 }
@@ -305,6 +310,27 @@ pub fn cancel_func_task(doodad: &DoodadRef) -> bool {
     had
 }
 
+/// `SpecialType.SpawnDoodad`: `TaskManager.Schedule(doodad.Spawn(), delay)`. Not a `FuncTask`
+/// (generation 0): a phase change must not cancel the spawn.
+pub fn schedule_spawn(server: &GameServer, doodad: &DoodadRef, delay: Duration) {
+    schedule(
+        server,
+        DoodadTask {
+            world: server
+                .world
+                .world_of(&WorldObject::from(doodad))
+                .as_ref()
+                .map(Arc::downgrade),
+            doodad: doodad.clone(),
+            holder: doodad.clone(),
+            caster: None,
+            generation: 0,
+            kind: FuncTaskKind::Spawn,
+        },
+        delay,
+    );
+}
+
 /// `TaskManager.Schedule(new DoodadDeleteTask(doodad))` (no delay).
 pub fn schedule_delete(server: &GameServer, doodad: &DoodadRef) {
     schedule(
@@ -347,11 +373,14 @@ pub fn execute(server: &GameServer, task: DoodadTask) {
             ..
         }
     );
+    // A scheduled spawn's doodad is not in the world yet; a deleted one is not spawned.
+    let spawning = matches!(task.kind, FuncTaskKind::Spawn);
     if !respawning
         && (task.doodad.data().phase.deleted
-            || !world
-                .doodad(task.doodad.obj_id)
-                .is_some_and(|current| Arc::ptr_eq(&current, &task.doodad)))
+            || (!spawning
+                && !world
+                    .doodad(task.doodad.obj_id)
+                    .is_some_and(|current| Arc::ptr_eq(&current, &task.doodad))))
     {
         return;
     }
@@ -500,6 +529,19 @@ pub fn execute(server: &GameServer, task: DoodadTask) {
             phase::do_change_phase(&ctx, caster, next_phase);
         }
         FuncTaskKind::Delete => super::manager::delete(server, &ctx.world, &ctx.doodad),
+        FuncTaskKind::Spawn => {
+            tracing::trace!(
+                "[Doodad] SpawnDoodadTask: Doodad {}, TemplateId {template_id}",
+                ctx.doodad.obj_id
+            );
+            // `SpawnDoodad.cs`: `if (delay > 0) Thread.Sleep(delay); doodad.Spawn();` after its
+            // `InitDoodad()`. The C# sleep held the game loop, so the start phase ran before the
+            // spawn but no area tick could run between them; here the phase runs at the spawn
+            // (`spawn_pending` keeps a summoned clout's origin on the summon).
+            super::manager::spawn(server, &ctx.world, &ctx.doodad);
+            phase::init_doodad(&ctx);
+            ctx.doodad.data().spawn_pending = false;
+        }
         FuncTaskKind::Pulse { source, value } => {
             let source_ctx = DoodadCtx::new(server, ctx.world.clone(), source);
             super::logic::receive(&source_ctx, &ctx.doodad, caster, value);

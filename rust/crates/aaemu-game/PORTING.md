@@ -1869,6 +1869,27 @@ is no longer mirrored (see "Known deviations", dead NPC returned and healed).
   delete and again by its task, and the former -1 suppressed the buff of the next clout on the
   same unit.
 
+* systems::npcs (2026-10-30): `SpecialType.SpawnDoodad` with `value2 > 0` now runs its
+  `Spawn()` and then `InitDoodad()` together when the delay expires (a doodad task,
+  `spawn_pending` set meanwhile), instead of initialising at the cast and spawning from a bare
+  tokio task. The C# ran `InitDoodad()` first, but its `Thread.Sleep(delay)` held the game
+  loop, so no area tick could see the initialised, still invisible doodad before `Spawn()`.
+  The port's delayed spawn ran on the task runtime, and a clout whose `duration` was shorter
+  than `value2` ended (and deleted the doodad) while it was still pending. The start phase now
+  starts at the spawn, so e.g. the clout of a `SpawnDoodad` summon is applied for its full
+  duration after the doodad appears (deviation: C# phase tasks were scheduled at the cast, so
+  an over-due clout task fired right after the spawn). A `DoodadFuncClout` with
+  `UseOriginSource` of a `spawn_pending` summon keeps the summon as its area origin even
+  though it is visible at that moment (see the 2026-10-30 `UseOriginSource` entry above).
+
+* systems::npcs (2026-10-30): `AreaTrigger::on_delete` takes and clears its `units`, and
+  `RemoveAreaTrigger` drops the trigger from its owner's `AttachAreaTriggers`; the C# ran
+  `OnDelete` again on every removal and left the trigger attached until the owner doodad was
+  deleted. A clout with `NextPhase == -1` is removed by both `Doodad.Delete` and its
+  `DoodadFuncCloutTask`, and two casters' comets over one ally share the buff's trigger count:
+  the duplicate `OnDelete` decremented it twice, so the ally lost the buff when the first
+  clout ended. Removal is now idempotent.
+
 * systems::vehicles / managers::item (2026-10-15): the shared death hook ignores self-deaths
   of objects other than characters and mates instead of reporting a missing mate owner. A mate
   whose owner really is missing still logs the mate and owner object IDs. A successful item
