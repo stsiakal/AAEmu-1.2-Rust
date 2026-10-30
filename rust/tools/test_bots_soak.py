@@ -378,11 +378,12 @@ class ScenarioCommandTests(unittest.TestCase):
     def value(cmd: list[str], flag: str) -> str:
         return cmd[cmd.index(flag) + 1]
 
-    def test_the_command_carries_the_bots_slot_and_a_timeout_below_the_attempt_timeout(self):
+    def test_the_command_carries_the_bots_slot_a_body_timeout_and_a_cleanup_budget(self):
         runner = self.runner({"sk1b0": 0, "sk1b3": 3})
         cmd = runner.scenario_command("questchain", "sk1b3", Path("out.json"), None)
         self.assertEqual(self.value(cmd, "--slot"), "3")
-        self.assertEqual(self.value(cmd, "--scenario-timeout"), "225")
+        self.assertEqual(self.value(cmd, "--scenario-timeout"), "175")
+        self.assertEqual(self.value(cmd, "--cleanup-timeout"), str(bots_soak.CLEANUP_BUDGET))
         self.assertEqual(self.value(cmd, "--scenario"), "questchain")
         self.assertEqual(self.value(cmd, "--user"), "sk1b3")
         self.assertEqual(self.value(cmd, "--character"), "sk1b3")
@@ -403,17 +404,22 @@ class ScenarioCommandTests(unittest.TestCase):
         self.assertNotIn("--character", cmd)
         self.assertEqual(self.value(cmd, "--slot"), "1")
 
-    def test_the_scenario_timeout_leaves_the_cleanup_reserve_and_keeps_a_floor(self):
-        self.assertEqual(bots_soak.scenario_timeout(300), 300 - bots_soak.CLEANUP_RESERVE)
-        self.assertEqual(bots_soak.scenario_timeout(600), 600 - bots_soak.CLEANUP_RESERVE)
+    def test_the_scenario_timeout_leaves_the_login_and_cleanup_budgets_and_keeps_a_floor(self):
+        reserve = bots_soak.LOGIN_RESERVE + bots_soak.CLEANUP_BUDGET
+        self.assertEqual(bots_soak.scenario_timeout(300), 300 - reserve)
+        self.assertEqual(bots_soak.scenario_timeout(600), 600 - reserve)
         self.assertEqual(bots_soak.scenario_timeout(60), bots_soak.MIN_SCENARIO_TIMEOUT)
         cmd = self.runner({}, attempt_timeout=480).scenario_command("housing", "a", Path("o.json"), None)
-        self.assertEqual(self.value(cmd, "--scenario-timeout"), "405")
+        self.assertEqual(self.value(cmd, "--scenario-timeout"), "355")
+        self.assertEqual(self.value(cmd, "--cleanup-timeout"), "90")
 
     def test_the_default_leaves_housing_a_wide_margin(self):
-        # Housing took up to ~200 s of scenario time with 8 bots contending for its plot.
-        self.assertGreaterEqual(bots_soak.scenario_timeout(bots_soak.DEFAULT_ATTEMPT_TIMEOUT), 300)
-        self.assertGreater(bots_soak.DEFAULT_ATTEMPT_TIMEOUT, bots_soak.scenario_timeout(bots_soak.DEFAULT_ATTEMPT_TIMEOUT))
+        # Housing needs up to ~200 s of body with 8 bots contending for its plot, and the login
+        # and the cleanup of a hung body must fit in the attempt on top of it.
+        body = bots_soak.scenario_timeout(bots_soak.DEFAULT_ATTEMPT_TIMEOUT)
+        self.assertGreaterEqual(body, 250)
+        self.assertLessEqual(body + bots_soak.LOGIN_RESERVE + bots_soak.CLEANUP_BUDGET, bots_soak.DEFAULT_ATTEMPT_TIMEOUT)
+        self.assertGreater(bots_soak.DEFAULT_ATTEMPT_TIMEOUT, body)
 
 
 class ScenarioListTests(unittest.TestCase):

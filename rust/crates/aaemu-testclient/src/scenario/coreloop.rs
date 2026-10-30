@@ -16,9 +16,33 @@ use super::{BotConfig, Runner, QUIET};
 use crate::game::{GameClient, Packet};
 use crate::record::Recorder;
 
-/// The time limit of a core-loop scenario run (the body, not its cleanup) unless
-/// `--scenario-timeout` says otherwise; housing, the longest, takes about three minutes.
+/// The time limit of a core-loop scenario body unless `--scenario-timeout` says otherwise;
+/// housing, the longest, takes about three minutes.
 pub(super) const DEFAULT_SCENARIO_TIMEOUT: Duration = Duration::from_secs(420);
+
+/// The time limit of a core-loop scenario's cleanup unless `--cleanup-timeout` says otherwise. The
+/// longest cleanup is housing's after a failed re-select: up to ~40 s of waits to bring the
+/// character back into the world (the leave grant, the lobby, the select, the spawn), then the
+/// demolition of each house (up to ~15 s) and the destruction of the leftovers.
+pub(super) const DEFAULT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// The time limit of the leave of the world that ends a run: the logout timer (10 s) and the
+/// departure save, which queues behind the other bots' saves ([`GRANT_PATIENCE`]), and the final
+/// drain, with a few seconds to spare. A normal leave takes about 10.4 s.
+pub(super) const LEAVE_LIMIT: Duration = Duration::from_secs(45);
+
+/// How long the parts of a core-loop scenario run may take. Each part has a budget of its own that
+/// starts when the part does, so a body that ran out of time leaves the cleanup its whole budget,
+/// and a cleanup that ran out leaves the leave of the world its [`LEAVE_LIMIT`]. A run therefore
+/// takes at most the login and world entry, `body`, `cleanup` and [`LEAVE_LIMIT`]: the soak
+/// runner sizes the body limit by what its attempt timeout leaves after the others.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Limits {
+    /// The scenario body (`--scenario-timeout`).
+    pub body: Duration,
+    /// The cleanup that follows the body, whatever became of it (`--cleanup-timeout`).
+    pub cleanup: Duration,
+}
 
 /// The text of a panic payload.
 pub(super) fn panic_message(payload: &(dyn Any + Send)) -> String {
@@ -29,34 +53,42 @@ pub(super) fn panic_message(payload: &(dyn Any + Send)) -> String {
         .unwrap_or_else(|| "(no message)".to_string())
 }
 
-/// Runs a scenario body so that it ends in an error, never in a panic or a hang: a panic is
-/// caught and a body still running after `limit` is dropped at its next await point. Both become
-/// an error naming the step they stopped in, which leaves the caller its turn to clean up.
-pub(super) async fn guarded<F>(rec: &Recorder, limit: Duration, body: F) -> anyhow::Result<()>
+/// Runs a part of a scenario (`what`: "scenario", "scenario cleanup", ...) so that it ends in an
+/// error, never in a panic or a hang: a panic is caught and a part still running after `limit` is
+/// dropped at its next await point. Both become an error naming the step they stopped in, which
+/// leaves the caller its turn to go on with the next part.
+pub(super) async fn guarded<F>(
+    rec: &Recorder,
+    what: &str,
+    limit: Duration,
+    body: F,
+) -> anyhow::Result<()>
 where
     F: Future<Output = anyhow::Result<()>>,
 {
     match tokio::time::timeout(limit, AssertUnwindSafe(body).catch_unwind()).await {
         Ok(Ok(result)) => result,
         Ok(Err(payload)) => Err(anyhow!(
-            "scenario panicked in step {}: {}",
+            "{what} panicked in step {}: {}",
             rec.current_step(),
             panic_message(payload.as_ref())
         )),
         Err(_) => Err(anyhow!(
-            "scenario timed out after {limit:?} in step {}",
+            "{what} timed out after {limit:?} in step {}",
             rec.current_step()
         )),
     }
 }
 
 /// Runs a core-loop scenario after its GM check: the `body`, then `clean_up` and the leave of the
-/// world whatever became of the body (an error, a panic, the time `limit`), and returns the first
-/// error in that order. The three steps share `state`, which is what the cleanup has to undo.
+/// world whatever became of the previous part (an error, a panic, the time limit), and returns the
+/// first error in that order. The three parts share `state`, which is what the cleanup has to
+/// undo. Each part is bounded by a budget of its own (see [`Limits`], [`LEAVE_LIMIT`]), and the
+/// wait limit of the game client is put back to what the run began with before each of them.
 pub(super) async fn run_scenario<'r, S, Body, Clean>(
     game: &mut GameClient,
     r: &mut Runner<'r>,
-    limit: Duration,
+    limits: Limits,
     state: &mut S,
     body: Body,
     clean_up: Clean,
@@ -74,10 +106,21 @@ where
     ) -> BoxFuture<'a, anyhow::Result<()>>,
 {
     let rec = r.rec;
-    let result = guarded(rec, limit, body(game, r, state)).await;
+    // A part that is dropped at an await point cannot restore the wait limit it changed (the
+    // changes made through `with_timeout` are restored by their guard).
+    let default_timeout = game.timeout;
+    let result = guarded(rec, "scenario", limits.body, body(game, r, state)).await;
     let failed_in = result.is_err().then(|| rec.current_step());
-    let cleanup_result = clean_up(game, r, state).await;
-    let leave = leave_world(game).await;
+    game.timeout = default_timeout;
+    let cleanup_result = guarded(
+        rec,
+        "scenario cleanup",
+        limits.cleanup,
+        clean_up(game, r, state),
+    )
+    .await;
+    game.timeout = default_timeout;
+    let leave = guarded(rec, "leave of the world", LEAVE_LIMIT, leave_world(game)).await;
     if let Some(step) = failed_in {
         // The failure belongs to the step the body stopped in, not to the cleanup step that
         // ran after it (the outcome names the step that is current when the error is read).
@@ -250,11 +293,11 @@ pub(super) async fn await_leave(
     };
     let timer_ends_soon = answer.logout_ms.is_none_or(|ms| ms <= NORMAL_LOGOUT_MS);
     if !answer.granted && (must_grant || timer_ends_soon) {
-        let saved = game.timeout;
-        game.timeout = saved.max(GRANT_PATIENCE);
-        let granted = game.wait_sc(sc::SCLeaveWorldGrantedPacket).await;
-        game.timeout = saved;
-        granted?;
+        // The guard puts the limit back when this wait ends, also when a time limit drops it.
+        let patience = game.timeout.max(GRANT_PATIENCE);
+        game.with_timeout(patience)
+            .wait_sc(sc::SCLeaveWorldGrantedPacket)
+            .await?;
         answer.granted = true;
     }
     Ok(answer)
@@ -407,8 +450,9 @@ pub(super) fn removed_ids(p: &Packet) -> anyhow::Result<Vec<u32>> {
 }
 
 /// The spawn grid of bots that run the same scenario at the same time: [`SLOTS`] spots in a
-/// square grid, [`SLOT_SPACING`] metres apart. Each bot owns one slot for the whole run
-/// (`--slot N`, see [`bot_slot`]), so the NPCs it spawns never land near another bot's spot.
+/// square grid, [`SLOT_SPACING`] metres apart, around an origin the scenario fixes. Each bot owns
+/// one slot for the whole run (`--slot N`, see [`bot_slot`]), so the NPCs it spawns never land
+/// near another bot's spot.
 pub(super) const SLOTS: u32 = 16;
 const SLOT_COLUMNS: u32 = 4;
 pub(super) const SLOT_SPACING: f32 = 25.0;
@@ -429,8 +473,9 @@ fn trailing_number(name: &str) -> u32 {
 }
 
 /// The offset (east, north), in metres, of `slot` from the scenario origin: a 4 x 4 grid centred
-/// on it. The origin is where the bot stood when the scenario began, captured once, never the
-/// bot's current position (which drifts while it follows an NPC).
+/// on it. The origin is a constant of the scenario (never where the bot happens to stand, which
+/// depends on the scenario that ran before and drifts while it follows an NPC), so the spots of
+/// all bots are the same points and stay [`SLOT_SPACING`] apart.
 pub(super) fn slot_offset(slot: u32) -> (f32, f32) {
     let slot = slot % SLOTS;
     let centre = (SLOT_COLUMNS - 1) as f32 / 2.0;
@@ -857,7 +902,10 @@ pub(super) mod tests {
         let _ = run_scenario(
             &mut game,
             &mut r,
-            Duration::from_secs(5),
+            Limits {
+                body: Duration::from_secs(5),
+                cleanup: Duration::from_secs(5),
+            },
             &mut log,
             |_game, r, log| {
                 Box::pin(async move {
@@ -909,8 +957,25 @@ pub(super) mod tests {
     }
 
     /// Runs a scripted scenario of `body` then `clean_up` and returns what it did, its error and
-    /// whether the client left the world at the end.
+    /// whether the client left the world at the end. The body has `limit`, the cleanup 5 s.
     async fn drive<B, C>(limit: Duration, body: B, clean_up: C) -> (Log, anyhow::Result<()>, bool)
+    where
+        B: for<'a> Fn(&'a mut Log) -> BoxFuture<'a, anyhow::Result<()>>,
+        C: for<'a> Fn(&'a mut Log) -> BoxFuture<'a, anyhow::Result<()>>,
+    {
+        let limits = Limits {
+            body: limit,
+            cleanup: Duration::from_secs(5),
+        };
+        drive_limits(limits, body, clean_up).await
+    }
+
+    /// [`drive`] with the limits of the body and the cleanup both given.
+    async fn drive_limits<B, C>(
+        limits: Limits,
+        body: B,
+        clean_up: C,
+    ) -> (Log, anyhow::Result<()>, bool)
     where
         B: for<'a> Fn(&'a mut Log) -> BoxFuture<'a, anyhow::Result<()>>,
         C: for<'a> Fn(&'a mut Log) -> BoxFuture<'a, anyhow::Result<()>>,
@@ -927,7 +992,7 @@ pub(super) mod tests {
         let result = run_scenario(
             &mut game,
             &mut r,
-            limit,
+            limits,
             &mut log,
             |_game, _r, log| body(log),
             |_game, _r, log| clean_up(log),
@@ -1009,13 +1074,168 @@ pub(super) mod tests {
         assert!(left);
     }
 
+    // ---- every part has a budget of its own ----
+
+    /// A cleanup that works for `work` and then finishes.
+    async fn cleans_slowly(log: &mut Log, work: Duration) -> anyhow::Result<()> {
+        log.push("cleanup");
+        tokio::time::sleep(work).await;
+        log.push("cleaned");
+        Ok(())
+    }
+
+    async fn cleanup_hangs(log: &mut Log) -> anyhow::Result<()> {
+        log.push("cleanup");
+        std::future::pending().await
+    }
+
+    async fn cleanup_panics(log: &mut Log) -> anyhow::Result<()> {
+        log.push("cleanup");
+        panic!("cleanup boom")
+    }
+
+    #[tokio::test]
+    async fn the_cleanup_gets_its_whole_budget_after_a_body_that_ran_out_of_time() {
+        // The body is dropped after 100 ms and the cleanup then needs four times that: one that
+        // inherited the body's expired deadline would be dropped at once.
+        let limits = Limits {
+            body: Duration::from_millis(100),
+            cleanup: Duration::from_secs(3),
+        };
+        let (log, result, left) = drive_limits(
+            limits,
+            |log| Box::pin(hangs(log)),
+            |log| Box::pin(cleans_slowly(log, Duration::from_millis(400))),
+        )
+        .await;
+        assert_eq!(log, ["body", "cleanup", "cleaned"]);
+        let text = format!("{:#}", result.unwrap_err());
+        assert!(text.contains("scenario timed out after 100ms"), "{text}");
+        assert!(left);
+    }
+
+    #[tokio::test]
+    async fn a_cleanup_that_hangs_is_dropped_at_its_budget_and_the_leave_still_runs() {
+        let started = std::time::Instant::now();
+        let limits = Limits {
+            body: Duration::from_secs(5),
+            cleanup: Duration::from_millis(200),
+        };
+        let (log, result, left) = drive_limits(
+            limits,
+            |log| Box::pin(finishes(log)),
+            |log| Box::pin(cleanup_hangs(log)),
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert_eq!(log, ["body", "cleanup"]);
+        let text = format!("{:#}", result.unwrap_err());
+        assert!(
+            text.contains("scenario cleanup timed out after 200ms in step game.test.build"),
+            "{text}"
+        );
+        assert!(left, "the leave of the world must still run");
+
+        // The error of the body stays the first one.
+        let (log, result, left) = drive_limits(
+            limits,
+            |log| Box::pin(fails(log)),
+            |log| Box::pin(cleanup_hangs(log)),
+        )
+        .await;
+        assert_eq!(log, ["body", "cleanup"]);
+        assert_eq!(result.unwrap_err().to_string(), "the body failed");
+        assert!(left);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_cleanup_ends_in_an_error_and_the_leave_still_runs() {
+        let (log, result, left) = drive(
+            Duration::from_secs(5),
+            |log| Box::pin(finishes(log)),
+            |log| Box::pin(cleanup_panics(log)),
+        )
+        .await;
+        assert_eq!(log, ["body", "cleanup"]);
+        let text = format!("{:#}", result.unwrap_err());
+        assert!(
+            text.contains("scenario cleanup panicked in step game.test.build: cleanup boom"),
+            "{text}"
+        );
+        assert!(left);
+    }
+
+    #[tokio::test]
+    async fn the_wait_limit_a_dropped_part_changed_is_put_back_before_the_next_part() {
+        // A body, and then a cleanup, that raised the wait limit and were dropped at their await
+        // point could not restore it: each next part starts from the limit the run began with.
+        let (mut game, peer) = scripted_game();
+        let server = tokio::spawn(serve_leave(peer));
+        let rec = Recorder::new(false);
+        let mut r = Runner {
+            rec: &rec,
+            out: Default::default(),
+        };
+        let mut seen: Vec<Duration> = Vec::new();
+        let result = run_scenario(
+            &mut game,
+            &mut r,
+            Limits {
+                body: Duration::from_millis(100),
+                cleanup: Duration::from_millis(100),
+            },
+            &mut seen,
+            |game, _r, _seen| {
+                Box::pin(async move {
+                    game.timeout = Duration::from_secs(30);
+                    std::future::pending::<anyhow::Result<()>>().await
+                })
+            },
+            |game, _r, seen| {
+                Box::pin(async move {
+                    seen.push(game.timeout);
+                    game.timeout = Duration::from_secs(40);
+                    std::future::pending::<anyhow::Result<()>>().await
+                })
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(seen, [Duration::from_millis(400)]);
+        // The leave after the cleanup began from the default too, and put it back as it was.
+        assert_eq!(game.timeout, Duration::from_millis(400));
+        assert_eq!(server.await.unwrap().received, [cs::CSLeaveWorldPacket]);
+    }
+
+    #[tokio::test]
+    async fn a_grant_wait_that_a_time_limit_cuts_off_puts_the_wait_limit_back() {
+        // The prepare comes and the grant never does: the wait for it (30 s patience) is dropped
+        // by the caller's time limit, and the client must not stay at the long limit.
+        let (mut game, mut peer) = scripted_game();
+        let server = tokio::spawn(async move {
+            peer.expect(cs::CSLeaveWorldPacket).await;
+            peer.send(sc::SCPrepareLeaveWorldPacket, &prepare_body(10_000))
+                .await;
+            peer
+        });
+        game.leave_world(0).await.unwrap();
+        let cut =
+            tokio::time::timeout(Duration::from_millis(300), await_leave(&mut game, true)).await;
+        assert!(
+            cut.is_err(),
+            "the wait for the grant must still be going on"
+        );
+        assert_eq!(game.timeout, Duration::from_millis(400));
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn guarded_passes_a_result_through_untouched() {
         let rec = Recorder::new(false);
-        guarded(&rec, Duration::from_secs(5), async { Ok(()) })
+        guarded(&rec, "scenario", Duration::from_secs(5), async { Ok(()) })
             .await
             .unwrap();
-        let error = guarded(&rec, Duration::from_secs(5), async {
+        let error = guarded(&rec, "scenario", Duration::from_secs(5), async {
             anyhow::bail!("plain failure")
         })
         .await

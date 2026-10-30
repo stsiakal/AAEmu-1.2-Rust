@@ -161,7 +161,7 @@ pub(super) async fn run(
     run_scenario(
         game,
         r,
-        cfg.scenario_timeout(),
+        cfg.limits(),
         &mut cleanup,
         |game, r, cleanup| Box::pin(run_inner(game, r, cleanup)),
         |game, r, cleanup| Box::pin(cleanup_house(game, r, cleanup)),
@@ -489,15 +489,17 @@ async fn run_inner(
 /// The re-select of the finished house: leave to the lobby, select the character again, read the
 /// owned-house snapshot the select sends and enter the world. `cleanup.reselect` follows every
 /// step, so a failure anywhere (a missing snapshot, a house still reporting build actions) leaves
-/// the cleanup exactly the steps still missing and it runs in the world.
+/// the cleanup exactly the steps still missing and it runs in the world. The state is recorded
+/// before the packet of its step is sent: a send that the scenario's time limit cancels may still
+/// be written later, and the cleanup must then know that the leave or the select is under way.
 async fn reselect(
     game: &mut GameClient,
     cleanup: &mut Cleanup,
     house_tl: u16,
 ) -> anyhow::Result<HouseView> {
     let char_id = game.state.selected_char;
-    game.leave_world(1).await?;
     cleanup.reselect = Some(Reselect::Leaving(char_id));
+    game.leave_world(1).await?;
     // The prepare and the grant are read in whatever order they come.
     await_leave(game, true).await?;
     cleanup.reselect = Some(Reselect::Lobby(char_id));
@@ -508,8 +510,8 @@ async fn reselect(
         p.is_sc(sc::SCCharacterListPacket) && p.body.first() == Some(&1)
     })
     .await?;
-    game.select_character(char_id).await?;
     cleanup.reselect = Some(Reselect::Selected);
+    game.select_character(char_id).await?;
     let packet = game
         .wait_for("SCLoginCharInfoHousePacket", |p| {
             p.is_sc(sc::SCLoginCharInfoHousePacket)
@@ -530,12 +532,13 @@ async fn reselect(
 }
 
 /// The last steps into the world, from [`Reselect::Selected`] or [`Reselect::Spawned`]: spawn the
-/// character, wait for a unit state, send the in-game notices. The state advances after each step
-/// and is `None` once the character is in the world.
+/// character, wait for a unit state, send the in-game notices. The state advances with each step
+/// (before its packet is sent, as in [`reselect`]) and is `None` once the character is in the
+/// world.
 async fn finish_entry(game: &mut GameClient, cleanup: &mut Cleanup) -> anyhow::Result<()> {
     if cleanup.reselect == Some(Reselect::Selected) {
-        game.spawn_character().await?;
         cleanup.reselect = Some(Reselect::Spawned);
+        game.spawn_character().await?;
         game.wait_for("own SCUnitStatePacket after re-select", |p| {
             p.is_sc(sc::SCUnitStatePacket)
         })
@@ -734,10 +737,10 @@ async fn demolish(
 /// can run the GM demolition: it waits for a requested leave to complete, repeats the lobby steps
 /// and finishes the entry from wherever it stopped (`cleanup.reselect`).
 async fn reenter_world(game: &mut GameClient, cleanup: &mut Cleanup) -> anyhow::Result<()> {
-    let saved = game.timeout;
-    let result = reenter_world_steps(game, cleanup).await;
-    game.timeout = saved;
-    result
+    // The steps set their own wait limits; the guard puts the caller's back when they end, also
+    // when the cleanup's time limit drops them.
+    let mut game = game.with_timeout(game.timeout);
+    reenter_world_steps(&mut game, cleanup).await
 }
 
 async fn reenter_world_steps(game: &mut GameClient, cleanup: &mut Cleanup) -> anyhow::Result<()> {
@@ -1045,6 +1048,73 @@ mod tests {
         let peer = server.await.unwrap();
         // One spawn only: the cleanup did not spawn the character twice.
         assert_eq!(peer.received, [LEAVE_AND_SELECT, ENTRY].concat());
+    }
+
+    // A send that the scenario's time limit cancels midway may still be written later, so the
+    // state names a step before its packet is sent. A send that fails (the peer is gone) shows
+    // the order as well as a cancelled one does.
+
+    #[tokio::test]
+    async fn the_leave_is_recorded_before_its_packet_is_sent() {
+        let (mut game, peer) = scripted_game();
+        drop(peer);
+        game.state.selected_char = CHAR;
+        let mut cleanup = Cleanup::default();
+        reselect(&mut game, &mut cleanup, TL).await.unwrap_err();
+        assert_eq!(cleanup.reselect, Some(Reselect::Leaving(CHAR)));
+    }
+
+    #[tokio::test]
+    async fn the_select_is_recorded_before_its_packet_is_sent() {
+        let (mut game, mut peer) = scripted_game();
+        game.state.selected_char = CHAR;
+        let server = tokio::spawn(async move {
+            peer.expect(cs::CSLeaveWorldPacket).await;
+            peer.send(sc::SCPrepareLeaveWorldPacket, &prepare_body())
+                .await;
+            peer.send(sc::SCLeaveWorldGrantedPacket, &[1]).await;
+            peer.expect(cs::CSListCharacterPacket).await;
+            peer.send(sc::SCCharacterListPacket, &[1, 0]).await;
+            // The connection is gone before the select can be sent.
+        });
+        let mut cleanup = Cleanup::default();
+        reselect(&mut game, &mut cleanup, TL).await.unwrap_err();
+        assert_eq!(cleanup.reselect, Some(Reselect::Selected));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_spawn_is_recorded_before_its_packet_is_sent() {
+        let (mut game, peer) = scripted_game();
+        drop(peer);
+        let mut cleanup = Cleanup {
+            reselect: Some(Reselect::Selected),
+            ..Cleanup::default()
+        };
+        finish_entry(&mut game, &mut cleanup).await.unwrap_err();
+        assert_eq!(cleanup.reselect, Some(Reselect::Spawned));
+    }
+
+    #[tokio::test]
+    async fn the_waits_of_the_reentry_do_not_outlive_a_cleanup_dropped_midway() {
+        // The cleanup is waiting for the grant of a leave when its time limit drops it. The
+        // waits of the re-entry run with limits of their own, which must not stay.
+        let (mut game, _peer) = scripted_game();
+        let mut cleanup = Cleanup {
+            reselect: Some(Reselect::Leaving(CHAR)),
+            ..Cleanup::default()
+        };
+        let cut = tokio::time::timeout(
+            Duration::from_millis(100),
+            reenter_world(&mut game, &mut cleanup),
+        )
+        .await;
+        assert!(
+            cut.is_err(),
+            "the wait for the grant must still be going on"
+        );
+        assert_eq!(game.timeout, Duration::from_millis(400));
+        assert_eq!(cleanup.reselect, Some(Reselect::Leaving(CHAR)));
     }
 
     #[tokio::test]

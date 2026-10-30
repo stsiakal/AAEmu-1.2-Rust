@@ -15,8 +15,9 @@ What it does:
     the GM scenarios work), plus the accounts of the one parallel `load` phase;
   * runs the scenarios in a per-bot loop, each cycle shuffled with `--seed`, until `--minutes`
     have passed, recording every outcome (testclient `--outcome-json`); every run gets the bot's
-    own `--slot` (the questchain spawn grid) and a `--scenario-timeout` below `--attempt-timeout`,
-    so a hung scenario cleans up before the runner would kill it;
+    own `--slot` (the questchain spawn grid) and a `--scenario-timeout` plus the cleanup's
+    `--cleanup-timeout` budgeted inside `--attempt-timeout`, so a hung scenario cleans up before
+    the runner would kill it;
   * writes <runtime>/soak/<run>/dashboard.md and dashboard.json from the scenario outcomes
     (including their `retry_*` run counters: boar hits the server refused for facing, line of
     sight or range), the bug reporter's `summary.json` and the server log, and leaves the raw
@@ -74,15 +75,20 @@ SPAWN_SLOTS = 16
 SLOT_SCENARIOS = {"questchain"}
 
 # Seconds one scenario attempt may take before the runner kills the testclient. Housing, the
-# longest, took up to ~200 s of scenario time with 8 bots fighting over its plot, plus ~35 s to
-# log in and enter the world, so the testclient's own scenario timeout (this minus the reserve
-# below) must stay well above that.
+# longest, needs up to ~200 s of scenario body with 8 bots fighting over its plot, plus ~35 s to
+# log in and enter the world, so the body budget this leaves (see `scenario_timeout`) must stay
+# well above that.
 DEFAULT_ATTEMPT_TIMEOUT = 420
 
-# Seconds of `--attempt-timeout` left for a scenario's cleanup, the leave of the world and the
-# exit: the testclient's own `--scenario-timeout` is that much shorter, so a scenario that hangs
-# or panics still demolishes / dismounts / destroys before the runner would kill the process.
-CLEANUP_RESERVE = 75
+# Seconds of `--attempt-timeout` a scenario needs before its body runs: the login, the world
+# entry and the client's setup (about 35 s in a soak).
+LOGIN_RESERVE = 35
+
+# Seconds of `--attempt-timeout` given to the scenario's cleanup (`--cleanup-timeout`). The
+# testclient starts it with a fresh budget whatever became of the body and bounds it itself, so a
+# body that ran out of time cannot make the runner kill the client mid-cleanup (which would leave
+# a house or a mount behind).
+CLEANUP_BUDGET = 90
 MIN_SCENARIO_TIMEOUT = 30
 
 # Run variables of a scenario outcome that count repeated work (`retry_out_of_angle`, ...); the
@@ -501,8 +507,11 @@ def assign_slots(accounts: list[str]) -> dict[str, int]:
 
 
 def scenario_timeout(attempt_timeout: int) -> int:
-    """The testclient's `--scenario-timeout`: the attempt timeout minus the cleanup reserve."""
-    return max(MIN_SCENARIO_TIMEOUT, attempt_timeout - CLEANUP_RESERVE)
+    """The testclient's `--scenario-timeout`: what the attempt timeout leaves after the login and
+    the cleanup. The leave of the world that follows the cleanup takes ~10 s of that remainder;
+    only an attempt whose body and cleanup both ran to their limits is killed during the leave,
+    after the cleanup has done its work."""
+    return max(MIN_SCENARIO_TIMEOUT, attempt_timeout - LOGIN_RESERVE - CLEANUP_BUDGET)
 
 
 def run_counters(outcome: dict | None) -> dict[str, int]:
@@ -966,6 +975,8 @@ class Runner:
             str(outcome_path),
             "--scenario-timeout",
             str(scenario_timeout(self.args.attempt_timeout)),
+            "--cleanup-timeout",
+            str(CLEANUP_BUDGET),
         ]
         slot = self.slots.get(account)
         if slot is not None:
@@ -1624,7 +1635,8 @@ def main(argv: list[str]) -> int:
         default=DEFAULT_ATTEMPT_TIMEOUT,
         help=(
             f"seconds per scenario attempt (default {DEFAULT_ATTEMPT_TIMEOUT}); the testclient "
-            f"stops its scenario {CLEANUP_RESERVE} s earlier and cleans up"
+            f"gets {LOGIN_RESERVE} s to log in and {CLEANUP_BUDGET} s to clean up, its body "
+            f"taking the rest"
         ),
     )
     parser.add_argument(

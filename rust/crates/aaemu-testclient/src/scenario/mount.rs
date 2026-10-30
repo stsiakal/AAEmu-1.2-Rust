@@ -49,7 +49,7 @@ pub(super) async fn run(
     run_scenario(
         game,
         r,
-        cfg.scenario_timeout(),
+        cfg.limits(),
         &mut cleanup,
         move |game, r, cleanup| Box::pin(async move { run_inner(game, &owned, r, cleanup).await }),
         |game, r, cleanup| Box::pin(cleanup_mount(game, r, cleanup)),

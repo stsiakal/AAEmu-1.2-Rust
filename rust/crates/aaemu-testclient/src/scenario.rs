@@ -247,6 +247,12 @@ pub struct BotConfig {
     /// cleanup still runs and the run fails; the soak runner sets it below its own kill time.
     #[serde(default)]
     pub scenario_timeout_secs: Option<u64>,
+    /// `housing` / `mount` / `questchain` / `gather`: seconds the scenario's cleanup may run
+    /// (`--cleanup-timeout S`, default 90), counted from when the cleanup begins, whatever became
+    /// of the body. The cleanup is dropped when they are over and the run fails; the leave of the
+    /// world that follows has its own limit.
+    #[serde(default)]
+    pub cleanup_timeout_secs: Option<u64>,
 }
 
 impl BotConfig {
@@ -254,6 +260,20 @@ impl BotConfig {
     pub fn scenario_timeout(&self) -> Duration {
         self.scenario_timeout_secs
             .map_or(coreloop::DEFAULT_SCENARIO_TIMEOUT, Duration::from_secs)
+    }
+
+    /// The time limit of a core-loop scenario's cleanup.
+    pub fn cleanup_timeout(&self) -> Duration {
+        self.cleanup_timeout_secs
+            .map_or(coreloop::DEFAULT_CLEANUP_TIMEOUT, Duration::from_secs)
+    }
+
+    /// The time limits of the parts of a core-loop scenario run.
+    fn limits(&self) -> coreloop::Limits {
+        coreloop::Limits {
+            body: self.scenario_timeout(),
+            cleanup: self.cleanup_timeout(),
+        }
     }
 }
 

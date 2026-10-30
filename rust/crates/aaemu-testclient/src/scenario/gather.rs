@@ -61,7 +61,7 @@ pub(super) async fn run(
     run_scenario(
         game,
         r,
-        cfg.scenario_timeout(),
+        cfg.limits(),
         &mut cleanup,
         |game, r, cleanup| Box::pin(run_inner(game, r, cleanup)),
         |game, r, cleanup| Box::pin(cleanup_gather(game, r, cleanup)),

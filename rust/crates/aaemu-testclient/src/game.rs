@@ -869,6 +869,36 @@ impl Drop for SocketReader {
     }
 }
 
+/// [`GameClient::timeout`] changed for as long as the guard lives (see
+/// [`GameClient::with_timeout`]). The client is used through the guard, which puts the value it
+/// found back when it is dropped: at the end of its scope, on an early `?` and also when the
+/// future that holds it is dropped at an await point (a scenario body that ran out of time),
+/// which a save before and a restore after the awaited call would skip.
+pub struct TimeoutGuard<'a> {
+    game: &'a mut GameClient,
+    saved: Duration,
+}
+
+impl std::ops::Deref for TimeoutGuard<'_> {
+    type Target = GameClient;
+
+    fn deref(&self) -> &GameClient {
+        self.game
+    }
+}
+
+impl std::ops::DerefMut for TimeoutGuard<'_> {
+    fn deref_mut(&mut self) -> &mut GameClient {
+        self.game
+    }
+}
+
+impl Drop for TimeoutGuard<'_> {
+    fn drop(&mut self) {
+        self.game.timeout = self.saved;
+    }
+}
+
 impl GameClient {
     pub async fn connect(addr: &str, rec: Recorder) -> anyhow::Result<Self> {
         let sock = TcpStream::connect(addr)
@@ -933,6 +963,14 @@ impl GameClient {
 
     pub fn recorder(&self) -> &Recorder {
         &self.rec
+    }
+
+    /// Makes the waits of this client (`wait_for`, `wait_sc`) last up to `timeout` until the
+    /// returned guard is dropped, which puts the previous limit back whatever ended the
+    /// guard's scope, a cancelled future included. Use the client through the guard.
+    pub fn with_timeout(&mut self, timeout: Duration) -> TimeoutGuard<'_> {
+        let saved = std::mem::replace(&mut self.timeout, timeout);
+        TimeoutGuard { game: self, saved }
     }
 
     /// Close both game socket halves, without sending `CSLeaveWorldPacket`.
@@ -1625,6 +1663,66 @@ mod socket_reader_tests {
         let (task, stopped) = reader().await;
         drop(task);
         assert!(stopped.await.is_ok());
+    }
+}
+
+#[cfg(test)]
+mod timeout_guard_tests {
+    use super::*;
+
+    /// A client on an in-memory connection nobody sends on (the other end stays open), whose
+    /// waits last 400 ms.
+    fn client() -> (GameClient, tokio::io::DuplexStream) {
+        let (io, peer) = tokio::io::duplex(1024);
+        let mut game = GameClient::from_io(io, Recorder::new(false));
+        game.timeout = Duration::from_millis(400);
+        (game, peer)
+    }
+
+    fn stops_early(game: &mut GameClient) -> anyhow::Result<()> {
+        let _patient = game.with_timeout(Duration::from_secs(30));
+        bail!("stopped early")
+    }
+
+    #[tokio::test]
+    async fn the_guard_changes_the_wait_limit_and_puts_the_previous_one_back() {
+        let (mut game, _peer) = client();
+        {
+            let mut patient = game.with_timeout(Duration::from_secs(30));
+            assert_eq!(patient.timeout, Duration::from_secs(30));
+            // The client is used through the guard, the way it is outside of it.
+            patient.timeout = Duration::from_secs(40);
+        }
+        assert_eq!(game.timeout, Duration::from_millis(400));
+        // An early return, such as the `?` of a failed step, ends the guard too.
+        stops_early(&mut game).unwrap_err();
+        assert_eq!(game.timeout, Duration::from_millis(400));
+        // A wait through the guard lasts as long as the guard says.
+        let started = Instant::now();
+        let error = game
+            .with_timeout(Duration::from_millis(50))
+            .wait_sc(sc::SCLeaveWorldGrantedPacket)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        assert!(started.elapsed() < Duration::from_millis(350));
+        assert_eq!(game.timeout, Duration::from_millis(400));
+    }
+
+    #[tokio::test]
+    async fn a_wait_dropped_by_a_time_limit_still_puts_the_limit_back() {
+        let (mut game, _peer) = client();
+        let cut = tokio::time::timeout(Duration::from_millis(100), async {
+            game.with_timeout(Duration::from_secs(30))
+                .wait_sc(sc::SCLeaveWorldGrantedPacket)
+                .await
+        })
+        .await;
+        assert!(
+            cut.is_err(),
+            "the 30 s wait must have been dropped, not ended"
+        );
+        assert_eq!(game.timeout, Duration::from_millis(400));
     }
 }
 

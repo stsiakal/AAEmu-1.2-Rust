@@ -9,9 +9,12 @@
 //! `CSLootOpenBag(lootAll)`, then reports with `CSCompleteQuestContext` and checks the reward.
 //!
 //! GM-spawned NPCs carry no owner, so bots running in parallel must not spawn near each other:
-//! every bot owns one slot of a 4 x 4 grid (`--slot N`, 25 m apart, anchored at the origin where
-//! its run began), teleports back to its slot before each `/spawn npc` (a boar chase drifts the
-//! bot away) and only accepts an NPC announced within 1 m of the point its own command asked for.
+//! every bot owns one slot of a 4 x 4 grid (`--slot N`, 25 m apart) around the fixed [`ORIGIN`]
+//! in the Nuian start area and stands on the heightmap floor of its slot (`/height`: `/spawn npc`
+//! copies the bot's height, so a slot that is not snapped puts the bot and its boars under the
+//! ground or in the air on a slope). It teleports back to its slot before each `/spawn npc` (a
+//! boar chase drifts the bot away) and only accepts an NPC announced within 1 m of the point its
+//! own command asked for.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -21,8 +24,8 @@ use aaemu_game::systems::skills::types::skill_result;
 use anyhow::{bail, ensure, Context};
 
 use super::coreloop::{
-    bot_slot, destroy_item, gm_access, item_stacks, item_stacks_any, run_scenario, slot_offset,
-    spawn_point, teleport_to, ItemStack, SPAWN_TOLERANCE,
+    bot_slot, destroy_item, floor_height, gm_access, item_stacks, item_stacks_any, run_scenario,
+    slot_offset, spawn_point, teleport_to, ItemStack, SPAWN_TOLERANCE,
 };
 use super::questitem::{chat_text, gm_command, last_quest_state};
 use super::{
@@ -42,6 +45,18 @@ const MEATS: i32 = 3;
 const REWARD: u32 = 18791;
 /// Melee attack skill of the created fighter.
 const ATTACK: u32 = 2;
+
+/// The origin of the slot grid (east, north, floor height): open ground in the Nuian start area,
+/// where every new Nuian character starts (`CharTemplates.json`: 15578.04, 15382.12, 126.48).
+/// A constant, not where the bot stands when the run begins (that is wherever the scenario before
+/// left it): all bots work on the same grid, so their spots are always `SLOT_SPACING` apart.
+const ORIGIN: (f32, f32, f32) = (15578.0, 15382.1, 126.5);
+/// How far above the origin's floor the ground of a slot is probed from: above any rise within
+/// the grid, so `/height` reads the terrain below the probe, never from under it. A floor further
+/// than this from the origin's is not level ground (or one the server does not know).
+const PROBE_LIFT: f32 = 20.0;
+/// How far above the floor the bot stands (the housing scenario's `floor + 0.1`).
+const GROUND_CLEARANCE: f32 = 0.1;
 
 /// How often the player's hit was refused with a result that means the boar moved (out of range,
 /// not in front, something between): the bot then walks up to it and aims again. The counts are
@@ -77,7 +92,7 @@ impl Retries {
 
 #[derive(Default)]
 struct Cleanup {
-    /// The scenario origin, where the bot stood before it moved to its own spot; it goes back
+    /// Where the bot stood when the run began, before it moved to its own spot; it goes back
     /// there at the end.
     home: Option<(f32, f32, f32)>,
     giver: Option<u32>,
@@ -98,7 +113,7 @@ pub(super) async fn run(
     run_scenario(
         game,
         r,
-        cfg.scenario_timeout(),
+        cfg.limits(),
         &mut cleanup,
         |game, r, cleanup| Box::pin(run_inner(game, slot, r, cleanup)),
         |game, r, cleanup| Box::pin(cleanup_quest(game, r, cleanup)),
@@ -117,14 +132,13 @@ async fn run_inner(
     game.drain(Duration::from_millis(300), Duration::from_secs(2))
         .await?;
 
-    // ---- the bot's own spot: parallel bots each own one slot of a grid 25 m apart, anchored at
-    // the origin where this run began (GM-spawned NPCs carry no owner, so the bot takes the NPC
-    // announced at the point its own command requested) ----
+    // ---- the bot's own spot: parallel bots each own one slot of a grid 25 m apart around the
+    // fixed origin, on the heightmap floor (GM-spawned NPCs carry no owner, so the bot takes the
+    // NPC announced at the point its own command requested) ----
     let s = r.begin("game.questchain.position");
-    let origin = game.state.self_pos;
-    cleanup.home = Some(origin);
+    cleanup.home = Some(game.state.self_pos);
     let (dx, dy) = slot_offset(slot);
-    let spot = (origin.0 + dx, origin.1 + dy, origin.2);
+    let Spot { pos: spot, floor } = slot_spot(game, slot).await?;
     r.var("slot", slot);
     let mut retries = Retries::default();
     retries.publish(r);
@@ -132,7 +146,8 @@ async fn run_inner(
     r.end(
         s,
         format!(
-            "slot {slot}: at {:?} (origin {origin:?} + {dx:.1}, {dy:.1}), NPCs spawn at {spawn_at:?}",
+            "slot {slot}: at {:?} on floor {floor:.2} (fixed origin {ORIGIN:?} + {dx:.1}, \
+             {dy:.1}), NPCs spawn at {spawn_at:?}",
             game.state.self_pos
         ),
     );
@@ -417,6 +432,60 @@ async fn cleanup_quest(
     Ok(())
 }
 
+/// A slot of the grid as a bot stands on it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Spot {
+    /// Where the bot stands: the slot's fixed east and north, at the floor plus
+    /// [`GROUND_CLEARANCE`].
+    pos: (f32, f32, f32),
+    /// The heightmap floor below it.
+    floor: f32,
+}
+
+/// What reads the ground of the grid: the game client goes to the probe and asks the server
+/// (`/height`); the tests have a terrain of their own.
+trait Ground {
+    /// The floor height below `probe`, a point above the ground.
+    async fn floor(&mut self, probe: (f32, f32, f32)) -> anyhow::Result<f32>;
+}
+
+impl Ground for GameClient {
+    async fn floor(&mut self, probe: (f32, f32, f32)) -> anyhow::Result<f32> {
+        teleport_to(self, probe).await?;
+        floor_height(self).await
+    }
+}
+
+/// East and north of `slot`: the fixed [`ORIGIN`] plus the slot's offset.
+fn slot_xy(slot: u32) -> (f32, f32) {
+    let (dx, dy) = slot_offset(slot);
+    (ORIGIN.0 + dx, ORIGIN.1 + dy)
+}
+
+/// The spot of `slot`: its east and north are fixed, its height is the floor the server reports
+/// there (read from a probe [`PROBE_LIFT`] above the origin's floor) plus [`GROUND_CLEARANCE`], so
+/// the bot, and the NPCs `/spawn npc` copies its height to, stand on the ground whatever the
+/// slope. Fails when the server reports a floor too far from the origin's (the grid is not on
+/// level ground, or the height is unknown: the server answers 0).
+async fn slot_spot(ground: &mut impl Ground, slot: u32) -> anyhow::Result<Spot> {
+    let (x, y) = slot_xy(slot);
+    let floor = ground
+        .floor((x, y, ORIGIN.2 + PROBE_LIFT))
+        .await
+        .with_context(|| format!("the floor of slot {slot} at ({x:.1}, {y:.1}) is unknown"))?;
+    ensure!(
+        (floor - ORIGIN.2).abs() <= PROBE_LIFT,
+        "slot {slot} at ({x:.1}, {y:.1}) has floor {floor} ({:+.1} m from the origin's {}): the \
+         grid is not on level ground, or the server knows no height there",
+        floor - ORIGIN.2,
+        ORIGIN.2
+    );
+    Ok(Spot {
+        pos: (x, y, floor + GROUND_CLEARANCE),
+        floor,
+    })
+}
+
 /// Teleports the bot to its spot (which also turns it to yaw 0, see [`spawn_point`]) and returns
 /// where a `/spawn npc` from there puts an NPC.
 async fn go_to_spot(game: &mut GameClient, spot: (f32, f32, f32)) -> anyhow::Result<(f32, f32)> {
@@ -550,7 +619,7 @@ fn packet_summary(packets: &[Packet]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::coreloop::ItemStack;
+    use super::super::coreloop::{ItemStack, SLOTS, SLOT_SPACING};
     use super::*;
 
     fn stack(template: u32, item_id: u64, count: i32) -> ItemStack {
@@ -651,19 +720,18 @@ mod tests {
 
     #[test]
     fn eight_parallel_bots_each_find_only_their_own_npc() {
-        // Every bot began at the same origin (the Nuian start) and owns one slot; each bot's
-        // command announces a boar at its own spawn point to all of them.
-        let origin = (13000.0, 14000.0, 100.0);
+        // Every bot works on the same fixed grid and owns one slot; each bot's command announces
+        // a boar at its own spawn point to all of them.
         let spawn_ats: Vec<(f32, f32)> = (0..8)
             .map(|slot| {
-                let (dx, dy) = slot_offset(slot);
-                spawn_point((origin.0 + dx, origin.1 + dy, origin.2))
+                let (x, y) = slot_xy(slot);
+                spawn_point((x, y, ORIGIN.2))
             })
             .collect();
         let units: HashMap<u32, UnitInfo> = spawn_ats
             .iter()
             .enumerate()
-            .map(|(i, at)| unit(100 + i as u32, BOAR, (at.0, at.1, 100.0), 50 + i as u64))
+            .map(|(i, at)| unit(100 + i as u32, BOAR, (at.0, at.1, ORIGIN.2), 50 + i as u64))
             .map(|u| (u.obj_id, u))
             .collect();
         for (i, at) in spawn_ats.iter().enumerate() {
@@ -746,5 +814,129 @@ mod tests {
         loot.push(stack(8022, 8, 1));
         consume_loot(&mut loot, MEAT, MEATS);
         assert_eq!(loot, [stack(MEAT, 7, 2), stack(8022, 8, 1)]);
+    }
+
+    /// A made-up terrain that rises `rise` metres per metre towards the east, and the probes it
+    /// was asked to read. Like the server it cannot read the ground below a probe that is under
+    /// it, so such a probe is an error.
+    struct Slope {
+        rise: f32,
+        probes: Vec<(f32, f32, f32)>,
+    }
+
+    impl Slope {
+        fn floor_at(&self, east: f32) -> f32 {
+            ORIGIN.2 + self.rise * (east - ORIGIN.0)
+        }
+    }
+
+    impl Ground for Slope {
+        async fn floor(&mut self, probe: (f32, f32, f32)) -> anyhow::Result<f32> {
+            self.probes.push(probe);
+            let floor = self.floor_at(probe.0);
+            ensure!(
+                probe.2 > floor,
+                "probe {probe:?} is under the ground ({floor})"
+            );
+            Ok(floor)
+        }
+    }
+
+    /// A terrain whose floor is the same everywhere (the server answers 0 where it has none).
+    struct Level(f32);
+
+    impl Ground for Level {
+        async fn floor(&mut self, _probe: (f32, f32, f32)) -> anyhow::Result<f32> {
+            Ok(self.0)
+        }
+    }
+
+    #[tokio::test]
+    async fn every_slot_is_a_fixed_point_snapped_to_the_floor_below_it() {
+        // A 10 % slope: 7.5 m of rise from the west to the east edge of the grid.
+        let mut terrain = Slope {
+            rise: 0.1,
+            probes: Vec::new(),
+        };
+        let mut spots = Vec::new();
+        for slot in 0..SLOTS {
+            let spot = slot_spot(&mut terrain, slot).await.unwrap();
+            // East and north are the fixed origin's plus the slot's offset, whatever the terrain
+            // and wherever a bot began: nothing else goes into them.
+            let (dx, dy) = slot_offset(slot);
+            assert_eq!((spot.pos.0, spot.pos.1), (ORIGIN.0 + dx, ORIGIN.1 + dy));
+            assert_eq!((spot.pos.0, spot.pos.1), slot_xy(slot));
+            // The bot stands on the floor below its slot, not at the origin's height (which is
+            // under the ground on the high side and in the air on the low one).
+            let floor = terrain.floor_at(spot.pos.0);
+            assert_eq!(spot.floor, floor);
+            assert_eq!(spot.pos.2, floor + GROUND_CLEARANCE);
+            spots.push(spot);
+        }
+        assert!(
+            spots.iter().any(|s| s.pos.2 > ORIGIN.2 + 1.0)
+                && spots.iter().any(|s| s.pos.2 < ORIGIN.2 - 1.0),
+            "the slope must lift and lower the spots"
+        );
+        // Asking again gives the same spots, and no two are closer than the slot spacing.
+        for (slot, spot) in (0..SLOTS).zip(&spots) {
+            assert_eq!(slot_spot(&mut terrain, slot).await.unwrap(), *spot);
+        }
+        for (i, a) in spots.iter().enumerate() {
+            for b in &spots[i + 1..] {
+                let apart = (a.pos.0 - b.pos.0).hypot(a.pos.1 - b.pos.1);
+                assert!(apart >= SLOT_SPACING - 0.001, "{apart} m apart");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_floor_of_a_slot_is_probed_from_above_the_ground_at_its_fixed_point() {
+        let mut terrain = Slope {
+            rise: 0.1,
+            probes: Vec::new(),
+        };
+        slot_spot(&mut terrain, 15).await.unwrap();
+        let (x, y) = slot_xy(15);
+        assert_eq!(terrain.probes, [(x, y, ORIGIN.2 + PROBE_LIFT)]);
+        // The probe is above the highest floor of the grid, the east edge of the slope.
+        assert!(terrain.probes[0].2 > terrain.floor_at(ORIGIN.0 + 37.5));
+    }
+
+    #[tokio::test]
+    async fn a_floor_the_server_does_not_know_or_far_off_the_origins_fails_the_slot() {
+        // The server answers 0 where it knows no height: the bot must not be put there.
+        let error = slot_spot(&mut Level(0.0), 3).await.unwrap_err();
+        let text = error.to_string();
+        assert!(
+            text.contains("slot 3") && text.contains("floor 0"),
+            "{text}"
+        );
+        // A cliff above the probe, a pit, and an answer that is no number.
+        assert!(slot_spot(&mut Level(ORIGIN.2 + PROBE_LIFT + 1.0), 3)
+            .await
+            .is_err());
+        assert!(slot_spot(&mut Level(ORIGIN.2 - PROBE_LIFT - 1.0), 3)
+            .await
+            .is_err());
+        assert!(slot_spot(&mut Level(f32::NAN), 3).await.is_err());
+        // Level ground within the lift is accepted, also a little below the origin's floor.
+        let spot = slot_spot(&mut Level(ORIGIN.2 - 3.0), 3).await.unwrap();
+        assert_eq!(spot.pos.2, ORIGIN.2 - 3.0 + GROUND_CLEARANCE);
+    }
+
+    #[tokio::test]
+    async fn a_floor_that_cannot_be_read_names_the_slot() {
+        // The probe sits under the ground (a hill higher than the lift): the terrain refuses it.
+        let mut terrain = Slope {
+            rise: 1.0,
+            probes: Vec::new(),
+        };
+        let error = slot_spot(&mut terrain, 15).await.unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("floor of slot 15") && text.contains("under the ground"),
+            "{text}"
+        );
     }
 }
