@@ -53,6 +53,36 @@ impl Command for BotCommand {
                     self.host.remove(server, name).await?;
                     out.send_message(&format!("[bot] removed '{name}'"));
                 }
+                Some("goto") => {
+                    let (Some(name), Some(x), Some(y), Some(z)) =
+                        (args.get(1), args.get(2), args.get(3), args.get(4))
+                    else {
+                        anyhow::bail!("usage: /bot goto <name> <x> <y> <z>");
+                    };
+                    let target = aaemu_game::systems::skills::controllers::Vec3::new(
+                        x.parse::<f32>()
+                            .map_err(|_| anyhow::anyhow!("x is not a number: {x}"))?,
+                        y.parse::<f32>()
+                            .map_err(|_| anyhow::anyhow!("y is not a number: {y}"))?,
+                        z.parse::<f32>()
+                            .map_err(|_| anyhow::anyhow!("z is not a number: {z}"))?,
+                    );
+                    let Some(server) = server.self_arc() else {
+                        anyhow::bail!("the server is shutting down");
+                    };
+                    let goto = self.host.goto(&server, name, target, 1.0).await?;
+                    out.send_message(&format!(
+                        "[bot] '{name}' walking to ({:.1}, {:.1}, {:.1})",
+                        target.x, target.y, target.z
+                    ));
+                    // The outcome arrives after the command returned.
+                    let character = ctx.character.clone();
+                    let name = name.clone();
+                    tokio::spawn(async move {
+                        let outcome = goto.wait().await;
+                        character.send_message(&format!("[bot] '{name}' goto: {outcome}"));
+                    });
+                }
                 Some("list") => {
                     let bots = self.host.list().await;
                     if bots.is_empty() {
@@ -75,16 +105,16 @@ impl Command for BotCommand {
     }
 
     fn get_command_line_help(&self) -> String {
-        "add <name> | remove <name> | list".into()
+        "add <name> | remove <name> | list | goto <name> <x> <y> <z>".into()
     }
 
     fn get_command_help_text(&self) -> String {
-        "Server-side player bots: add logs a character in through the normal session path, remove saves and logs it out.".into()
+        "Server-side player bots: add logs a character in through the normal session path, remove saves and logs it out, goto walks one to a point with the nav planner.".into()
     }
 }
 
 fn help() -> String {
-    "[bot] /bot add <name> | /bot remove <name> | /bot list".into()
+    "[bot] /bot add <name> | /bot remove <name> | /bot list | /bot goto <name> <x> <y> <z>".into()
 }
 
 /// Registers `/bot` on the running server (called by [`crate::install`] only when enabled).

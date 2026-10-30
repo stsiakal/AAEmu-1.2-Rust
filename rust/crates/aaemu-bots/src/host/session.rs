@@ -1,14 +1,17 @@
 //! One live bot: its socketless connection, the replies it can read, and its think schedule.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use aaemu_game::net::registry::ClientPacket;
 use aaemu_game::net::socketless::SocketlessConnection;
 use aaemu_game::world::session::{self, leave_target};
+use aaemu_game::world::PlayerRef;
 use aaemu_game::GameServer;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
+
+use crate::nav::RoadGraphCache;
 
 /// Idle cadence of a bot between thinks (the cadence table / governor comes in P2/P3).
 const IDLE_THINK: Duration = Duration::from_millis(1_000);
@@ -20,6 +23,12 @@ pub struct BotSession {
     conn: Mutex<SocketlessConnection>,
     next_think: Mutex<Instant>,
     disconnected: AtomicBool,
+    /// The long-range road graph of this bot's world (built on the first route that needs it).
+    pub(crate) roads: RoadGraphCache,
+    /// Generation of the running navigation task: a `goto` bumps it and earlier walkers stop.
+    nav_generation: AtomicU64,
+    /// Places the walker got stuck at (routed around by later plans).
+    stuck_spots: Mutex<Vec<(f32, f32)>>,
 }
 
 impl BotSession {
@@ -32,6 +41,46 @@ impl BotSession {
             conn: Mutex::new(conn),
             next_think: Mutex::new(Instant::now() + jitter),
             disconnected: AtomicBool::new(false),
+            roads: RoadGraphCache::default(),
+            nav_generation: AtomicU64::new(0),
+            stuck_spots: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The active character (`None` in the lobby or after a logout).
+    pub async fn player(&self) -> Option<PlayerRef> {
+        self.conn.lock().await.conn.active_char.clone()
+    }
+
+    /// `(x, y, z)` of the active character.
+    pub async fn position(&self) -> Option<(f32, f32, f32)> {
+        let player = self.player().await?;
+        let c = player.data();
+        let t = c.unit.transform;
+        Some((t.x, t.y, t.z))
+    }
+
+    /// The generation of the running navigation task.
+    pub(crate) fn nav_generation(&self) -> u64 {
+        self.nav_generation.load(Ordering::SeqCst)
+    }
+
+    /// Starts a new navigation generation; any older walker notices and stops.
+    pub(crate) fn bump_nav_generation(&self) -> u64 {
+        self.nav_generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Places the walker got stuck at (bounded; the oldest fall off).
+    pub(crate) async fn stuck_spots(&self) -> Vec<(f32, f32)> {
+        self.stuck_spots.lock().await.clone()
+    }
+
+    /// Records a stuck place for later plans to route around.
+    pub(crate) async fn record_stuck_spot(&self, spot: (f32, f32)) {
+        let mut spots = self.stuck_spots.lock().await;
+        spots.push(spot);
+        if spots.len() > 32 {
+            spots.remove(0);
         }
     }
 

@@ -12,10 +12,13 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use aaemu_game::config::BotsConfig;
+use aaemu_game::systems::skills::controllers::Vec3;
 use aaemu_game::GameServer;
 use tokio::sync::Mutex;
 
 pub use session::BotSession;
+
+use crate::nav::movement::Goto;
 
 /// The scheduler tick: connection commands are serviced this often.
 const HOST_TICK: Duration = Duration::from_millis(250);
@@ -151,6 +154,30 @@ impl BotHost {
             bot.character_id
         );
         Ok(())
+    }
+
+    /// The live bot named `name`.
+    pub async fn bot(&self, name: &str) -> Option<Arc<BotSession>> {
+        self.bots
+            .lock()
+            .await
+            .values()
+            .find(|b| b.name.eq_ignore_ascii_case(name))
+            .cloned()
+    }
+
+    /// `/bot goto <name> <x> <y> <z>`: starts walking (the caller awaits [`Goto::wait`]).
+    pub async fn goto(
+        &self,
+        server: &Arc<GameServer>,
+        name: &str,
+        target: Vec3,
+        radius: f32,
+    ) -> anyhow::Result<Goto> {
+        let Some(bot) = self.bot(name.trim()).await else {
+            anyhow::bail!("no live bot named '{}'", name.trim());
+        };
+        Ok(bot.start_goto(server, target, radius))
     }
 
     /// `/bot list`.

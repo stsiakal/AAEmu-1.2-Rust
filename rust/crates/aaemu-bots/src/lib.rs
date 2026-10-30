@@ -7,7 +7,9 @@
 //!
 //! P1 scope: [`host`] (one scheduler task, per-bot next-think time, no AI yet), [`life`]
 //! (create-or-load a character, enter through the real session path, save and remove), and
-//! [`commands`]. Combat, quests, navigation and the governor come in P2/P3.
+//! [`commands`]. P2 adds [`nav`]: route planning (`.bai`, height grid, transfer roads) and the
+//! movement walker that sends real `CSMoveUnitPacket`s, with [`nav::movement::NavOutcome`] as
+//! the `goto` API. Combat, quests and the governor come later.
 //!
 //! [`GameConnection`]: aaemu_game::net::connection::GameConnection
 
@@ -16,6 +18,11 @@ pub mod commands;
 mod flow_tests;
 pub mod host;
 pub mod life;
+pub mod nav;
+#[cfg(test)]
+mod nav_flow_tests;
+#[cfg(test)]
+mod nav_real_data_tests;
 
 use std::sync::Arc;
 
