@@ -202,7 +202,7 @@ impl Session {
 /// Entry point: connect, then play the quests of `cfg.race`.
 pub async fn run(cfg: &CrawlConfig, catalog: &Catalog) -> Result<()> {
     let result_path = cfg.result_path();
-    let passed = load_passed(&result_path);
+    let mut passed = load_passed(&result_path);
     let mut results = ResultsFile::open(&result_path)?;
 
     let mut session = connect(cfg, catalog).await?;
@@ -220,16 +220,17 @@ pub async fn run(cfg: &CrawlConfig, catalog: &Catalog) -> Result<()> {
         .iter()
         .filter(|q| is_attemptable(cfg, catalog, q, &passed))
         .count();
-    let budget = cfg.limit.map_or(attemptable, |n| n.min(attemptable));
+    let budget = cfg.limit.map(|n| n.min(attemptable));
     println!(
-        "[crawl] {}: {budget} quests to attempt ({attemptable} attemptable, {} already passed)",
+        "[crawl] {}: {} quests to attempt ({attemptable} attemptable, {} already passed)",
         cfg.race.name(),
+        budget.map_or_else(|| "all".to_string(), |b| b.to_string()),
         passed.len()
     );
 
     let mut visited = 0usize;
     for quest in quests {
-        if visited >= budget {
+        if budget.is_some_and(|b| visited >= b) {
             break;
         }
         if passed.contains(&quest.id) {
@@ -244,7 +245,7 @@ pub async fn run(cfg: &CrawlConfig, catalog: &Catalog) -> Result<()> {
         println!(
             "[{}/{}] {} quest {:<5} {:<24} L{:<2} {:<30} {}",
             visited,
-            budget,
+            budget.map_or_else(|| "all".to_string(), |b| b.to_string()),
             match result.status.as_str() {
                 "passed" => "ok  ",
                 "skipped" => "skip",
@@ -257,6 +258,13 @@ pub async fn run(cfg: &CrawlConfig, catalog: &Catalog) -> Result<()> {
             result.step,
             result.reason
         );
+        // A quest that passed (or was already completed on the character) unlocks the quests
+        // gated on it, so later quests in the same run can be attempted without a second pass.
+        if result.status == "passed"
+            || (result.step == "accept" && result.reason.contains("already completed"))
+        {
+            passed.insert(result.quest);
+        }
         results.append(&result)?;
         if attempt && visited.is_multiple_of(10) {
             if let Err(e) = super::dashboard::write(&cfg.out) {
