@@ -200,7 +200,8 @@ pub async fn cast(
         let _ = (x, y);
         CastOutcome::Started
     } else {
-        match cast_result(&frames) {
+        let result = cast_result(&frames);
+        match result {
             Some(result) if result == skill_result::TOO_FAR_RANGE || result == skill_result::TOO_CLOSE_RANGE => {
                 state.casts_out_of_range += 1;
                 return CastOutcome::OutOfRange;
@@ -231,6 +232,7 @@ pub async fn cast(
             skill = skill_id,
             target = target_obj_id,
             target_template,
+            result = ?result,
             "Bots: the server refused a cast every check said was usable; backing the skill off"
         );
         CastOutcome::Refused
