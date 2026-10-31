@@ -250,35 +250,77 @@ pub fn validate_house(
             }
         }
     }
-    for house in server.systems.housing.manager.all() {
-        let (house_instance, id, position, scale) = {
-            let h = house.data();
-            (
-                h.unit.transform.instance_id,
-                h.unit.template_id,
-                h.unit.transform.local(),
-                h.unit.scale,
-            )
-        };
-        if house_instance != instance {
-            continue;
-        }
-        let Some(other) = data.template(id) else {
-            continue;
-        };
-        // Garden ownership already uses axis-aligned squares throughout the 1.2 server.
-        let extent = template.garden_radius + other.garden_radius * scale;
-        if (x - position.x).abs() < extent && (y - position.y).abs() < extent {
-            return Err(err::HOUSE_CANNOT_LOCATE_OVERLAP_HOUSE);
-        }
-    }
     if cells > 0 {
-        let (x0, y0) = footprint_origin(x, y, cells);
         let side = cells as f32 * FOOTPRINT_CELL;
+        let half = side * 0.5;
+        let (x0, y0) = footprint_origin(x, y, cells);
+        for house in server.systems.housing.manager.all() {
+            let (house_instance, id, position, scale, rot_z) = {
+                let h = house.data();
+                (
+                    h.unit.transform.instance_id,
+                    h.unit.template_id,
+                    h.unit.transform.local(),
+                    h.unit.scale,
+                    h.unit.transform.rot_z,
+                )
+            };
+            if house_instance != instance {
+                continue;
+            }
+            let Some(other) = data.template(id) else {
+                continue;
+            };
+            let other_cells = footprint_cells(other.garden_radius * scale);
+            if other_cells == 0 {
+                continue;
+            }
+            let other_half = other_cells as f32 * FOOTPRINT_CELL * 0.5;
+            if squares_overlap(
+                (
+                    f64::from(x0) + f64::from(half),
+                    f64::from(y0) + f64::from(half),
+                ),
+                f64::from(half),
+                0.0,
+                (f64::from(position.x), f64::from(position.y)),
+                f64::from(other_half),
+                f64::from(rot_z),
+            ) {
+                return Err(err::HOUSE_CANNOT_LOCATE_OVERLAP_HOUSE);
+            }
+        }
         validate_unit_overlap(server, player, &world, x0, y0, side, z)?;
         validate_terrain(server, &world, x0, y0, side)?;
     }
     Ok(())
+}
+
+/// 2D SAT of two squares (`FUN_39332c10`, used per cell by `FUN_393349e0`).
+fn squares_overlap(
+    a: (f64, f64),
+    a_half: f64,
+    a_yaw: f64,
+    b: (f64, f64),
+    b_half: f64,
+    b_yaw: f64,
+) -> bool {
+    let (sin_a, cos_a) = a_yaw.sin_cos();
+    let (sin_b, cos_b) = b_yaw.sin_cos();
+    let axes = [
+        (cos_a, sin_a),
+        (-sin_a, cos_a),
+        (cos_b, sin_b),
+        (-sin_b, cos_b),
+    ];
+    let d = (b.0 - a.0, b.1 - a.1);
+    let radius = |half: f64, sin: f64, cos: f64, n: (f64, f64)| {
+        half * ((n.0 * cos + n.1 * sin).abs() + (n.0 * -sin + n.1 * cos).abs())
+    };
+    axes.iter().all(|&n| {
+        let distance = (d.0 * n.0 + d.1 * n.1).abs();
+        distance <= radius(a_half, sin_a, cos_a, n) + radius(b_half, sin_b, cos_b, n)
+    })
 }
 
 /// Beginner plots in the original data (`housing_groups.can_extend = false`) expire rather

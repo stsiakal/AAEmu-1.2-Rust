@@ -318,3 +318,24 @@ async fn a_unit_inside_the_footprint_is_refused_with_overlap_unit() {
         Some(crate::systems::economy::error_message::HOUSE_CANNOT_LOCATE_OVERLAP_UNIT)
     );
 }
+
+#[tokio::test]
+async fn a_house_rotated_into_the_footprint_is_refused_even_outside_the_radius_sum() {
+    let mut f = fixture(data());
+    let world = f.server.world.world(0).unwrap();
+    let house = manager::create(&f.server, DESIGN, 101, &world, 0, 0).unwrap();
+    {
+        let mut h = house.data();
+        h.id = f.server.ids.housing.get_next_id().unwrap();
+        // 23 m east: outside the old garden-radius sum (11 + 11), inside the 45° box margin.
+        h.unit
+            .transform
+            .set_xyz(ACCEPTED.0 + 23.0, ACCEPTED.1, 100.0);
+        h.unit.transform.rot_z = std::f32::consts::FRAC_PI_4;
+    }
+    assert!(f.server.systems.housing.manager.insert(&house));
+    assert_eq!(
+        build_error(&mut f, ACCEPTED.0, ACCEPTED.1),
+        Some(crate::systems::economy::error_message::HOUSE_CANNOT_LOCATE_OVERLAP_HOUSE)
+    );
+}
