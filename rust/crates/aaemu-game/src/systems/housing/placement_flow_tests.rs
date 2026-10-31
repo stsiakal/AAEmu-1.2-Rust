@@ -21,9 +21,6 @@ use crate::opcodes::sc;
 use crate::server::GameServer;
 use crate::systems::ai::collision::terrain::tests::Plane;
 use crate::systems::ai::collision::world::CellContent;
-use crate::systems::npcs::heightmap::{
-    HeightmapConfig, HeightmapWorlds, WorldHeightmap, CELL_HMAP_RESOLUTION,
-};
 use crate::systems::npcs::subzone::Area;
 use crate::systems::skills::data::BuffTemplate;
 use crate::test_support::*;
@@ -222,33 +219,6 @@ fn build_error(f: &mut Fixture, x: f32, y: f32) -> Option<i16> {
     })
 }
 
-fn install_ramp_heightmap(server: &crate::server::GameServer) {
-    const COEF: f64 = 65535.0 / (4096.0 / 4.0);
-    const CELL_POINTS: usize = (CELL_HMAP_RESOLUTION * CELL_HMAP_RESOLUTION) as usize;
-    let map = WorldHeightmap::with_size(0, "main_world", 16, 16, COEF);
-    let mut heights = vec![0u16; CELL_POINTS];
-    for sx in 0..CELL_HMAP_RESOLUTION {
-        for sy in 0..CELL_HMAP_RESOLUTION {
-            heights[(sx * CELL_HMAP_RESOLUTION + sy) as usize] = (sx * 40) as u16;
-        }
-    }
-    // The accepted footprint (15316..15340, 14620..14644) lies in world cell (14, 14).
-    assert!(map.insert_cell(14, 14, heights));
-    server
-        .systems
-        .npcs
-        .heightmaps
-        .install(Arc::new(HeightmapWorlds::from_parts(
-            Arc::new(crate::data::client_files::ClientFileManager::new()),
-            vec![map],
-            HashMap::from([(TEST_ZONE, 0)]),
-            HeightmapConfig {
-                heightmaps_enable: true,
-                ..Default::default()
-            },
-        )));
-}
-
 /// A physical unit collider in the middle of the accepted footprint.
 fn install_unit_collider(server: &crate::server::GameServer) {
     server
@@ -297,16 +267,6 @@ async fn area_338_captured_spot_is_refused_and_the_fitting_spot_is_accepted() {
     assert_eq!(houses.len(), 1, "the fitting footprint is accepted");
     let pos = houses[0].data().unit.transform.local();
     assert_eq!((pos.x, pos.y), ACCEPTED);
-}
-
-#[tokio::test]
-async fn a_six_metre_terrain_spread_is_refused_with_terrain_too_low() {
-    let mut f = fixture(data());
-    install_ramp_heightmap(&f.server);
-    assert_eq!(
-        build_error(&mut f, ACCEPTED.0, ACCEPTED.1),
-        Some(crate::systems::economy::error_message::HOUSE_CANNOT_LOCATE_TERRAIN_TOO_LOW)
-    );
 }
 
 #[tokio::test]

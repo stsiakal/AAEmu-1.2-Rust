@@ -14,8 +14,6 @@ use crate::world::{PlayerRef, WorldInstance};
 const FOOTPRINT_CELL: f32 = 4.0;
 /// `FUN_39897170`: 12 or more cells is logged as "house too big" and yields no footprint.
 const FOOTPRINT_MAX_CELLS: i32 = 12;
-/// `FUN_39332180` / `FUN_39337fb0`: refuse when the terrain spread exceeds 6 m.
-const MAX_TERRAIN_SPREAD: f32 = 6.0;
 /// `FUN_39335860`: the unit/doodad collision query uses entity mask 0x1f.
 const UNIT_OVERLAP_MASK: u32 = 0x1f;
 
@@ -164,39 +162,6 @@ fn validate_groups(
         return Ok(group.id);
     }
     Err(error)
-}
-
-/// `FUN_39337fb0` / `FUN_39332180`: the 6 m terrain spread over the placement square.
-fn validate_terrain(
-    server: &GameServer,
-    world: &WorldInstance,
-    x0: f32,
-    y0: f32,
-    side: f32,
-) -> Result<(), i16> {
-    let Some(maps) = server.systems.npcs.heightmaps.get() else {
-        return Ok(());
-    };
-    if !maps.config.heightmaps_enable {
-        return Ok(());
-    }
-    let mut min = f32::INFINITY;
-    let mut max = f32::NEG_INFINITY;
-    for ix in 0..3 {
-        for iy in 0..3 {
-            let x = x0 + side * ix as f32 * 0.5;
-            let y = y0 + side * iy as f32 * 0.5;
-            let Ok(height) = maps.world_height(world.template.id, x, y) else {
-                return Ok(());
-            };
-            min = min.min(height);
-            max = max.max(height);
-        }
-    }
-    if max - min > MAX_TERRAIN_SPREAD {
-        return Err(err::HOUSE_CANNOT_LOCATE_TERRAIN_TOO_LOW);
-    }
-    Ok(())
 }
 
 fn player_owned(server: &GameServer, player: &PlayerRef, obj_id: u32) -> bool {
@@ -404,7 +369,6 @@ pub fn validate_house(
             }
         }
         validate_unit_overlap(server, player, &world, x0, y0, side, z)?;
-        validate_terrain(server, &world, x0, y0, side)?;
     }
     Ok(())
 }
