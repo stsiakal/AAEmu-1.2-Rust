@@ -379,7 +379,7 @@ Cross-subsystem calls: wired in phase 3b (see "Phase 3b wiring": trial court doo
 | Housing packets (11 CS, 14 SC incl. `SCLoginCharInfoHouse`, `SCMyHouse`) | `systems/housing/packets.rs` | done | Byte-exact tests. `CSChangeHousePayPacket` has opcode 0xfff in 1.2 (not registered). `SCHouseOwnerNameChangedPacket` is social's (`packets/misc.rs`). |
 | `CraftEffect` (`WorldInteractionGroup.Building`) | `systems/housing/mod.rs::apply_effect` | done | Routed first by `skills::ext::ExtHooks::route_effect`; quest `DoDoodadInteractionEvents` after it. |
 | `SpawnManager.Load` / `SpawnPersistentDoodads` housing parts, `LoadAccount` / `CSListCharacter` / `CSSelectCharacter` / `Character.Load` / `DeleteCharacterAssets` housing parts | `npcs/spawn_manager.rs`, `packets/c2g.rs`, `world/session.rs`, `db_character.rs` (one call each) | done | `LoadPlayerHousing` + `SpawnAll` before the persistent doodads, house parenting + bound doodads, `ReconcileBoundDoodads` (`UsePersistentHouseDoodads`). |
-| Placement validation | `systems/housing/placement.rs`, `systems/npcs/subzone.rs` | done | Original 1.2 housing XML `value1` tags resolve `housing_areas`/groups/categories; finite world positions, garden overlap, account eligibility, and nonrenewable beginner plots are checked server-side. World-scoped land checks also guard planting and housing crafting benches. Model-specific slope/height/footprint checks remain client-side. |
+| Placement validation | `systems/housing/placement.rs`, `systems/npcs/subzone.rs` | done | Original 1.2 housing XML `value1` tags resolve `housing_areas`/groups/categories; finite world positions, the whole `4n` footprint grid (`FUN_39331f70`/`FUN_39331ba0`), terrain spread (`FUN_39332180`/`FUN_39337fb0`), house and unit/doodad overlap (`FUN_39335860`), authored `max_construct_count`, account eligibility, and nonrenewable beginner plots are checked server-side. World-scoped land checks also guard planting and housing crafting benches. Real-data test: `placement::tests::real_area_338_footprint_accepts_only_the_fitting_spot`. |
 
 Economy hooks (`server.systems.housing.hooks`): installed by `economy::bridges::EconomyForHousing`. Housing API for others: `housing::{house_by_id, house_at_location, allowed_to_interact(_by_id), pay_weekly_tax (MailManager tax payment), act_ability_bonus_at (CharacterCraft), update_owned_housing_faction, demolish_by_player}`.
 
@@ -2300,6 +2300,33 @@ and in NPC wandering / buff remaining times.
   mail; FinalizeForBidFail still uses AucOffFail; receiver lookup is case-sensitive.
   The old return failure and sender unread-count bug are corrected below.
 * `systems::instances`: `RegisterIndunEvents` runs in the `Dungeon` constructor and again in the loader, so every indun event handler is subscribed twice; a dungeon kill raises `OnUnitKilled` (and the victim's `OnDeath`) in `PostUpdateCurrentHp` and again in `DoDie` — NPC-killed action chains run four times; `IndunEventDoodadSpawneds.UnSubscribe` adds the handler (`+=`); `AreaClearTick` stops at the first cleared room (`return`); a new dungeon verifies the requirements twice (the entry item is consumed twice) and the creator gets `SCProcessingInstancePacket` twice; `Transform.CloneDetached(character)` / `MainWorldPosition.Clone()` fire `OnZoneChange(0, zone)` (the instance zone chat is never left); `ApplyWorldSpawnPosition` stores the spawn rotation in degrees; leaving an instance sends the (radian) return rotation through `DegToRad` again and `SCLoadInstancePacket` names `MainWorldPosition.WorldId`; `DestroyDungeon` removes the players from the instance without moving them out; `InstantGame.RemovePlayer` looks the corps lists up by 0 / 1 instead of the faction ids (never cleaned); `AddScore` always sends `Corps1` / `score2 = 0`; the kill packet's victim count is the victim corps' kills; entering a battlefield set the corps faction through `Character.SetFaction`, which kicked guild members of another mother faction from their guild and party (no longer mirrored: the corps faction is temporary, see the RPA-09 deviation above); offline queue applicants are never pruned (`CharObj` is never null); `RemoveGame` leaves the game in the queue list; battlefields.json loops stop (`return`) at the first orphan row.
+* systems::housing (2026-10-31, placement validation): the server now applies the original
+  1.2 client's builder checks to `CSCreateHouse` (`ops::build` -> `placement::validate_house`),
+  the only player path; GM / preset / server-spawned houses (`manager::create`, the test-only
+  `TestHouse` fixture, fort and DB loading) do not run them. Footprint: `n =
+  int((garden_radius*2 + 3) * 0.25)` (`FUN_39897170`), the grid origin snapped to 4 m
+  (`FUN_39326980`), `n` x `n` cells of 4 m, every cell's four corners in one housing polygon
+  (`FUN_39331f70`/`FUN_39331ba0`) -> `0x70`; `n >= 12` yields no footprint (the client logs
+  "house too big", `FUN_39897170`). Category check for categories 1, 7-13, 15-18
+  (`FUN_39897070`): no area at the centre or a group without the category -> `0x244`
+  (`FUN_39897280`). Terrain: 3 x 3 samples over the placement square, refuse a spread above
+  6 m (`FUN_39332180` uses the ghost model box corners + centre, `FUN_39337fb0` a rotated
+  3 x 3 plot grid) -> `0x74`. Houses: axis-aligned new square vs each existing house's
+  yaw-oriented `4m` square, SAT (`FUN_39332c10` via `FUN_393349e0`) -> `0x71`. Units/doodads:
+  CryPhysics overlap of the footprint box with entity mask `0x1f` (`FUN_39181170` called by
+  `FUN_39335860`), ignoring houses and the placing character / its own mount -> `0x72`.
+  `max_construct_count` (DB column; the client decompile only carries the `0x2fe` text, no
+  producer) is enforced per account, group and category. Open deviations: the server has no
+  ghost model bounds for the terrain samples, so it samples the placement square (the client
+  model box is normally smaller); the client's unit owner filter (`FUN_39335860`) is only
+  partly decoded (the server skips the requester and its slave/mate); overlapping polygons
+  are accepted when any one polygon contains all four cell corners; with heightmaps or
+  CryPhysics disabled the corresponding check is skipped. Tests:
+  `placement_flow_tests::area_338_captured_spot_is_refused_and_the_fitting_spot_is_accepted`,
+  `..a_six_metre_terrain_spread_is_refused_with_terrain_too_low`,
+  `..a_unit_inside_the_footprint_is_refused_with_overlap_unit`,
+  `..a_house_rotated_into_the_footprint_is_refused_even_outside_the_radius_sum`; the real
+  1.2 polygon and `max_construct_count` row are checked by the gated test above.
 * systems::housing: abandoned-house removal buff 2250 now applies its original effect
   1876 through the normal damage path. C# rejected the house attacking itself, so the
   building never decayed. Only the active server-owned removal tick on that same unowned

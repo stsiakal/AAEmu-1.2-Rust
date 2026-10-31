@@ -3,11 +3,11 @@
 use std::collections::HashMap;
 
 use super::data::{HousingData, HousingTemplate};
+use crate::data::GameData;
 use crate::server::GameServer;
 use crate::systems::ai::collision::world::{ObjKind, Owner};
 use crate::systems::economy::error_message as err;
 use crate::systems::npcs::subzone::{self, Area};
-use crate::data::GameData;
 use crate::world::{PlayerRef, WorldInstance};
 
 /// `FUN_393312a0` / `FUN_398971c0`: the placement cells are 4 m squares.
@@ -18,6 +18,11 @@ const FOOTPRINT_MAX_CELLS: i32 = 12;
 const MAX_TERRAIN_SPREAD: f32 = 6.0;
 /// `FUN_39335860`: the unit/doodad collision query uses entity mask 0x1f.
 const UNIT_OVERLAP_MASK: u32 = 0x1f;
+
+/// `FUN_39897070`: categories that require a matching housing-area group/category.
+fn restricted_category(category: u32) -> bool {
+    matches!(category, 1 | 7..=13 | 15..=18)
+}
 
 /// `FUN_39897170`: `n = int((garden_radius * 2 + 3) * 0.25)`; `n >= 12` has no footprint.
 fn footprint_cells(garden_radius: f32) -> i32 {
@@ -161,6 +166,39 @@ fn validate_groups(
     Err(error)
 }
 
+/// `FUN_39337fb0` / `FUN_39332180`: the 6 m terrain spread over the placement square.
+fn validate_terrain(
+    server: &GameServer,
+    world: &WorldInstance,
+    x0: f32,
+    y0: f32,
+    side: f32,
+) -> Result<(), i16> {
+    let Some(maps) = server.systems.npcs.heightmaps.get() else {
+        return Ok(());
+    };
+    if !maps.config.heightmaps_enable {
+        return Ok(());
+    }
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    for ix in 0..3 {
+        for iy in 0..3 {
+            let x = x0 + side * ix as f32 * 0.5;
+            let y = y0 + side * iy as f32 * 0.5;
+            let Ok(height) = maps.world_height(world.template.id, x, y) else {
+                return Ok(());
+            };
+            min = min.min(height);
+            max = max.max(height);
+        }
+    }
+    if max - min > MAX_TERRAIN_SPREAD {
+        return Err(err::HOUSE_CANNOT_LOCATE_TERRAIN_TOO_LOW);
+    }
+    Ok(())
+}
+
 fn player_owned(server: &GameServer, player: &PlayerRef, obj_id: u32) -> bool {
     let Some(world) = server
         .world
@@ -214,37 +252,31 @@ fn validate_unit_overlap(
     Ok(())
 }
 
-/// `FUN_39337fb0` / `FUN_39332180`: the 6 m terrain spread over the placement square.
-fn validate_terrain(
-    server: &GameServer,
-    world: &WorldInstance,
-    x0: f32,
-    y0: f32,
-    side: f32,
-) -> Result<(), i16> {
-    let Some(maps) = server.systems.npcs.heightmaps.get() else {
-        return Ok(());
+/// 2D SAT of two squares (`FUN_39332c10`, used per cell by `FUN_393349e0`).
+fn squares_overlap(
+    a: (f64, f64),
+    a_half: f64,
+    a_yaw: f64,
+    b: (f64, f64),
+    b_half: f64,
+    b_yaw: f64,
+) -> bool {
+    let (sin_a, cos_a) = a_yaw.sin_cos();
+    let (sin_b, cos_b) = b_yaw.sin_cos();
+    let axes = [
+        (cos_a, sin_a),
+        (-sin_a, cos_a),
+        (cos_b, sin_b),
+        (-sin_b, cos_b),
+    ];
+    let d = (b.0 - a.0, b.1 - a.1);
+    let radius = |half: f64, sin: f64, cos: f64, n: (f64, f64)| {
+        half * ((n.0 * cos + n.1 * sin).abs() + (n.0 * -sin + n.1 * cos).abs())
     };
-    if !maps.config.heightmaps_enable {
-        return Ok(());
-    }
-    let mut min = f32::INFINITY;
-    let mut max = f32::NEG_INFINITY;
-    for ix in 0..3 {
-        for iy in 0..3 {
-            let x = x0 + side * ix as f32 * 0.5;
-            let y = y0 + side * iy as f32 * 0.5;
-            let Ok(height) = maps.world_height(world.template.id, x, y) else {
-                return Ok(());
-            };
-            min = min.min(height);
-            max = max.max(height);
-        }
-    }
-    if max - min > MAX_TERRAIN_SPREAD {
-        return Err(err::HOUSE_CANNOT_LOCATE_TERRAIN_TOO_LOW);
-    }
-    Ok(())
+    axes.iter().all(|&n| {
+        let distance = (d.0 * n.0 + d.1 * n.1).abs();
+        distance <= radius(a_half, sin_a, cos_a, n) + radius(b_half, sin_b, cos_b, n)
+    })
 }
 
 /// Validate before reserving a design, money, or tax certificates. Accounts without static
@@ -283,42 +315,78 @@ pub fn validate_house(
             template.garden_radius,
         )?;
     }
-    if fort.is_none() && !data.areas.is_empty() {
-        let areas = subzone::get_housing_zone_by_position(&server.game_data, &world.template, x, y)
-            .map_err(|_| err::HOUSE_CANNOT_LOCATE_INVALID_AREA)?;
-        if areas.is_empty() {
-            return Err(err::HOUSE_CANNOT_LOCATE_INVALID_AREA);
-        }
-        let owned_categories = server
-            .systems
-            .housing
-            .manager
-            .by_account(account)
-            .iter()
-            .filter_map(|house| {
-                data.template(house.data().unit.template_id)
-                    .map(|t| t.category_id)
-            })
-            .collect::<Vec<_>>();
-        let owned_counts = owned_group_counts(server, data, account);
-        validate_groups(
-            data,
-            &areas,
-            template.category_id,
-            &owned_categories,
-            &owned_counts,
-        )?;
-    }
     let cells = footprint_cells(template.garden_radius);
-    if cells > 0 && fort.is_none() && !data.areas.is_empty() {
+    let (x0, y0) = if cells > 0 {
+        footprint_origin(x, y, cells)
+    } else {
+        (x, y)
+    };
+    if fort.is_none() && !data.areas.is_empty() {
         let areas = housing_areas(&server.game_data, world.template.id);
-        let (x0, y0) = footprint_origin(x, y, cells);
-        for ix in 0..cells {
-            for iy in 0..cells {
-                let cx = x0 + ix as f32 * FOOTPRINT_CELL;
-                let cy = y0 + iy as f32 * FOOTPRINT_CELL;
-                if !cell_inside_one_area(&areas, cx, cy) {
-                    return Err(err::HOUSE_CANNOT_LOCATE_INVALID_AREA);
+        let centre = areas_at(&areas, x, y);
+        let centre_ids = centre.iter().map(|area| area.id).collect::<Vec<_>>();
+        let restricted = restricted_category(template.category_id);
+        let has_limit = centre_ids
+            .iter()
+            .filter_map(|id| data.areas.get(id))
+            .filter_map(|group_id| data.groups.get(group_id))
+            .any(|group| {
+                data.group_categories
+                    .get(&group.id)
+                    .is_some_and(|categories| categories.contains(&template.category_id))
+                    && data
+                        .max_construct_count
+                        .get(&(group.id, template.category_id))
+                        .copied()
+                        .unwrap_or(0)
+                        > 0
+            });
+        if restricted || has_limit {
+            if restricted && centre_ids.is_empty() {
+                // `FUN_39333e20`: a centre outside every polygon is the category-area error.
+                return Err(err::HOUSE_CANNOT_LOACATE_INVALID_CATEGORY_AREA);
+            }
+            if !centre_ids.is_empty() {
+                let owned_categories = server
+                    .systems
+                    .housing
+                    .manager
+                    .by_account(account)
+                    .iter()
+                    .filter_map(|house| {
+                        data.template(house.data().unit.template_id)
+                            .map(|t| t.category_id)
+                    })
+                    .collect::<Vec<_>>();
+                let owned_counts = owned_group_counts(server, data, account);
+                match validate_groups(
+                    data,
+                    &centre_ids,
+                    template.category_id,
+                    &owned_categories,
+                    &owned_counts,
+                ) {
+                    Ok(_) => {}
+                    Err(error) => {
+                        // Outside the restricted categories the client does not check the
+                        // area/category pairing; only an authored construct limit can fire.
+                        if restricted
+                            || error == err::HOUSE_CANNOT_CONSTRUCT_IN_AREA_BY_MAX_CONSTRUCT_COUNT
+                        {
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+        }
+        if cells > 0 {
+            for ix in 0..cells {
+                for iy in 0..cells {
+                    let cx = x0 + ix as f32 * FOOTPRINT_CELL;
+                    let cy = y0 + iy as f32 * FOOTPRINT_CELL;
+                    if !cell_inside_one_area(&areas, cx, cy) {
+                        return Err(err::HOUSE_CANNOT_LOCATE_INVALID_AREA);
+                    }
                 }
             }
         }
@@ -326,7 +394,6 @@ pub fn validate_house(
     if cells > 0 {
         let side = cells as f32 * FOOTPRINT_CELL;
         let half = side * 0.5;
-        let (x0, y0) = footprint_origin(x, y, cells);
         for house in server.systems.housing.manager.all() {
             let (house_instance, id, position, scale, rot_z) = {
                 let h = house.data();
@@ -367,33 +434,6 @@ pub fn validate_house(
         validate_terrain(server, &world, x0, y0, side)?;
     }
     Ok(())
-}
-
-/// 2D SAT of two squares (`FUN_39332c10`, used per cell by `FUN_393349e0`).
-fn squares_overlap(
-    a: (f64, f64),
-    a_half: f64,
-    a_yaw: f64,
-    b: (f64, f64),
-    b_half: f64,
-    b_yaw: f64,
-) -> bool {
-    let (sin_a, cos_a) = a_yaw.sin_cos();
-    let (sin_b, cos_b) = b_yaw.sin_cos();
-    let axes = [
-        (cos_a, sin_a),
-        (-sin_a, cos_a),
-        (cos_b, sin_b),
-        (-sin_b, cos_b),
-    ];
-    let d = (b.0 - a.0, b.1 - a.1);
-    let radius = |half: f64, sin: f64, cos: f64, n: (f64, f64)| {
-        half * ((n.0 * cos + n.1 * sin).abs() + (n.0 * -sin + n.1 * cos).abs())
-    };
-    axes.iter().all(|&n| {
-        let distance = (d.0 * n.0 + d.1 * n.1).abs();
-        distance <= radius(a_half, sin_a, cos_a, n) + radius(b_half, sin_b, cos_b, n)
-    })
 }
 
 /// Beginner plots in the original data (`housing_groups.can_extend = false`) expire rather
@@ -482,7 +522,7 @@ mod tests {
         );
         assert_eq!(
             validate_house(&server, &player, &template, 50., 50., 100.),
-            Err(err::HOUSE_CANNOT_LOCATE_INVALID_AREA)
+            Err(err::HOUSE_CANNOT_LOACATE_INVALID_CATEGORY_AREA)
         );
         assert_eq!(
             validate_house(&server, &player, &template, 2500., 500., 100.),
