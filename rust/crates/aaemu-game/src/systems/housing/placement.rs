@@ -3,8 +3,59 @@
 use super::data::{HousingData, HousingTemplate};
 use crate::server::GameServer;
 use crate::systems::economy::error_message as err;
-use crate::systems::npcs::subzone;
+use crate::systems::npcs::subzone::{self, Area};
+use crate::data::GameData;
 use crate::world::PlayerRef;
+
+/// `FUN_393312a0` / `FUN_398971c0`: the placement cells are 4 m squares.
+const FOOTPRINT_CELL: f32 = 4.0;
+/// `FUN_39897170`: 12 or more cells is logged as "house too big" and yields no footprint.
+const FOOTPRINT_MAX_CELLS: i32 = 12;
+
+/// `FUN_39897170`: `n = int((garden_radius * 2 + 3) * 0.25)`; `n >= 12` has no footprint.
+fn footprint_cells(garden_radius: f32) -> i32 {
+    if !garden_radius.is_finite() {
+        return 0;
+    }
+    let n = ((garden_radius * 2.0 + 3.0) * 0.25) as i32;
+    if n >= FOOTPRINT_MAX_CELLS {
+        return 0;
+    }
+    n.max(0)
+}
+
+/// `FUN_39326980` / `FUN_393312a0`: the grid origin is snapped to the world's 4 m grid.
+fn footprint_origin(x: f32, y: f32, cells: i32) -> (f32, f32) {
+    let half = cells as f32 * FOOTPRINT_CELL * 0.5;
+    let snap = |v: f32| ((v - half + FOOTPRINT_CELL * 0.5) * 0.25) as i32 as f32 * FOOTPRINT_CELL;
+    (snap(x), snap(y))
+}
+
+/// Every housing polygon of a world template, as the client's housing-area manager sees them.
+fn housing_areas(data: &GameData, world_template_id: u32) -> Vec<&Area> {
+    data.systems
+        .npcs
+        .subzone
+        .housing_zones
+        .get(&world_template_id)
+        .map(|zones| zones.values().flatten().collect())
+        .unwrap_or_default()
+}
+
+/// `FUN_39331ba0`: all four corners of one 4 m cell must lie in the same housing polygon.
+fn cell_inside_one_area(areas: &[&Area], x: f32, y: f32) -> bool {
+    let corners = [
+        (x, y),
+        (x + FOOTPRINT_CELL, y),
+        (x, y + FOOTPRINT_CELL),
+        (x + FOOTPRINT_CELL, y + FOOTPRINT_CELL),
+    ];
+    areas.iter().any(|area| {
+        corners
+            .iter()
+            .all(|&(px, py)| subzone::is_inside(&area.points, [px, py, 0.0]))
+    })
+}
 
 fn validate_groups(
     data: &HousingData,
@@ -93,6 +144,20 @@ pub fn validate_house(
             })
             .collect::<Vec<_>>();
         validate_groups(data, &areas, template.category_id, &owned_categories)?;
+    }
+    let cells = footprint_cells(template.garden_radius);
+    if cells > 0 && fort.is_none() && !data.areas.is_empty() {
+        let areas = housing_areas(&server.game_data, world.template.id);
+        let (x0, y0) = footprint_origin(x, y, cells);
+        for ix in 0..cells {
+            for iy in 0..cells {
+                let cx = x0 + ix as f32 * FOOTPRINT_CELL;
+                let cy = y0 + iy as f32 * FOOTPRINT_CELL;
+                if !cell_inside_one_area(&areas, cx, cy) {
+                    return Err(err::HOUSE_CANNOT_LOCATE_INVALID_AREA);
+                }
+            }
+        }
     }
     for house in server.systems.housing.manager.all() {
         let (house_instance, id, position, scale) = {
