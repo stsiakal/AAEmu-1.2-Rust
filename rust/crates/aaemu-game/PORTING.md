@@ -379,7 +379,7 @@ Cross-subsystem calls: wired in phase 3b (see "Phase 3b wiring": trial court doo
 | Housing packets (11 CS, 14 SC incl. `SCLoginCharInfoHouse`, `SCMyHouse`) | `systems/housing/packets.rs` | done | Byte-exact tests. `CSChangeHousePayPacket` has opcode 0xfff in 1.2 (not registered). `SCHouseOwnerNameChangedPacket` is social's (`packets/misc.rs`). |
 | `CraftEffect` (`WorldInteractionGroup.Building`) | `systems/housing/mod.rs::apply_effect` | done | Routed first by `skills::ext::ExtHooks::route_effect`; quest `DoDoodadInteractionEvents` after it. |
 | `SpawnManager.Load` / `SpawnPersistentDoodads` housing parts, `LoadAccount` / `CSListCharacter` / `CSSelectCharacter` / `Character.Load` / `DeleteCharacterAssets` housing parts | `npcs/spawn_manager.rs`, `packets/c2g.rs`, `world/session.rs`, `db_character.rs` (one call each) | done | `LoadPlayerHousing` + `SpawnAll` before the persistent doodads, house parenting + bound doodads, `ReconcileBoundDoodads` (`UsePersistentHouseDoodads`). |
-| Placement validation | `systems/housing/placement.rs`, `systems/npcs/subzone.rs` | done | Original 1.2 housing XML `value1` tags resolve `housing_areas`/groups/categories; finite world positions, garden overlap, account eligibility, and nonrenewable beginner plots are checked server-side. World-scoped land checks also guard planting and housing crafting benches. Model-specific slope/height/footprint checks remain client-side. |
+| Placement validation | `systems/housing/placement.rs`, `systems/npcs/subzone.rs` | done | Original 1.2 housing XML `value1` tags resolve `housing_areas`/groups/categories; finite world positions, the whole `4n` footprint grid (`FUN_39331f70`/`FUN_39331ba0`), snapped-box house overlap (`FUN_39331f30`/`FUN_393349e0`), unit/doodad overlap with house-attached doodads skipped (`FUN_39335860`), authored `max_construct_count`, account eligibility, and nonrenewable beginner plots are checked server-side under the world placement guard. Terrain and mode-1 (n=0) model-box checks are omitted because the server has no render-model bounds (never stricter than the client). World-scoped land checks also guard planting and housing crafting benches. Real-data test: `placement::tests::real_area_338_footprint_accepts_only_the_fitting_spot`. |
 
 Economy hooks (`server.systems.housing.hooks`): installed by `economy::bridges::EconomyForHousing`. Housing API for others: `housing::{house_by_id, house_at_location, allowed_to_interact(_by_id), pay_weekly_tax (MailManager tax payment), act_ability_bonus_at (CharacterCraft), update_owned_housing_faction, demolish_by_player}`.
 
@@ -2328,6 +2328,39 @@ and in NPC wandering / buff remaining times.
   mail; FinalizeForBidFail still uses AucOffFail; receiver lookup is case-sensitive.
   The old return failure and sender unread-count bug are corrected below.
 * `systems::instances`: `RegisterIndunEvents` runs in the `Dungeon` constructor and again in the loader, so every indun event handler is subscribed twice; a dungeon kill raises `OnUnitKilled` (and the victim's `OnDeath`) in `PostUpdateCurrentHp` and again in `DoDie` — NPC-killed action chains run four times; `IndunEventDoodadSpawneds.UnSubscribe` adds the handler (`+=`); `AreaClearTick` stops at the first cleared room (`return`); a new dungeon verifies the requirements twice (the entry item is consumed twice) and the creator gets `SCProcessingInstancePacket` twice; `Transform.CloneDetached(character)` / `MainWorldPosition.Clone()` fire `OnZoneChange(0, zone)` (the instance zone chat is never left); `ApplyWorldSpawnPosition` stores the spawn rotation in degrees; leaving an instance sends the (radian) return rotation through `DegToRad` again and `SCLoadInstancePacket` names `MainWorldPosition.WorldId`; `DestroyDungeon` removes the players from the instance without moving them out; `InstantGame.RemovePlayer` looks the corps lists up by 0 / 1 instead of the faction ids (never cleaned); `AddScore` always sends `Corps1` / `score2 = 0`; the kill packet's victim count is the victim corps' kills; entering a battlefield set the corps faction through `Character.SetFaction`, which kicked guild members of another mother faction from their guild and party (no longer mirrored: the corps faction is temporary, see the RPA-09 deviation above); offline queue applicants are never pruned (`CharObj` is never null); `RemoveGame` leaves the game in the queue list; battlefields.json loops stop (`return`) at the first orphan row.
+* systems::housing (2026-10-31, placement validation): the server now applies the original
+  1.2 client's builder checks to `CSCreateHouse` (`ops::build` -> `placement::validate_house`),
+  the only player path; GM / preset / server-spawned houses (`manager::create`, the test-only
+  `TestHouse` fixture, fort and DB loading) do not run them. Footprint: `n =
+  int((garden_radius*2 + 3) * 0.25)` (`FUN_39897170`), the grid origin snapped to 4 m
+  (`FUN_39326980`), `n` x `n` cells of 4 m, every cell's four corners in one housing polygon
+  (`FUN_39331f70`/`FUN_39331ba0`) -> `0x70`; `n >= 12` yields no footprint (the client logs
+  "house too big", `FUN_39897170`). Category check for categories 1, 7-13, 15-18
+  (`FUN_39897070`): no area at the centre or a group without the category -> `0x244`
+  (`FUN_39897280`). Houses: the new snapped grid square vs each existing mode-2 house's own
+  snapped axis-aligned `4n` box, strict inequalities as in `FUN_39331f30` via
+  `FUN_393349e0` -> `0x71`; `rot_z` is not used for mode-2 houses. Units/doodads: CryPhysics
+  overlap of the footprint box with entity mask `0x1f` (`FUN_39181170` called by
+  `FUN_39335860`), ignoring houses, the placing character / its own mount, and every doodad
+  attached to an existing house (the client's skip list) -> `0x72`. `max_construct_count`
+  (DB column; the client decompile only carries the `0x2fe` text, no producer) is enforced
+  per account, group and category. The check and the insert/spawn are one critical section
+  under `WorldInstance::placement_guard`, as for planting; race test
+  `two_house_builds_at_the_same_spot_race_and_one_wins`. Open deviations: terrain is not
+  checked because the client samples the turned ghost model box (`FUN_39326c10` from
+  `FUN_39332180`, and the rotated 3 x 3 plot grid of `FUN_39337fb0`) and the server has no
+  render-model bounds; n=0 "mode-1" designs (walls, towers, gates) and existing mode-1 houses
+  use the model box via `FUN_390318f0` / `FUN_39332c10`, so their house/unit/terrain checks
+  stay lenient; the template flag at desc `+9` (`FUN_39897130`) that also clears a doodad from
+  the overlap query is not mapped to a server field. Overlapping polygons are accepted when
+  any one polygon contains all four cell corners; with CryPhysics disabled the unit/doodad
+  check is skipped. Tests:
+  `placement_flow_tests::area_338_captured_spot_is_refused_and_the_fitting_spot_is_accepted`,
+  `..a_unit_inside_the_footprint_is_refused_with_overlap_unit`,
+  `..doodads_attached_to_a_house_are_ignored_by_the_unit_overlap`,
+  `..a_rotated_house_uses_the_clients_snapped_axis_aligned_box`,
+  `..two_house_builds_at_the_same_spot_race_and_one_wins`; the real 1.2 polygon and
+  `max_construct_count` row are checked by the gated test above.
 * systems::housing: abandoned-house removal buff 2250 now applies its original effect
   1876 through the normal damage path. C# rejected the house attacking itself, so the
   building never decayed. Only the active server-owned removal tick on that same unowned
@@ -3399,3 +3432,49 @@ container accepts it (the same `can_accept` / `SplitOrMoveItem` path as `CSSwapI
 does the player equipping something else into the back slot. A pack lost while the character is
 dead keeps the record until `resurrect_character`. The explicit `SCUnitEquipmentsChangedPacket`
 broadcast in `put_down_backpack` is gone (the equipment events broadcast leave and re-equip).
+
+## Glider deploy gate and the gliding error codes (2026-10-31)
+
+The C# defined `CannotInteractWhileGliding` / `CannotChangeBackpackInGliding` but never raised them
+and did not check the equipped glider. The Rust adds the 1.2 rules at these entry points
+(`systems::skills::glider` holds the shared predicates):
+
+- `CSStartSkill` of a glider skill requires the equipped glider. A glider skill is a deploy skill
+  (`skills.skill_controller_id` 2687, 31 rows) or a linked glider skill
+  (`skills.link_backpack_type_id` 2: 14901 "glider use" with `link_equip_slot_id` 26, 17657 "glider
+  fold"). The back-slot item must be a glider (`item_backpacks.backpack_type_id` 2), and an
+  `Item` cast must be exactly that equipped item. This mirrors the client's link check
+  `FUN_393925c0` (item backpack type == `link_backpack_type_id` in the linked slot), whose failure
+  raises `must_equip_proper_item` 326. The client converts the default glider skill 14901 into the
+  equipped item's `use_skill_id` (item 14677 -> 12373), so the deploy arrives as an `Item` cast.
+  A refused cast sends `SCErrorMsg(326)` and the `SCSkillStarted` `NO_PERM` result.
+- `CSSwapItemsPacket` / `CSSplitBagItemPacket` moves that take an item out of, or put one into, the
+  back slot while the unit is gliding raise `cannot_change_backpack_in_gliding` 543, mirroring the
+  client's equip validation `FUN_394e41f0`.
+- **Gliding state:** `is_gliding` is an active `buffs.gliding = 't'` buff **while airborne**
+  (`skill_state.airborne`, set by `on_actor_move`). The 1.2 client's stance-4 check ends on the
+  landing movement, while buffs 7431 / 1675 (test / indun flight skills) are not `remove_on_land`
+  and would otherwise keep blocking a landed player. The buff alone (`has_gliding_buff`) is used
+  only for the fold.
+- **Every interaction entry path** uses one shared 334 check (`glider::refuse_interaction`):
+  the skill `InteractionEffect` (`interaction_effect`, which is how doodad use / gathering /
+  looting a doodad / the mailbox arrive) and the direct `execute_interaction_with` path (the
+  CSLootOpenBag recover-item func), `CSStartInteractionPacket`, `CSInteractNPCPacket` (NPC and
+  gimmick targets), `CSLootOpenBagPacket` and opening a `CSCofferInteractionPacket`. The client's
+  gate is `FUN_393b3d50`, which runs before its interaction action `FUN_390a6af0`. A landed unit
+  with a lingering 7431 / 1675 buff is not gliding and is not refused.
+- **Fold when the glider is gone:** the back slot can still change mid-flight through a timed
+  glider expiring or `CSDestroyItem` on the equipped slot. A fold skill (`link_backpack_type_id`
+  2 with `link_equip_slot_id` -1, e.g. 17657) is accepted while a gliding buff is active even with
+  no equipped glider, and the successful fold ends every active gliding buff (`glider::end_flight`)
+  so the client falls cleanly instead of getting `must_equip_proper_item` 326. Without a flight, a
+  forged fold still needs the equipped glider.
+- **Not added:** an airborne requirement for deploying. The 1.2 glider skill has only the authored
+  `unit_reqs` NotUnderWater and NoBuffTag 306 (`unit_reqs` 28592 / 28593), the client start path
+  `FUN_393989e0` checks only the linked item (no stance / air test), and the startup lift
+  (`gliding_startup_speed`) is what takes off from the ground. The double-jump deploy height /
+  freefall gate (`OPTION_ITEM_USE_GLIDE_WITH_DOUBLE_JUMP`, option 57) remains capture-pending
+  (S14-C4).
+- **Not gated:** the internal automatic backpack replacement (`Inventory.TryEquipNewBackPack` from
+  loot / craft / quests). Those callers may hold the character lock, so a `buffs` check there could
+  deadlock; the client-side interaction and equip gates that lead to them are covered above.
