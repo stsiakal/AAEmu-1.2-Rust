@@ -64,13 +64,13 @@ impl HousingEconomyHooks for TestHooks {
     fn inventory_item(
         &self,
         _server: &crate::server::GameServer,
-        _player: &PlayerRef,
+        player: &PlayerRef,
         item_id: u64,
     ) -> Option<HouseItem> {
         Some(HouseItem {
             item_id,
             template_id: DESIGN_ITEM,
-            owner_id: 1,
+            owner_id: u64::from(player.character_id),
             count: 1,
             max_count: 1,
             slot_type: slot_type::INVENTORY,
@@ -321,5 +321,126 @@ async fn a_rotated_house_uses_the_clients_snapped_axis_aligned_box() {
     assert_eq!(
         build_error(&mut f, ACCEPTED.0, ACCEPTED.1),
         Some(crate::systems::economy::error_message::HOUSE_CANNOT_LOCATE_OVERLAP_HOUSE)
+    );
+}
+
+/// Greptile P1: validation and insertion were a snapshot, so two `CSCreateHouse` calls at
+/// the same spot could both pass and both insert. `ops::build` now holds the world's
+/// placement guard from the final check through `spawn_house`.
+///
+/// The first build pauses just after its check. With the guard the second waits and then
+/// sees the first house (0x71); without it both reach the pause, pass and insert (mutation).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_house_builds_at_the_same_spot_race_and_one_wins() {
+    use std::sync::{Condvar, Mutex};
+    use std::time::{Duration, Instant};
+
+    thread_local! {
+        static RACING_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    struct RacePause {
+        arrived: Mutex<usize>,
+        cv: Condvar,
+    }
+    struct ClearPause;
+    impl Drop for ClearPause {
+        fn drop(&mut self) {
+            super::ops::set_placement_pause(None);
+        }
+    }
+
+    let server = Arc::new(test_server_large(data()));
+    server.set_self();
+    server.systems.housing.hooks.install(Arc::new(TestHooks));
+    let client_a = TestClient::new(&server, 1, 1001);
+    let mut client_a = client_a;
+    let player_a = spawn_player(
+        &server,
+        &client_a,
+        test_character(1, "Owner A", ACCEPTED.0, ACCEPTED.1),
+        10,
+    );
+    let mut client_b = TestClient::new(&server, 2, 1002);
+    let player_b = spawn_player(
+        &server,
+        &client_b,
+        test_character(2, "Owner B", ACCEPTED.0, ACCEPTED.1),
+        11,
+    );
+    client_a.drain();
+    client_b.drain();
+
+    let pause = Arc::new(RacePause {
+        arrived: Mutex::new(0),
+        cv: Condvar::new(),
+    });
+    let guard_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    super::ops::set_placement_pause(Some({
+        let pause = pause.clone();
+        let guard_seen = guard_seen.clone();
+        let world = server.world.world(0).unwrap();
+        Arc::new(move || {
+            if !RACING_THREAD.with(|racing| racing.get()) {
+                return;
+            }
+            guard_seen.store(
+                world.placement_guard_is_locked(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            let mut arrived = pause.arrived.lock().unwrap();
+            *arrived += 1;
+            pause.cv.notify_all();
+            if *arrived > 1 {
+                return;
+            }
+            let deadline = Instant::now() + Duration::from_millis(250);
+            while *arrived < 2 {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let (guard, _) = pause.cv.wait_timeout(arrived, deadline - now).unwrap();
+                arrived = guard;
+            }
+        })
+    }));
+    let _clear_pause = ClearPause;
+
+    let handle = tokio::runtime::Handle::current();
+    let build = |server: Arc<GameServer>, player: PlayerRef, handle: tokio::runtime::Handle| {
+        std::thread::spawn(move || {
+            let _runtime = handle.enter();
+            RACING_THREAD.with(|racing| racing.set(true));
+            let account = player.data().account_id;
+            super::ops::build(&server, &player, account, &packet(ACCEPTED.0, ACCEPTED.1));
+        })
+    };
+    let a = build(server.clone(), player_a, handle.clone());
+    let b = build(server.clone(), player_b, handle.clone());
+    a.join().unwrap();
+    b.join().unwrap();
+
+    assert!(
+        guard_seen.load(std::sync::atomic::Ordering::SeqCst),
+        "the placement guard is held across the validate-to-spawn window"
+    );
+    assert_eq!(
+        server.systems.housing.manager.count(),
+        1,
+        "exactly one house stands on the spot"
+    );
+    let errors = |client: &mut TestClient| {
+        client
+            .drain()
+            .into_iter()
+            .filter(|(op, _)| *op == sc::SCErrorMsgPacket)
+            .map(|(_, body)| i16::from_le_bytes([body[0], body[1]]))
+            .collect::<Vec<_>>()
+    };
+    let (codes_a, codes_b) = (errors(&mut client_a), errors(&mut client_b));
+    assert!(
+        codes_a.iter().chain(codes_b.iter()).any(|code| *code
+            == crate::systems::economy::error_message::HOUSE_CANNOT_LOCATE_OVERLAP_HOUSE),
+        "{codes_a:?} {codes_b:?}"
     );
 }
