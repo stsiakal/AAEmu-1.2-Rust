@@ -1458,6 +1458,241 @@ async fn slave_summon_bind_drive_and_despawn() {
     assert!(ops(&b.drain()).contains(&sc::SCUnitsRemovedPacket));
 }
 
+/// A seat another character already holds answers `slave_already_has_master` 0x61 instead of
+/// the C# silent return, keeps the occupant, and frees the seat when the occupant leaves. The
+/// check and the reservation happen under the slave's one lock, so the seat can never be
+/// handed to two characters.
+#[tokio::test]
+async fn a_taken_seat_answers_slave_already_has_master_and_keeps_the_occupant() {
+    use crate::models::slave::Slave;
+    use crate::world::Entity;
+
+    let server = server_with(slave_data());
+    let mut a = TestClient::new(&server, 1, 1);
+    let mut b = TestClient::new(&server, 2, 2);
+    let mut c = TestClient::new(&server, 3, 3);
+    let pa = spawn_player(&server, &a, test_character(1, "Driver", 100.0, 100.0), PA);
+    let pb = spawn_player(
+        &server,
+        &b,
+        test_character(2, "Passenger", 101.0, 100.0),
+        PB,
+    );
+    let pc = spawn_player(
+        &server,
+        &c,
+        test_character(3, "Third", 102.0, 100.0),
+        0x00F0_0003,
+    );
+    a.conn.active_char = Some(pa.clone());
+    b.conn.active_char = Some(pb.clone());
+    c.conn.active_char = Some(pc.clone());
+    let world = server.world.world(0).unwrap();
+    let mut cart = Slave::new(0, SLAVE_TEMPLATE);
+    cart.unit.transform.set_xyz(103.0, 100.0, 100.0);
+    cart.unit.tl_id = 3;
+    cart.summoner_obj_id = PA;
+    cart.summoner_id = pa.character_id;
+    let cart = Entity::new(0x300, cart);
+    world.spawn(&cart, &server.view_ctx());
+    a.drain();
+    b.drain();
+    c.drain();
+
+    slaves::bind_slave(&server, &pa, cart.obj_id, attach_point::DRIVER, 7);
+    assert_eq!(
+        cart.data().attached_characters,
+        vec![(attach_point::DRIVER, PA)]
+    );
+    a.drain();
+    b.drain();
+    c.drain();
+
+    // The driver seat is taken: B is refused with the 1.2 `slave_already_has_master` error.
+    slaves::bind_slave(&server, &pb, cart.obj_id, attach_point::DRIVER, 7);
+    assert_eq!(
+        error_codes(&b.drain()),
+        vec![super::error::SLAVE_ALREADY_HAS_MASTER]
+    );
+    assert_eq!(
+        cart.data().attached_characters,
+        vec![(attach_point::DRIVER, PA)]
+    );
+    assert_eq!(pb.data().attached_point, attach_point::NONE);
+    assert_eq!(pb.data().unit.transform.parent_obj_id, 0);
+    assert!(a.drain().is_empty(), "a refused bind attaches nobody");
+
+    // The free passenger seat still takes B at point 2, with the exact attach packet.
+    slaves::bind_slave(&server, &pb, cart.obj_id, attach_point::PASSENGER0, 7);
+    assert_eq!(
+        cart.data().attached_characters,
+        vec![(attach_point::DRIVER, PA), (attach_point::PASSENGER0, PB)]
+    );
+    let mut attached = bc(PB);
+    attached.push(attach_point::PASSENGER0);
+    attached.extend(bc(cart.obj_id));
+    attached.push(7);
+    assert_eq!(body(&b.drain(), sc::SCUnitAttachedPacket), attached);
+    assert!(ops(&a.drain()).contains(&sc::SCUnitAttachedPacket));
+
+    // A third character on the taken passenger seat gets the same error.
+    slaves::bind_slave(&server, &pc, cart.obj_id, attach_point::PASSENGER0, 7);
+    assert_eq!(
+        error_codes(&c.drain()),
+        vec![super::error::SLAVE_ALREADY_HAS_MASTER]
+    );
+    assert_eq!(cart.data().attached_characters.len(), 2);
+
+    // Leaving frees the seat for the next character.
+    slaves::unbind_slave(&server, &pa, 3, slaves::attach_reason::SLAVE_BINDING);
+    slaves::bind_slave(&server, &pc, cart.obj_id, attach_point::DRIVER, 7);
+    assert_eq!(
+        cart.data().attached_characters,
+        vec![
+            (attach_point::PASSENGER0, PB),
+            (attach_point::DRIVER, 0x00F0_0003)
+        ]
+    );
+}
+
+const PASSENGER_SKILL: u32 = 13_863;
+const PASSENGER_EFFECT: u32 = 2_378;
+
+/// The real 1.2 passenger-seat data: skill 13863 carries effect 8869 -> special effect 2378,
+/// type 53 `AttachTo`, with value1 2 (passenger point) and value2..4 0. This fixture keeps
+/// value1 2 and sets value2 to the decoy 9, so a regression that read value2 would seat point 9.
+fn passenger_data() -> GameData {
+    use crate::systems::skills::data::effects::SpecialEffect;
+    use crate::systems::skills::data::{EffectKind, EffectTemplate, SkillTemplate};
+    let mut d = slave_data();
+    d.systems.skills.add_effect(
+        EffectKind::SpecialEffect,
+        EffectTemplate::Special(SpecialEffect {
+            id: PASSENGER_EFFECT,
+            special_effect_type_id: 53,
+            value1: attach_point::PASSENGER0.into(),
+            value2: 9,
+            value3: 0,
+            value4: 0,
+        }),
+        PASSENGER_EFFECT,
+    );
+    d.systems.skills.add_skill(SkillTemplate {
+        id: PASSENGER_SKILL,
+        target_type: 5, // AnyUnit
+        target_selection: 2,
+        target_relation: 0, // Any
+        min_range: 0,
+        max_range: 4,
+        default_gcd: false,
+        level_rule_no_consideration: true,
+        effects: vec![crate::systems::skills::tests::skill_effect(
+            PASSENGER_EFFECT,
+            EffectKind::SpecialEffect,
+            PASSENGER_EFFECT,
+        )],
+        ..crate::systems::skills::tests::skill_template(PASSENGER_SKILL)
+    });
+    d
+}
+
+/// Skill 13863 (`Take the Passenger Seat`) seats the caster at point 2 through the real
+/// `CSStartSkill` handler and `AttachTo` special effect; a second character on the same seat
+/// is answered with `slave_already_has_master`.
+#[tokio::test]
+async fn passenger_skill_13863_seats_point_two_and_a_taken_seat_answers_97() {
+    use crate::models::slave::Slave;
+    use crate::systems::skills::handlers::{start_skill, CSStartSkillPacket};
+    use crate::systems::skills::types::{SkillCastTarget, SkillCaster, SkillObject};
+    use crate::world::Entity;
+
+    let server = server_with(passenger_data());
+    crate::systems::economy::bridges::install(&server);
+    crate::systems::npcs::install_hooks(&server);
+    super::install_hooks(&server);
+    let mut a = TestClient::new(&server, 1, 1);
+    let mut b = TestClient::new(&server, 2, 2);
+    let mut c = TestClient::new(&server, 3, 3);
+    let pa = spawn_player(&server, &a, test_character(1, "Driver", 100.0, 100.0), PA);
+    let mut passenger = test_character(2, "Passenger", 101.0, 100.0);
+    passenger
+        .skills
+        .skills
+        .push(crate::models::char_data::Skill {
+            id: PASSENGER_SKILL,
+            level: 1,
+        });
+    let pb = spawn_player(&server, &b, passenger, PB);
+    let mut third = test_character(3, "Third", 102.0, 100.0);
+    third.skills.skills.push(crate::models::char_data::Skill {
+        id: PASSENGER_SKILL,
+        level: 1,
+    });
+    let pc = spawn_player(&server, &c, third, 0x00F0_0003);
+    a.conn.active_char = Some(pa.clone());
+    b.conn.active_char = Some(pb.clone());
+    c.conn.active_char = Some(pc.clone());
+    for p in [&pb, &pc] {
+        let mut d = p.data();
+        d.unit.hp = 1000;
+        d.unit.max_hp = 1000;
+    }
+    let world = server.world.world(0).unwrap();
+    let mut cart = Slave::new(0, SLAVE_TEMPLATE);
+    cart.unit.transform.set_xyz(103.0, 100.0, 100.0);
+    cart.unit.tl_id = 3;
+    cart.summoner_obj_id = PA;
+    cart.summoner_id = pa.character_id;
+    let cart = Entity::new(0x300, cart);
+    world.spawn(&cart, &server.view_ctx());
+    a.drain();
+    b.drain();
+    c.drain();
+
+    let cast = |client: &mut TestClient, caster: u32, target: u32| {
+        start_skill(
+            &server,
+            &mut client.conn,
+            CSStartSkillPacket {
+                skill_id: PASSENGER_SKILL,
+                caster: SkillCaster::Unit(caster),
+                target: SkillCastTarget::Unit(target),
+                flag: 0,
+                skill_object: SkillObject::None,
+            },
+        );
+    };
+
+    cast(&mut b, PB, cart.obj_id);
+    assert_eq!(
+        cart.data().attached_characters,
+        vec![(attach_point::PASSENGER0, PB)],
+        "AttachTo must use value1 (point 2), not the decoy value2 (point 9)"
+    );
+    assert_eq!(pb.data().attached_point, attach_point::PASSENGER0);
+    assert_eq!(pb.data().unit.transform.parent_obj_id, cart.obj_id);
+    let mut attached = bc(PB);
+    attached.push(attach_point::PASSENGER0);
+    attached.extend(bc(cart.obj_id));
+    attached.push(slaves::attach_reason::NEW_MASTER);
+    assert_eq!(body(&b.drain(), sc::SCUnitAttachedPacket), attached);
+    a.drain();
+    c.drain();
+
+    // The passenger seat is now taken: the second cast is refused, not silently dropped.
+    cast(&mut c, 0x00F0_0003, cart.obj_id);
+    assert_eq!(
+        error_codes(&c.drain()),
+        vec![super::error::SLAVE_ALREADY_HAS_MASTER]
+    );
+    assert_eq!(
+        cart.data().attached_characters,
+        vec![(attach_point::PASSENGER0, PB)]
+    );
+    assert_eq!(pc.data().unit.transform.parent_obj_id, 0);
+    b.drain();
+}
+
 /// A deck stander's transform is hull-local (`parent_obj_id` set) but it is not in the hull's
 /// `AttachedCharacters` (it was not bound as a driver). Replacing the hull must give the owner
 /// its world pose back before `create_spawn_committed` reads it: otherwise the summon places
@@ -3019,6 +3254,113 @@ fn real_compact_db_vehicle_tables() {
             points.iter().any(|(p, _)| *p == point),
             "slave {slave} model {model} point {point}"
         );
+    }
+}
+
+/// Real 1.2 cart / ship / cannon slaves. The shipped `slave_attach_points*.json` lists the
+/// driver helper for the ships and only the Rowboat a passenger point; cart / car passenger
+/// points live on the client model (`$passenger0`, `attach_anims`) and are absent from that
+/// JSON. The interaction list must therefore offer the passenger skill 13863 for a real cart
+/// or ship whose driver seat is taken (point 2 free) and never for a cannon, and the real
+/// `AttachTo` row must still be special type 53 value1 2.
+#[tokio::test]
+#[ignore = "needs AAEMU_COMPACT_DB"]
+async fn real_cart_and_ship_slaves_offer_the_passenger_seat() {
+    use crate::models::slave::Slave;
+    use crate::world::Entity;
+
+    let Ok(db) = std::env::var("AAEMU_COMPACT_DB") else {
+        return;
+    };
+    let d = load_real(&db, &[]);
+    // Seat points (driver 1 + passenger0..6) of the real models in the shipped JSON.
+    for (model, seats) in [
+        (129u32, &[1u8, 2][..]), // Rowboat: driver + passenger0
+        (128, &[1]),             // Clipper
+        (393, &[1]),             // Eznan Cutter
+        (511, &[1]),             // Small Sailing Ship
+        (1008, &[]),             // Farm Wagon (crate points only)
+        (1323, &[]),             // car
+        (1553, &[]),             // Red Farm Hauler
+    ] {
+        let got: Vec<u8> = d
+            .attach_points_for_slave(model)
+            .map(|points| {
+                points
+                    .iter()
+                    .map(|(p, _)| *p)
+                    .filter(|p| (1..=8).contains(p))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(got, seats, "model {model} seat points");
+    }
+    // The passenger skill's effect chain in the real data.
+    let conn =
+        rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let (kind, value1): (i32, i32) = conn
+        .query_row(
+            "SELECT special_effect_type_id, value1 FROM special_effects WHERE id = 2378",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((kind, value1), (53, 2), "the 1.2 passenger AttachTo row");
+    let effect_id: u32 = conn
+        .query_row(
+            "SELECT se.effect_id FROM skill_effects se \
+             JOIN effects e ON e.id = se.effect_id \
+             JOIN special_effects s ON e.actual_type = 'SpecialEffect' AND e.actual_id = s.id \
+             WHERE se.skill_id = 13863",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(effect_id, 8869);
+
+    let server = real_server(d);
+    let mut a = TestClient::new(&server, 1, 1);
+    let pa = spawn_player(&server, &a, test_character(1, "Driver", 100.0, 100.0), PA);
+    a.conn.active_char = Some(pa.clone());
+    let world = server.world.world(0).unwrap();
+    server.systems.npcs.spawns.get_or_create(&world);
+    a.drain();
+    for (template, taken_skill) in [(60u32, 13_863u32), (21, 13_863), (10, 12_076)] {
+        let t = server
+            .game_data
+            .systems
+            .vehicles
+            .slave_template(template)
+            .unwrap_or_else(|| panic!("slave {template}"))
+            .clone();
+        let mut s = Slave::new(0, t.id);
+        s.unit.model_id = t.model_id;
+        s.unit.tl_id = server.ids.tl.get_next_id().unwrap() as u16;
+        s.summoner_obj_id = PA;
+        s.summoner_id = pa.character_id;
+        let slave = Entity::new(server.ids.object.get_next_id().unwrap(), s);
+        world.spawn(&slave, &server.view_ctx());
+        assert_eq!(
+            crate::systems::npcs::npc::packets::slave_interaction_skill(&server, &slave),
+            12_076,
+            "slave {template} with a free driver seat"
+        );
+        slaves::bind_slave(
+            &server,
+            &pa,
+            slave.obj_id,
+            attach_point::DRIVER,
+            slaves::attach_reason::NEW_MASTER,
+        );
+        assert_eq!(
+            crate::systems::npcs::npc::packets::slave_interaction_skill(&server, &slave),
+            taken_skill,
+            "slave {template} with the driver seat taken"
+        );
+        let tl = u32::from(slave.data().unit.tl_id);
+        slaves::unbind_slave(&server, &pa, tl, slaves::attach_reason::SLAVE_BINDING);
+        a.drain();
     }
 }
 

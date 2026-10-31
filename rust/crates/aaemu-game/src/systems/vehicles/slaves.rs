@@ -1322,17 +1322,16 @@ pub fn unbind_slave(server: &GameServer, character: &PlayerRef, tl_id: u32, reas
         );
         return;
     };
-    let point = slave
-        .data()
-        .attached_characters
-        .iter()
-        .find(|(_, c)| *c == character.obj_id)
-        .map_or(attach_point::NONE, |(p, _)| *p);
-    if point != attach_point::NONE {
-        slave
-            .data()
-            .attached_characters
-            .retain(|(p, _)| *p != point);
+    // Find and remove the character's own seat under the slave's one lock: a re-bind between a
+    // check and a separate `retain` could remove the seat the character moved to.
+    let removed = {
+        let mut d = slave.data();
+        d.attached_characters
+            .iter()
+            .position(|(_, c)| *c == character.obj_id)
+            .map(|i| d.attached_characters.remove(i))
+    };
+    if let Some((point, _)) = removed {
         if point == attach_point::DRIVER {
             super::ship_physics::set_driver(server, &slave, false);
         }
@@ -1366,18 +1365,32 @@ pub fn bind_slave(
     let Some(slave) = world.slave(obj_id) else {
         return;
     };
-    let (taken, has_mark, summoner) = {
-        let d = slave.data();
-        (
-            d.has_attached_at(point),
-            d.unit.buffs.check_buff(buff::OWNERS_MARK),
-            d.summoner_obj_id,
-        )
+    // No "already attached elsewhere" guard: the 1.2 client refuses a second slave bind
+    // (`FUN_39346290` -> 0x66) but sends 13863 while riding a mate, and what the original
+    // server does there is capture-pending (S11-C5); see PORTING.md.
+    // Check and reserve the seat under the slave's one lock, so two binds racing for the same
+    // point cannot both pass. The 1.2 client's message table maps 0x61 to
+    // `slave_already_has_master` (the C# used it for the driver owners-mark refusal) and has no
+    // separate seat-taken text, so a taken seat answers the same error instead of the C# silent
+    // return.
+    let reserved = {
+        let mut d = slave.data();
+        let reserve = !d.has_attached_at(point)
+            && !(point == attach_point::DRIVER
+                && d.unit.buffs.check_buff(buff::OWNERS_MARK)
+                && d.summoner_obj_id != character.obj_id);
+        if reserve {
+            d.attached_characters.push((point, character.obj_id));
+        }
+        reserve
     };
-    if taken {
-        return;
-    }
-    if point == attach_point::DRIVER && has_mark && summoner != character.obj_id {
+    if !reserved {
+        tracing::debug!(
+            "BindSlave: character {} cannot take seat {} of slave {} (taken or owners mark)",
+            character.obj_id,
+            point,
+            obj_id
+        );
         error(character, error::SLAVE_ALREADY_HAS_MASTER);
         return;
     }
@@ -1406,10 +1419,6 @@ pub fn bind_slave(
             true,
         );
     }
-    slave
-        .data()
-        .attached_characters
-        .push((point, character.obj_id));
     if point == attach_point::DRIVER {
         super::ship_physics::set_driver(server, &slave, true);
     }
@@ -1658,7 +1667,11 @@ fn unbind_riders_of(server: &GameServer, slave: &SlaveRef, reason: u8) {
     }
 }
 
-/// `BindSlave(connection, tlId)` (`CSBindSlavePacket`).
+/// `BindSlave(connection, tlId)` (`CSBindSlavePacket`). The 1.2 packet body is only the target
+/// timeline id (`FUN_393464a0` writes `target+0x41c`; `FUN_39346290` holds the reach / riding
+/// checks) and its only builder is skill 12076 "occupy" (`FUN_393bf310` -> `FUN_39362f50`), so
+/// this path always asks for driver point 1. The passenger seat is skill 13863 -> `AttachTo`
+/// (`special_effects` 2378 value1 2), which reaches [`bind_slave`] directly.
 pub fn bind_slave_by_tl(server: &GameServer, character: &PlayerRef, tl_id: u32) {
     let Some(world) = player_world(server, character) else {
         return;
