@@ -635,6 +635,9 @@ async fn run_lines(
                 let tpl: u32 = num(&parts, 0)?;
                 let s = nearest_slave(game, tpl)
                     .with_context(|| format!("slave {tpl} not in sight"))?;
+                clock += 1500;
+                game.move_to((s.pos.0 + 1.0, s.pos.1, s.pos.2), clock)
+                    .await?;
                 let mut body = aaemu_commons::PacketStream::new();
                 body.write_u16(s.tl_id);
                 game.send_cs(cs::CSBindSlavePacket, body.as_bytes()).await?;
