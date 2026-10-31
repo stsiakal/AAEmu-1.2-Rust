@@ -29,7 +29,10 @@
 //!    * otherwise (caller params with `+98 = 0`) → `bSweepTest = 0`, `bKeepPrevContacts = 1`,
 //!      `t += count` (all contacts accumulate in the pool).
 //! 8. Returns the best `t` (0 when `>= 1e10`); `*pcontacts` = the best record (sweep) or the
-//!    contact pool. The skip entities lose the caller bit.
+//!    contact pool. In the accumulating case `t` is the number of contacts this call added and
+//!    callers read exactly `t` records: PWI never clears the pool, so a 0 result (nothing
+//!    tested or no part intersected) means the pool still holds the previous query's records
+//!    and must not be read. The skip entities lose the caller bit.
 //!
 //! Not ported: the per-thread part subsets (`entity+320/+328`, living/structure code) and the
 //! `nSkip < 0` nibble update for entities with flag 0x10; the debug callback.
@@ -97,8 +100,15 @@ pub struct PwiResult {
     /// static: 1.0 on the first intersection (default params) or the contact count
     /// (caller params with `+98 = 0`); 0 = nothing.
     pub dist: f32,
-    /// Sweep: the best contact; otherwise the contact pool of the last call.
+    /// Sweep: the best contact; otherwise the contacts this call accumulated (empty when
+    /// [`PwiResult::dist`] is 0: the pool is not cleared between queries).
     pub contacts: Vec<GeomContact>,
+    /// The per-caller contact pool ran out during this query: the contact count reached its 64
+    /// records or the border-point pool reached 2040, so the `Intersect` gate
+    /// (`prim_intersect.rs`, the original's 0x35151F20 / 0x3515A6D0) dropped further parts
+    /// silently. An accumulating caller must not read this as a complete result. Observation
+    /// only: the engine behaviour is unchanged.
+    pub saturated: bool,
 }
 
 /// The primitive geometry of a query, centred at the origin, and the centre (`gwd1.offset`).
@@ -259,6 +269,7 @@ impl World {
             return PwiResult {
                 dist: 1.0,
                 contacts: Vec::new(),
+                saturated: false,
             };
         }
         PwiResult::default()
@@ -447,9 +458,11 @@ impl World {
             best.as_ref()
                 .map(|b| vec![b.decode(&self.tscratch[tid])])
                 .unwrap_or_default()
-        } else {
+        } else if best_t > 0.0 {
             let s = &self.tscratch[tid];
             s.contacts(0, s.n_contacts())
+        } else {
+            Vec::new()
         };
         for &s in &p.skip {
             if !p.entities_only
@@ -462,6 +475,15 @@ impl World {
             }
         }
         let dist = if best_t >= 1.0e10 { 0.0 } else { best_t as f32 };
+        // The `Intersect` gate stops at 64 contact records and 2040 border points; both counters
+        // are reset by the first part of an accumulating query, so they describe this query.
+        // Empty results never report saturation (the pool may still hold stale records).
+        let saturated = if contacts.is_empty() {
+            false
+        } else {
+            let s = &self.tscratch[tid];
+            s.n_contacts() >= 64 || s.n_border() >= 2040
+        };
         PwiResult {
             dist,
             contacts: if p.want_contacts {
@@ -469,6 +491,7 @@ impl World {
             } else {
                 Vec::new()
             },
+            saturated,
         }
     }
 }
