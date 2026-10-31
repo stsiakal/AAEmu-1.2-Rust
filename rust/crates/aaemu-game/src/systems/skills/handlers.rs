@@ -124,6 +124,35 @@ fn bind_on_pickup_doodad_use(
         <= skill.template.max_range.max(0) as f32
 }
 
+/// Minimum time between two WARN lines for the same item-cast refusal of the same character
+/// (`Ctx::log_refusal`'s window: a modded client can send bogus item ids in a loop).
+const ITEM_CAST_REFUSAL_REPEAT_MS: i64 = 60_000;
+
+/// Whether a refusal of `reason` for `character_id` should be logged now. Repeats inside
+/// [`ITEM_CAST_REFUSAL_REPEAT_MS`] are dropped; like the quest layer's `refusal_log`, the map
+/// stays bounded when many characters or reasons pass through.
+fn should_log_item_cast_refusal(character_id: u32, reason: &'static str) -> bool {
+    static LOGGED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(u32, &'static str), i64>>,
+    > = std::sync::OnceLock::new();
+    let mut logged = LOGGED
+        .get_or_init(Default::default)
+        .lock()
+        .expect("item cast refusal log poisoned");
+    if logged.len() > 1024 {
+        logged.clear();
+    }
+    let now = crate::world::now_ms();
+    if logged
+        .get(&(character_id, reason))
+        .is_some_and(|&t| now.saturating_sub(t) < ITEM_CAST_REFUSAL_REPEAT_MS)
+    {
+        return false;
+    }
+    logged.insert((character_id, reason), now);
+    true
+}
+
 /// `CSStartSkillPacket.Read` behaviour.
 pub fn start_skill(server: &GameServer, conn: &mut GameConnection, mut p: CSStartSkillPacket) {
     let Some(player) = conn.active_char.clone() else {
@@ -278,23 +307,27 @@ pub fn start_skill(server: &GameServer, conn: &mut GameConnection, mut p: CSStar
         let Some((template_id, _)) = items.owned_item(server, &player, item_id) else {
             // A stale item id (a stack the server already merged, consumed or destroyed) is
             // the usual cause; a real client sends the id of a stack it still owns.
-            tracing::warn!(
-                character = %player.data().unit.name,
-                skill_id,
-                item_id,
-                wire_template_id,
-                "Client item cast refused: the item is not in the character's containers"
-            );
+            if should_log_item_cast_refusal(player.character_id, "not owned") {
+                tracing::warn!(
+                    character = %player.data().unit.name,
+                    skill_id,
+                    item_id,
+                    wire_template_id,
+                    "Client item cast refused: the item is not in the character's containers"
+                );
+            }
             return;
         };
         let Some((use_skill_id, bind_on_pickup)) = items.item_use_skill(server, template_id) else {
-            tracing::warn!(
-                character = %player.data().unit.name,
-                skill_id,
-                item_id,
-                item_template_id = template_id,
-                "Client item cast refused: the item template has no use skill"
-            );
+            if should_log_item_cast_refusal(player.character_id, "no use skill") {
+                tracing::warn!(
+                    character = %player.data().unit.name,
+                    skill_id,
+                    item_id,
+                    item_template_id = template_id,
+                    "Client item cast refused: the item template has no use skill"
+                );
+            }
             return;
         };
         let Some(skill) = template_skill(server, skill_id) else {
@@ -306,14 +339,16 @@ pub fn start_skill(server: &GameServer, conn: &mut GameConnection, mut p: CSStar
             // The item's own use skill is the only general authorization; item-only skills
             // never take the legacy exception, and the exception itself is limited to the
             // fireplace's real DoodadFuncUse interaction.
-            tracing::warn!(
-                character = %player.data().unit.name,
-                skill_id,
-                use_skill_id,
-                item_id,
-                item_template_id = template_id,
-                "Client item cast refused: the skill is not the item template's use skill"
-            );
+            if should_log_item_cast_refusal(player.character_id, "not the use skill") {
+                tracing::warn!(
+                    character = %player.data().unit.name,
+                    skill_id,
+                    use_skill_id,
+                    item_id,
+                    item_template_id = template_id,
+                    "Client item cast refused: the skill is not the item template's use skill"
+                );
+            }
             if data.skills.is_item_only_skill(skill_id) {
                 send_cast_refused(&player, skill_id, p.caster, target, p.skill_object);
             }

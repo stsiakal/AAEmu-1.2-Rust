@@ -40,8 +40,9 @@ const STARTER_QUEST: u32 = 72;
 const ACCEPT_QUEST_EFFECT: u32 = 52;
 const ACCEPT_QUEST_EFFECT_QUEST: u32 = 28;
 
-/// The five real starter items, the quest their `AcceptQuestEffect` starts and the mother
-/// faction the quest's start component requires (`unit_reqs` kind 0x2A).
+/// The five real starter items, the quest their `AcceptQuestEffect` starts and the character
+/// faction to play it with: children of the mother faction the start component requires
+/// (`unit_reqs` kind 0x2A), 101 -> 148 and 108 -> 149.
 const STARTERS: [(u32, u32, u32); 5] = [
     (1459, 72, 101),
     (14739, 1587, 101),
@@ -141,6 +142,32 @@ impl Fx {
         let mut bag = bag.lock().unwrap();
         bag.add_new_item(item, -1, &self.server.game_data.items)
             .expect("bag space");
+        id
+    }
+
+    /// Adds an item whose template is absent from the game data (a data gap): the handler's
+    /// `item_use_skill` lookup then has no template to read the use skill from. The item is
+    /// placed like the quest tests' `give_item`, because `ItemManager::create` needs the
+    /// template the fixture deliberately does not register.
+    fn give_unregistered_item(&self, template_id: u32) -> u64 {
+        use crate::data::items::ItemData;
+        use crate::models::container::slot_type;
+        use crate::models::item::Item;
+
+        let template = ItemTemplate {
+            impl_id: item_impl::ACCEPT_QUEST,
+            use_skill_id: STARTER_SKILL,
+            ..ItemTemplate::plain(template_id, 1)
+        };
+        let id = u64::from(self.server.ids.item.get_next_id().expect("item id"));
+        let mut item = Item::create(id, &template, 1, 0, 1, &ItemData::default(), 0);
+        item.owner_id = u64::from(self.player.character_id);
+        item.slot_type = slot_type::INVENTORY;
+        let bag = Inv::of(&self.player).bag();
+        let mut bag = bag.lock().unwrap();
+        item.slot = bag.get_unused_slot(-1);
+        bag.items.push(item);
+        bag.update_free_slot_count();
         id
     }
 
@@ -279,15 +306,18 @@ fn fixture_data() -> GameData {
 }
 
 fn fixture() -> Fx {
-    fixture_with(|_| {})
+    fixture_for(1, |_| {})
 }
 
-fn fixture_with(build: impl FnOnce(&mut GameData)) -> Fx {
+/// The fixture on a character with `character_id`. The refusal log is throttled per character
+/// and reason, so tests asserting a WARN use distinct character ids to stay independent of the
+/// other tests in this process.
+fn fixture_for(character_id: u32, build: impl FnOnce(&mut GameData)) -> Fx {
     let mut data = fixture_data();
     build(&mut data);
     let server = real_server(data);
     let mut client = TestClient::new(&server, 1, 1001);
-    let mut c = test_character(1, "Starter", 100.0, 100.0);
+    let mut c = test_character(character_id, "Starter", 100.0, 100.0);
     c.unit.level = 10;
     c.unit.faction_id = 101;
     let player = spawn_player(&server, &client, c, 0x100);
@@ -375,7 +405,7 @@ async fn starter_item_cast_starts_the_quest() {
 
 #[tokio::test]
 async fn an_unowned_item_id_is_refused_with_the_reason() {
-    let mut fx = fixture();
+    let mut fx = fixture_for(2, |_| {});
     fx.client.drain();
 
     let lines = warnings(|| fx.cast_starter(STARTER_SKILL, 999_999, STARTER_ITEM));
@@ -400,27 +430,26 @@ async fn an_unowned_item_id_is_refused_with_the_reason() {
 
 #[tokio::test]
 async fn an_item_with_no_use_skill_is_refused_with_the_reason() {
-    let mut fx = fixture_with(|data| {
-        data.items
-            .templates
-            .get_mut(&STARTER_ITEM)
-            .unwrap()
-            .use_skill_id = 0;
+    // `item_use_skill` returns None only when the owned item's template is missing from the
+    // game data; an item template with `use_skill_id = 0` still returns `Some((0, ..))` and
+    // takes the "skill is not the use skill" branch instead.
+    let mut fx = fixture_for(3, |data| {
+        data.items.templates.remove(&STARTER_ITEM);
     });
-    let item_id = fx.give_starter(STARTER_ITEM);
+    let item_id = fx.give_unregistered_item(STARTER_ITEM);
     fx.client.drain();
 
     let lines = warnings(|| fx.cast_starter(STARTER_SKILL, item_id, STARTER_ITEM));
 
     assert!(
         !crate::systems::quests::events::has_quest(&fx.player, STARTER_QUEST),
-        "an item with use skill 0 must not start a quest"
+        "an item whose template is not in the data must not start a quest"
     );
     assert!(
-        lines.iter().any(
-            |l| l.contains("the skill is not the item template's use skill")
-                && l.contains("use_skill_id=0")
-        ),
+        lines
+            .iter()
+            .any(|l| l.contains("the item template has no use skill")
+                && l.contains("item_template_id=1459")),
         "no refusal WARN, got {lines:?}"
     );
 }
@@ -428,7 +457,7 @@ async fn an_item_with_no_use_skill_is_refused_with_the_reason() {
 #[tokio::test]
 async fn a_foreign_skill_is_refused_with_the_reason() {
     // A known skill that is not the item's use skill: the Item caster cannot run it.
-    let mut fx = fixture_with(|data| {
+    let mut fx = fixture_for(4, |data| {
         data.systems.skills.add_skill(SkillTemplate {
             id: 12345,
             target_type: 0,
@@ -454,9 +483,30 @@ async fn a_foreign_skill_is_refused_with_the_reason() {
     );
 }
 
+#[tokio::test]
+async fn a_bogus_item_id_is_logged_once_per_character_and_reason() {
+    let mut fx = fixture_for(5, |_| {});
+    fx.client.drain();
+
+    let lines = warnings(|| {
+        for _ in 0..100 {
+            fx.cast_starter(STARTER_SKILL, 999_999, STARTER_ITEM);
+        }
+    });
+
+    let count = lines
+        .iter()
+        .filter(|l| l.contains("the item is not in the character's containers"))
+        .count();
+    assert_eq!(
+        count, 1,
+        "100 bogus item casts must log one WARN, got {lines:?}"
+    );
+}
+
 /// Runs a `kill`-free character through the five real starter items on `compact.sqlite3`.
-/// The mother factions are the ones the quests' start components require (148 for the Nuian
-/// chain, 149 for 3303), taken from the data.
+/// The character factions are children of the mother factions the start components require
+/// (`unit_reqs` kind 0x2A), taken from the data: 101 (mother 148) and 108 (mother 149).
 #[tokio::test]
 #[ignore = "needs AAEMU_COMPACT_DB"]
 async fn quest_starter_items_start_their_quests() {
