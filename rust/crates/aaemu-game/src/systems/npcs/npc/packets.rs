@@ -942,6 +942,7 @@ mod tests {
             cart.obj_id,
             crate::systems::vehicles::data::attach_point::DRIVER,
             7,
+            Some(4.0),
         );
         a.drain();
         b.drain();
@@ -958,6 +959,7 @@ mod tests {
             cart.obj_id,
             crate::systems::vehicles::data::attach_point::PASSENGER0,
             7,
+            Some(3.0),
         );
         a.drain();
         b.drain();
@@ -1003,6 +1005,7 @@ mod tests {
             cannon.obj_id,
             attach_point::DRIVER,
             7,
+            Some(4.0),
         );
         assert_eq!(
             super::slave_interaction_skill(&server, &cannon),

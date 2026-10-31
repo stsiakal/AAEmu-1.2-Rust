@@ -1423,20 +1423,28 @@ is no longer mirrored (see "Known deviations", dead NPC returned and healed).
   `AttachedCharacters` list is never filled).
 * systems::vehicles: `Transform.Parent = null` keeps the world position (`detach_child`); the C#
   keeps the local values until the next position update.
-* systems::vehicles (2026-10-31, passenger seats): `BindSlave` checks the client's own bind
-  reach before it reserves a seat, under the slave's one lock: the 12076 driver bind uses
-  `FUN_39346290` -> `FUN_39093860(..., 16.0)` (strictly under 4.0 m surface gap) and the 13863
-  passenger interaction uses `FUN_393bf270` -> `FUN_39093860(..., 9.0)` (strictly under 3.0 m),
-  widened to 12.25 (3.5 m) by the target's `+0x3c26` flag. The S11 client work reads that flag
-  as "riding a mate" (S11-C5 capture-pending); the decompile also uses `+0x3c26` as the dead
-  flag (`FUN_39346290` refuses a dead target with 0x144), so the mounted reading is not proven.
-  The server uses the S11 reading: 3.5 m while the character is riding a mate. A bind outside
-  the reach answers `TOO_FAR_AWAY` 0x9a. A character already in any slave's
-  `attached_characters` is refused with `slave_unbind_first` 0x66 (`FUN_39346290`); a mate is
-  not in that list, so S11-C5 stays open. The passenger seat is refused on a cannon (slave kind
-  7 / 8) with `slave_cannot_bind` 0x60. A taken seat keeps the C# silent return (debug log);
-  the client message table's 0x61 is not evidenced for that case (S11-C2 capture-pending), and
-  0x61 is kept only for the C# owners-mark driver refusal. `CSBindSlave` 0x031 has no attach
+* systems::vehicles (2026-10-31, passenger seats): `BindSlave` takes the reach from its caller:
+  the 12076 driver bind passes 4.0 m (`FUN_39346290` -> `FUN_39093860(..., 16.0)`, strictly
+  under 4.0), the 13863 passenger interaction passes the passenger reach (`FUN_393bf270` ->
+  `FUN_39093860(..., 9.0)`, strictly under 3.0, widened to 12.25 = 3.5 m by the target's
+  `+0x3c26` flag), and the doodad BoardTransfer path passes `None` because its doodad func has
+  its own use-range check. The gap is measured against the ship model's mass box when the slave
+  has a ship model, else the requested attach point's world position, and only falls back to
+  the slave origin when neither exists; a ship's bare origin is never the measure (a merchant
+  ship's seat / helm can be far from the origin). The 3.5 m branch keys on the character's
+  `is_riding`, but the decompile reads `+0x3c26` from the target (where it is also the dead
+  flag), so this is capture-pending (S11-C5). A bind outside the reach answers `TOO_FAR_AWAY`
+  0x9a. A character already in any slave's `attached_characters` is refused with
+  `slave_unbind_first` 0x66 (`FUN_39346290`); a mate is not in that list, so S11-C5 stays open.
+  The passenger seat is refused on a cannon (slave kind 7 / 8) with `slave_cannot_bind` 0x60.
+  A taken seat keeps the C# silent return (debug log); the client message table's 0x61 is not
+  evidenced for that case (S11-C2 capture-pending), and 0x61 is kept only for the C# owners-mark
+  driver refusal. A character who dies is unbound from any slave seat through the same
+  `unbind_slave` path as logout (the C# only did this for cannon gunners, so a ship driver /
+  passenger kept a stale seat and the one-slave guard then refused every later bind).
+  **Capture-pending (S11-C6):** whether 1.2 refuses an enemy / non-owner ship is unproven; the
+  `+0x3c26` flag may be a faction / owner flag and no faction rule is implemented.
+  `CSBindSlave` 0x031 has no attach
   point in the 1.2 packet (client `FUN_393464a0` writes only the target tl) and its only builder
   is 12076 "occupy", so `bind_slave_by_tl` keeps driver point 1; the passenger seat is skill
   13863 -> `AttachTo` (`special_effects` 2378 type 53 value1 2), which reaches point 2 now that

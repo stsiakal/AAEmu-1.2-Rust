@@ -388,7 +388,7 @@ pub fn on_death_event(server: &GameServer, victim: &WorldObject) {
     match victim {
         WorldObject::Shipyard(s) => shipyards::on_death(server, s),
         WorldObject::Mate(m) => mates::on_death(server, m),
-        WorldObject::Player(p) => slaves::on_gunner_death(server, p),
+        WorldObject::Player(p) => slaves::on_character_death(server, p),
         _ => {}
     }
 }
