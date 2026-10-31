@@ -35,6 +35,13 @@ pub fn is_glider_skill(skill: &SkillTemplate) -> bool {
         || skill.link_backpack_type_id == backpack_type::GLIDER
 }
 
+/// Whether `skill` is a glider fold skill: linked to the glider type but with no back-slot
+/// requirement of its own (`link_equip_slot_id` -1; 17657 "glider fold" and the later fold
+/// variants). A fold ends the current flight.
+pub fn is_glider_fold_skill(skill: &SkillTemplate) -> bool {
+    skill.link_backpack_type_id == backpack_type::GLIDER && skill.link_equip_slot_id < 0
+}
+
 /// The character's equipped glider (`item_backpacks.backpack_type_id = 2` in the back slot).
 pub fn equipped_glider(server: &GameServer, player: &PlayerRef) -> Option<Item> {
     let item = Inv::of(player).equipped(equip_slot::BACKPACK)?;
@@ -48,9 +55,10 @@ pub fn equipped_glider(server: &GameServer, player: &PlayerRef) -> Option<Item> 
     .then_some(item)
 }
 
-/// Whether the unit currently has an active buff with `buffs.gliding = 't'` (the 1.2 client's
-/// stance 4 / `FUN_39357bc0` state).
-pub fn is_gliding(server: &GameServer, unit: &WorldObject) -> bool {
+/// Whether the unit has an active buff with `buffs.gliding = 't'`, regardless of its movement
+/// state. Buffs 7431 and 1675 (test / indun flight skills) are not `remove_on_land`, so the buff
+/// alone does not mean the unit is still flying.
+pub fn has_gliding_buff(server: &GameServer, unit: &WorldObject) -> bool {
     let data = &server.game_data.systems.skills;
     unit.with_base_unit(|b| {
         b.buffs()
@@ -58,4 +66,58 @@ pub fn is_gliding(server: &GameServer, unit: &WorldObject) -> bool {
             .iter()
             .any(|e| data.buff(e.template.id).is_some_and(|t| t.gliding))
     })
+}
+
+/// The 1.2 client's gliding state (stance 4 / `FUN_39357bc0`): an active gliding buff **while
+/// airborne**. The movement state ends it; without that a lingering non-`remove_on_land` buff
+/// (7431 / 1675) would keep the interaction and back-slot rules blocking a landed player.
+pub fn is_gliding(server: &GameServer, unit: &WorldObject) -> bool {
+    let data = &server.game_data.systems.skills;
+    unit.with_unit(|u| {
+        let u = u.unit();
+        u.skill_state.airborne
+            && u.buffs
+                .effects
+                .iter()
+                .any(|e| data.buff(e.template.id).is_some_and(|t| t.gliding))
+    })
+    .unwrap_or(false)
+}
+
+/// Ends every active gliding buff on `unit`: the flight stops and the client falls (the buff
+/// removal is the stop path, `FUN_39389d60`). Used when the glider item is gone but the buff is
+/// still active, so the fold still ends the flight instead of being refused.
+pub fn end_flight(server: &GameServer, unit: &WorldObject) -> bool {
+    let data = &server.game_data.systems.skills;
+    let indices: Vec<u32> = unit.with_base_unit(|b| {
+        b.buffs()
+            .effects
+            .iter()
+            .filter(|e| data.buff(e.template.id).is_some_and(|t| t.gliding))
+            .map(|e| e.index)
+            .collect()
+    });
+    for index in &indices {
+        super::buffs::exit(server, unit, *index, false);
+    }
+    !indices.is_empty()
+}
+
+/// The shared 334 check for every interaction entry path: a gliding player is refused and gets
+/// `cannot_interact_while_gliding` (the client's `FUN_393b3d50` gate). Non-player casters (NPC
+/// effects, area triggers) are left alone.
+pub fn refuse_interaction(server: &GameServer, unit: &WorldObject) -> bool {
+    let Some(player) = unit.as_player() else {
+        return false;
+    };
+    if !is_gliding(server, unit) {
+        return false;
+    }
+    crate::systems::economy::inventory::send_error_message(
+        player,
+        crate::systems::economy::error_message::CANNOT_INTERACT_WHILE_GLIDING,
+        0,
+        true,
+    );
+    true
 }

@@ -325,14 +325,11 @@ impl ClientPacket for CSCofferInteractionPacket {
             // 1.2 refuses an interaction while gliding (`FUN_393b3d50`, error 334). Closing a
             // coffer already open is not an interaction.
             if self.opening
-                && crate::systems::skills::glider::is_gliding(server, &WorldObject::from(&me))
+                && crate::systems::skills::glider::refuse_interaction(
+                    server,
+                    &WorldObject::from(&me),
+                )
             {
-                crate::systems::economy::inventory::send_error_message(
-                    &me,
-                    crate::systems::economy::error_message::CANNOT_INTERACT_WHILE_GLIDING,
-                    0,
-                    true,
-                );
                 return Ok(());
             }
             let name = me.data().unit.name.clone();

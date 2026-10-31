@@ -1,5 +1,6 @@
 //! 1.2 glider rules: the deploy / linked-item gate (`FUN_393925c0`, error 326), the back-slot
-//! change refusal (543) and the interaction refusal (334).
+//! change refusal (543), the shared interaction refusal (334) on every entry path, and the fold
+//! that still ends the flight when the glider is gone.
 
 use std::sync::Arc;
 
@@ -8,14 +9,16 @@ use aaemu_commons::PacketStream;
 use crate::data::items::{backpack_type, ItemTemplate, TemplateKind};
 use crate::data::GameData;
 use crate::models::container::{equip_slot, slot_type};
+use crate::models::gimmick::Gimmick;
 use crate::models::item::Item;
+use crate::models::movement::MoveTypeActorFlags;
 use crate::net::registry::ClientPacket;
 use crate::opcodes::sc;
 use crate::server::GameServer;
 use crate::systems::economy::error_message;
 use crate::systems::economy::inventory::Inv;
 use crate::test_support::*;
-use crate::world::{PlayerRef, WorldObject};
+use crate::world::{Entity, PlayerRef, WorldObject};
 
 use super::data::effects::{BuffEffect, EffectTemplate};
 use super::data::{BuffTemplate, EffectKind};
@@ -26,8 +29,11 @@ const PLAYER_OBJ: u32 = 0x100;
 const GLIDER_ITEM: u32 = 14_677;
 const GLIDER_SKILL: u32 = 12_373;
 const GLIDER_USE_SKILL: u32 = 14_901;
+const GLIDER_FOLD_SKILL: u32 = 17_657;
 const GLIDER_BUFF: u32 = 1_029;
 const GLIDER_EFFECT: u32 = 9_100;
+const INTERACTION_SKILL: u32 = 9_900;
+const INTERACTION_EFFECT: u32 = 9_201;
 const OTHER_ITEM: u32 = 6_002;
 
 fn glider_data() -> GameData {
@@ -74,6 +80,33 @@ fn glider_data() -> GameData {
             slot: 24,
             add_to_slot: true,
         });
+    let mut fold = super::tests::skill_template(GLIDER_FOLD_SKILL);
+    fold.target_type = 0;
+    fold.damage_type_id = 0;
+    fold.link_backpack_type_id = backpack_type::GLIDER;
+    fold.link_equip_slot_id = -1;
+    skills.add_skill(fold);
+    data.skills.add_client_sourced_skill(GLIDER_FOLD_SKILL);
+    skills.add_effect(
+        EffectKind::InteractionEffect,
+        EffectTemplate::Interaction {
+            id: INTERACTION_EFFECT,
+            world_interaction:
+                crate::systems::npcs::doodad::interactions::world_interaction_type::USE as i32,
+            doodad_id: 0,
+        },
+        INTERACTION_EFFECT,
+    );
+    let mut interaction = super::tests::skill_template(INTERACTION_SKILL);
+    interaction.target_type = 0;
+    interaction.damage_type_id = 0;
+    interaction.effects.push(super::tests::skill_effect(
+        INTERACTION_EFFECT,
+        EffectKind::InteractionEffect,
+        INTERACTION_EFFECT,
+    ));
+    skills.add_skill(interaction);
+    data.skills.add_client_sourced_skill(INTERACTION_SKILL);
     data.items.templates.insert(
         GLIDER_ITEM,
         ItemTemplate {
@@ -101,6 +134,7 @@ fn fixture() -> Fixture {
     server.set_self();
     super::bind(&server);
     crate::systems::economy::bridges::install(&server);
+    crate::systems::npcs::bridges::install(&server);
     let mut client = TestClient::new(&server, 1, 1);
     let player = spawn_player(
         &server,
@@ -178,6 +212,16 @@ fn has_error(frames: &[(u16, Vec<u8>)], error: i16) -> bool {
     frames
         .iter()
         .any(|(op, body)| *op == sc::SCErrorMsgPacket && *body == error_body(error))
+}
+
+/// The server's movement state: a jump / airborne actor makes a gliding buff an active flight.
+fn become_airborne(server: &GameServer, me: &WorldObject) {
+    crate::systems::skills::on_actor_move(server, me, MoveTypeActorFlags::JUMPING, 0);
+}
+
+/// A standing-on-solid movement ends the flight state (the buff may stay: 7431 / 1675).
+fn land(server: &GameServer, me: &WorldObject) {
+    crate::systems::skills::on_actor_move(server, me, MoveTypeActorFlags::STANDING_ON_SOLID, 0);
 }
 
 /// A deploy cast must carry the equipped glider, not an item that merely sits in the bag.
@@ -293,6 +337,7 @@ async fn backpack_change_while_gliding_is_refused() {
     );
     let me = WorldObject::from(&f.player);
     super::buffs::add_buff_by_id(&f.server, &me, GLIDER_BUFF, &me, 0);
+    become_airborne(&f.server, &me);
     f.client.drain();
 
     // Another item into the back slot.
@@ -362,6 +407,7 @@ async fn interaction_while_gliding_is_refused() {
     let mut f = fixture();
     let me = WorldObject::from(&f.player);
     super::buffs::add_buff_by_id(&f.server, &me, GLIDER_BUFF, &me, 0);
+    become_airborne(&f.server, &me);
     f.client.drain();
 
     let start = CSStartInteractionPacket {
@@ -391,6 +437,230 @@ async fn interaction_while_gliding_is_refused() {
     assert!(
         has_error(&frames, error_message::CANNOT_INTERACT_WHILE_GLIDING),
         "{frames:x?}"
+    );
+}
+
+/// Doodad use / gathering / mailbox go through the skill Interaction effect, not
+/// `CSStartInteraction`; the shared 334 check must catch that path too.
+#[tokio::test]
+async fn skill_interaction_effect_while_gliding_is_refused() {
+    let mut f = fixture();
+    let me = WorldObject::from(&f.player);
+    super::buffs::add_buff_by_id(&f.server, &me, GLIDER_BUFF, &me, 0);
+    become_airborne(&f.server, &me);
+    f.client.drain();
+
+    start_skill(&f.server, &mut f.client.conn, unit_cast(INTERACTION_SKILL));
+    let frames = f.client.drain();
+    assert!(
+        has_error(&frames, error_message::CANNOT_INTERACT_WHILE_GLIDING),
+        "{frames:x?}"
+    );
+    assert!(
+        !has_error(&frames, error_message::MUST_EQUIP_PROPER_ITEM),
+        "{frames:x?}"
+    );
+}
+
+/// `CSInteractNPC` is another interaction entry point (NPC and gimmick targets).
+#[tokio::test]
+async fn interact_npc_while_gliding_is_refused() {
+    use crate::systems::npcs::npc::packets::CSInteractNPCPacket;
+
+    let mut f = fixture();
+    let me = WorldObject::from(&f.player);
+    super::buffs::add_buff_by_id(&f.server, &me, GLIDER_BUFF, &me, 0);
+    become_airborne(&f.server, &me);
+    f.client.drain();
+
+    let packet = CSInteractNPCPacket {
+        obj_id: PLAYER_OBJ,
+        is_target_changed: true,
+    };
+    packet.handle(&f.server, &mut f.client.conn).await.unwrap();
+    let frames = f.client.drain();
+    assert!(
+        has_error(&frames, error_message::CANNOT_INTERACT_WHILE_GLIDING),
+        "{frames:x?}"
+    );
+    assert_eq!(f.player.data().unit.current_interaction_object, 0);
+    assert_eq!(f.player.data().unit.current_target, 0);
+}
+
+/// The same gate covers a gimmick object, the other unit kind `CSInteractNPC` resolves.
+#[tokio::test]
+async fn gimmick_interaction_while_gliding_is_refused() {
+    use crate::systems::npcs::npc::packets::CSInteractNPCPacket;
+
+    let mut f = fixture();
+    let me = WorldObject::from(&f.player);
+    super::buffs::add_buff_by_id(&f.server, &me, GLIDER_BUFF, &me, 0);
+    become_airborne(&f.server, &me);
+    let gimmick = Entity::new(0x300, Gimmick::new(1));
+    f.server
+        .world
+        .world(0)
+        .unwrap()
+        .spawn(&gimmick, &f.server.view_ctx());
+    f.client.drain();
+
+    let packet = CSInteractNPCPacket {
+        obj_id: gimmick.obj_id,
+        is_target_changed: true,
+    };
+    packet.handle(&f.server, &mut f.client.conn).await.unwrap();
+    let frames = f.client.drain();
+    assert!(
+        has_error(&frames, error_message::CANNOT_INTERACT_WHILE_GLIDING),
+        "{frames:x?}"
+    );
+    assert_eq!(f.player.data().unit.current_interaction_object, 0);
+}
+
+/// Opening a loot bag is a world interaction (`CSLootOpenBag`), not `CSStartInteraction`.
+#[tokio::test]
+async fn loot_open_while_gliding_is_refused() {
+    use crate::systems::economy::looting::CSLootOpenBagPacket;
+
+    let mut f = fixture();
+    let me = WorldObject::from(&f.player);
+    super::buffs::add_buff_by_id(&f.server, &me, GLIDER_BUFF, &me, 0);
+    become_airborne(&f.server, &me);
+    f.client.drain();
+
+    let packet = CSLootOpenBagPacket {
+        obj_id: 0x999,
+        obj2_id: 0,
+        loot_all: false,
+    };
+    packet.handle(&f.server, &mut f.client.conn).await.unwrap();
+    let frames = f.client.drain();
+    assert!(
+        has_error(&frames, error_message::CANNOT_INTERACT_WHILE_GLIDING),
+        "{frames:x?}"
+    );
+}
+
+/// A glider that expired / was destroyed mid-flight must not make the fold fail with 326:
+/// the fold still ends the active flight (the client falls).
+#[tokio::test]
+async fn fold_without_the_glider_ends_the_flight() {
+    let mut f = fixture();
+    let me = WorldObject::from(&f.player);
+    super::buffs::add_buff_by_id(&f.server, &me, GLIDER_BUFF, &me, 0);
+    become_airborne(&f.server, &me);
+    f.client.drain();
+
+    // No glider equipped (timed expiry / CSDestroyItem on the slot).
+    start_skill(&f.server, &mut f.client.conn, unit_cast(GLIDER_FOLD_SKILL));
+    let frames = f.client.drain();
+    assert!(
+        !has_error(&frames, error_message::MUST_EQUIP_PROPER_ITEM),
+        "{frames:x?}"
+    );
+    assert!(!f.player.data().unit.buffs.check_buff(GLIDER_BUFF));
+    assert!(!super::glider::is_gliding(&f.server, &me));
+}
+
+/// A normal fold (glider still equipped) also ends the flight server-side.
+#[tokio::test]
+async fn fold_with_the_glider_equipped_ends_the_flight() {
+    let mut f = fixture();
+    give_at(
+        &f.server,
+        &f.player,
+        PLAYER_OBJ as u64 * 100 + 5,
+        GLIDER_ITEM,
+        slot_type::EQUIPMENT,
+        equip_slot::BACKPACK,
+    );
+    let me = WorldObject::from(&f.player);
+    super::buffs::add_buff_by_id(&f.server, &me, GLIDER_BUFF, &me, 0);
+    become_airborne(&f.server, &me);
+    f.client.drain();
+
+    start_skill(&f.server, &mut f.client.conn, unit_cast(GLIDER_FOLD_SKILL));
+    let frames = f.client.drain();
+    assert!(
+        !has_error(&frames, error_message::MUST_EQUIP_PROPER_ITEM),
+        "{frames:x?}"
+    );
+    assert!(!f.player.data().unit.buffs.check_buff(GLIDER_BUFF));
+}
+
+/// Without a flight to end, a forged fold still needs the equipped glider.
+#[tokio::test]
+async fn fold_without_a_glider_or_flight_is_refused() {
+    let mut f = fixture();
+    start_skill(&f.server, &mut f.client.conn, unit_cast(GLIDER_FOLD_SKILL));
+    let frames = f.client.drain();
+    assert!(
+        has_error(&frames, error_message::MUST_EQUIP_PROPER_ITEM),
+        "{frames:x?}"
+    );
+}
+
+/// Gliding buffs 7431 / 1675 are not `remove_on_land`: on the ground the buff alone must not
+/// keep the interaction / back-slot gates closed.
+#[tokio::test]
+async fn landed_gliding_buff_does_not_block_interactions_or_backpack_changes() {
+    use crate::systems::economy::item_handlers::{CSSwapItemsPacket, MoveArgs};
+    use crate::systems::npcs::npc::packets::CSStartInteractionPacket;
+
+    let mut f = fixture();
+    let glider = give_at(
+        &f.server,
+        &f.player,
+        PLAYER_OBJ as u64 * 100 + 4,
+        GLIDER_ITEM,
+        slot_type::INVENTORY,
+        0,
+    );
+    let me = WorldObject::from(&f.player);
+    super::buffs::add_buff_by_id(&f.server, &me, GLIDER_BUFF, &me, 0);
+    become_airborne(&f.server, &me);
+    land(&f.server, &me);
+    assert!(f.player.data().unit.buffs.check_buff(GLIDER_BUFF));
+    assert!(!super::glider::is_gliding(&f.server, &me));
+    f.client.drain();
+
+    let start = CSStartInteractionPacket {
+        npc_obj_id: 0x999,
+        obj_id: 0,
+        extra_info: 0,
+        pick_id: 0,
+        mouse_button: 0,
+        modifier_keys: 0,
+    };
+    start.handle(&f.server, &mut f.client.conn).await.unwrap();
+    let frames = f.client.drain();
+    assert!(
+        !has_error(&frames, error_message::CANNOT_INTERACT_WHILE_GLIDING),
+        "{frames:x?}"
+    );
+
+    let swap = CSSwapItemsPacket {
+        args: MoveArgs {
+            from_item_id: glider,
+            to_item_id: 0,
+            from_slot_type: slot_type::INVENTORY,
+            from_slot: 0,
+            to_slot_type: slot_type::EQUIPMENT,
+            to_slot: equip_slot::BACKPACK as u8,
+        },
+    };
+    swap.handle(&f.server, &mut f.client.conn).await.unwrap();
+    let frames = f.client.drain();
+    assert!(
+        !has_error(&frames, error_message::CANNOT_CHANGE_BACKPACK_IN_GLIDING),
+        "{frames:x?}"
+    );
+    assert_eq!(
+        Inv::of(&f.player)
+            .equipped(equip_slot::BACKPACK)
+            .expect("landed back-slot change succeeds")
+            .id,
+        glider
     );
 }
 

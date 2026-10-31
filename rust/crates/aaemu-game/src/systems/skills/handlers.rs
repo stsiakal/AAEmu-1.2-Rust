@@ -168,6 +168,13 @@ fn glider_cast_refused(
     if !glider::is_glider_skill(skill) {
         return false;
     }
+    // A fold ends the current flight, so it stays legitimate when the glider item already
+    // expired or was destroyed while the gliding buff is still active.
+    if glider::is_glider_fold_skill(skill)
+        && glider::has_gliding_buff(server, &crate::world::WorldObject::from(player))
+    {
+        return false;
+    }
     let Some(glider) = glider::equipped_glider(server, player) else {
         return true;
     };
@@ -509,6 +516,17 @@ pub fn start_skill(server: &GameServer, conn: &mut GameConnection, mut p: CSStar
         );
         result = r;
         value = v;
+    }
+    if result == skill_result::SUCCESS
+        && data
+            .systems
+            .skills
+            .skill(skill_id)
+            .is_some_and(|t| super::glider::is_glider_fold_skill(t))
+    {
+        // A fold ends the flight. This also covers a glider that expired / was destroyed
+        // mid-flight: the client falls cleanly instead of the fold being refused.
+        super::glider::end_flight(server, &me);
     }
     if result != skill_result::SUCCESS {
         tracing::debug!(skill_id, result, value, "Client skill failed");

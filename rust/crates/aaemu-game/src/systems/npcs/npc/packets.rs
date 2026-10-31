@@ -284,13 +284,7 @@ impl ClientPacket for CSStartInteractionPacket {
                 return Ok(());
             };
             // 1.2 refuses an interaction while gliding (`FUN_393b3d50`, error 334).
-            if crate::systems::skills::glider::is_gliding(server, &WorldObject::from(&me)) {
-                crate::systems::economy::inventory::send_error_message(
-                    &me,
-                    crate::systems::economy::error_message::CANNOT_INTERACT_WHILE_GLIDING,
-                    0,
-                    true,
-                );
+            if crate::systems::skills::glider::refuse_interaction(server, &WorldObject::from(&me)) {
                 return Ok(());
             }
             let instance = me.data().unit.transform.instance_id;
@@ -362,6 +356,10 @@ impl ClientPacket for CSInteractNPCPacket {
             let Some(me) = conn.active_char.clone() else {
                 return Ok(()); // C#: NullReferenceException
             };
+            // `CSInteractNPC` is also the NPC / gimmick target interaction entry point.
+            if crate::systems::skills::glider::refuse_interaction(server, &WorldObject::from(&me)) {
+                return Ok(());
+            }
             let instance = me.data().unit.transform.instance_id;
             let unit_id = if self.obj_id > 0 {
                 server
