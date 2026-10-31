@@ -266,14 +266,35 @@ pub fn start_skill(server: &GameServer, conn: &mut GameConnection, mut p: CSStar
             player.data().unit.is_auto_attack = true;
             skill::start_auto_skill(server, &me, &skill);
         }
-    } else if let SkillCaster::Item { item_id, .. } = p.caster {
+    } else if let SkillCaster::Item {
+        item_id,
+        item_template_id: wire_template_id,
+        ..
+    } = p.caster
+    {
         let items = server.systems.skills.ext.items();
         // Resolve the template from the owned item: the wire template id is a client hint and
         // must never decide the use skill, the reagent or the consumed template.
         let Some((template_id, _)) = items.owned_item(server, &player, item_id) else {
+            // A stale item id (a stack the server already merged, consumed or destroyed) is
+            // the usual cause; a real client sends the id of a stack it still owns.
+            tracing::warn!(
+                character = %player.data().unit.name,
+                skill_id,
+                item_id,
+                wire_template_id,
+                "Client item cast refused: the item is not in the character's containers"
+            );
             return;
         };
         let Some((use_skill_id, bind_on_pickup)) = items.item_use_skill(server, template_id) else {
+            tracing::warn!(
+                character = %player.data().unit.name,
+                skill_id,
+                item_id,
+                item_template_id = template_id,
+                "Client item cast refused: the item template has no use skill"
+            );
             return;
         };
         let Some(skill) = template_skill(server, skill_id) else {
@@ -285,6 +306,14 @@ pub fn start_skill(server: &GameServer, conn: &mut GameConnection, mut p: CSStar
             // The item's own use skill is the only general authorization; item-only skills
             // never take the legacy exception, and the exception itself is limited to the
             // fireplace's real DoodadFuncUse interaction.
+            tracing::warn!(
+                character = %player.data().unit.name,
+                skill_id,
+                use_skill_id,
+                item_id,
+                item_template_id = template_id,
+                "Client item cast refused: the skill is not the item template's use skill"
+            );
             if data.skills.is_item_only_skill(skill_id) {
                 send_cast_refused(&player, skill_id, p.caster, target, p.skill_object);
             }
