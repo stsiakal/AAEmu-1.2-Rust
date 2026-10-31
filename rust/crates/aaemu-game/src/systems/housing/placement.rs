@@ -5,12 +5,14 @@ use crate::server::GameServer;
 use crate::systems::economy::error_message as err;
 use crate::systems::npcs::subzone::{self, Area};
 use crate::data::GameData;
-use crate::world::PlayerRef;
+use crate::world::{PlayerRef, WorldInstance};
 
 /// `FUN_393312a0` / `FUN_398971c0`: the placement cells are 4 m squares.
 const FOOTPRINT_CELL: f32 = 4.0;
 /// `FUN_39897170`: 12 or more cells is logged as "house too big" and yields no footprint.
 const FOOTPRINT_MAX_CELLS: i32 = 12;
+/// `FUN_39332180` / `FUN_39337fb0`: refuse when the terrain spread exceeds 6 m.
+const MAX_TERRAIN_SPREAD: f32 = 6.0;
 
 /// `FUN_39897170`: `n = int((garden_radius * 2 + 3) * 0.25)`; `n >= 12` has no footprint.
 fn footprint_cells(garden_radius: f32) -> i32 {
@@ -88,6 +90,39 @@ fn validate_groups(
         return Ok(());
     }
     Err(error)
+}
+
+/// `FUN_39337fb0` / `FUN_39332180`: the 6 m terrain spread over the placement square.
+fn validate_terrain(
+    server: &GameServer,
+    world: &WorldInstance,
+    x0: f32,
+    y0: f32,
+    side: f32,
+) -> Result<(), i16> {
+    let Some(maps) = server.systems.npcs.heightmaps.get() else {
+        return Ok(());
+    };
+    if !maps.config.heightmaps_enable {
+        return Ok(());
+    }
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    for ix in 0..3 {
+        for iy in 0..3 {
+            let x = x0 + side * ix as f32 * 0.5;
+            let y = y0 + side * iy as f32 * 0.5;
+            let Ok(height) = maps.world_height(world.template.id, x, y) else {
+                return Ok(());
+            };
+            min = min.min(height);
+            max = max.max(height);
+        }
+    }
+    if max - min > MAX_TERRAIN_SPREAD {
+        return Err(err::HOUSE_CANNOT_LOCATE_TERRAIN_TOO_LOW);
+    }
+    Ok(())
 }
 
 /// Validate before reserving a design, money, or tax certificates. Accounts without static
@@ -180,6 +215,10 @@ pub fn validate_house(
         if (x - position.x).abs() < extent && (y - position.y).abs() < extent {
             return Err(err::HOUSE_CANNOT_LOCATE_OVERLAP_HOUSE);
         }
+    }
+    if cells > 0 {
+        let (x0, y0) = footprint_origin(x, y, cells);
+        validate_terrain(server, &world, x0, y0, cells as f32 * FOOTPRINT_CELL)?;
     }
     Ok(())
 }
