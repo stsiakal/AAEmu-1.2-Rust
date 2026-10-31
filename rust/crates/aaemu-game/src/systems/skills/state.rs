@@ -43,6 +43,9 @@ pub struct SkillRunState {
     /// Accepted casts of a reused SkillRun, independent of timeline ID release.
     pub generation: u64,
     pub cancelled: bool,
+    /// An effect cancelled the cast itself (as opposed to a client / channel stop): its source
+    /// item debit is refunded.
+    pub effect_cancelled: bool,
     /// `HitTypes` (target obj id -> hit type, `TryAdd` semantics where the C# uses it).
     pub hit_types: HashMap<u32, SkillHitType>,
     /// `InitialTarget?.ObjId` (`u32::MAX` = a position unit).
@@ -59,6 +62,9 @@ pub struct SkillRunState {
     /// An instant player music skill (special effect 93 / 94) still owes its `SCSkillStarted`,
     /// sent right before its `SCSkillFired` (see `skill::schedule_effects`).
     pub music_started_pending: bool,
+    /// A player's timed cast already started the global cooldown when it was accepted (the 1.2
+    /// client counts it from the cast start), so `skill::cast` must not restart it at cast end.
+    pub gcd_started: bool,
 }
 
 /// `Skill`: a template + level and the per-use state, shared by the cast and its tasks.

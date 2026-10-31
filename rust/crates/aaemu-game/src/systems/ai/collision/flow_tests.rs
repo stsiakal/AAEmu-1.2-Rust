@@ -10,7 +10,7 @@ use aaemu_physics::geometry::shapes::stream::{save_phys_geometry, PhysGeomHeader
 use aaemu_physics::geometry::shapes::BoxGeom;
 use aaemu_physics::math::{Quat, Vec3};
 
-use crate::models::movement::UnitMove;
+use crate::models::movement::{MoveKind, MoveType, UnitMove};
 use crate::test_support::{spawn_player, test_character, test_server, TestClient};
 use crate::world::WorldObject;
 
@@ -142,6 +142,66 @@ async fn queries_and_doodad_colliders() {
     assert!((g - 100.0).abs() < 1e-3);
 }
 
+/// A box-obstacle query over open water after one that hit a pier must report no obstacles:
+/// the accumulating PWI (`stop_at_first = false`) returns the hit count in its float result
+/// and callers size the contact read by it, so 0 means the pool holds no contacts of this
+/// query (PWI does not clear the pool itself). Instance worlds have no heightfield, so no
+/// terrain part runs an intersection of its own to reset the pool before the empty result.
+#[tokio::test]
+async fn open_water_box_obstacles_after_a_pier_query_is_empty() {
+    let s = test_server();
+    let mut files = HashMap::new();
+    files.insert("game/objects/test/box.cgf".to_string(), box_cgf());
+    s.systems
+        .ai
+        .collision
+        .test_files
+        .set(Arc::new(files))
+        .unwrap();
+    let pw = super::phys_world(&s, 0).unwrap();
+    super::load_cell(&s, &pw, (0, 0));
+    let files = super::files(&s).unwrap();
+    let models = super::model_cache(&s, &files);
+    let mut shapes = HashMap::new();
+    let pier = DoodadInfo {
+        obj_id: 61,
+        model: "cgf://objects/test/box.cgf".into(),
+        pos: Vec3::new(500.0, 500.0, 101.0),
+        q: Quat::IDENTITY,
+        scale: 1.0,
+        flags: collision_flags(false, false, false),
+    };
+    apply_doodads(
+        &pw,
+        &files,
+        &models,
+        &mut shapes,
+        std::slice::from_ref(&pier),
+    );
+    let query = |x: f32| {
+        super::box_obstacles(
+            &s,
+            0,
+            [x, 500.0, 101.0],
+            [2.0, 2.0, 2.0],
+            0.0,
+            super::query::mask::STATIC_TERRAIN,
+        )
+        .unwrap()
+    };
+    let near_pier = query(501.5);
+    assert!(
+        !near_pier.is_empty(),
+        "the pier intersects the box: {near_pier:?}"
+    );
+    let open_water = query(700.0);
+    assert!(
+        open_water.is_empty(),
+        "open water returned {} obstacle(s) of the pier query",
+        open_water.len()
+    );
+}
+
 #[tokio::test]
 async fn unit_colliders_are_skippable_by_obj_id() {
     let s = server(100.0);
@@ -216,6 +276,38 @@ async fn zone_fall_gate_in_the_movement_path() {
         30000
     );
     let _ = Files::Map(Arc::new(HashMap::new()));
+}
+
+#[tokio::test]
+async fn a_landing_in_water_forwards_the_client_value_and_never_heals() {
+    // terrain at z = 80 under the synthetic ocean (level 100): z = 95 is in the water, where
+    // the zone's tracker does not run and the client value is forwarded
+    let s = server(80.0);
+    let mut client = TestClient::new(&s, 1, 1);
+    let mut diver = test_character(1, "Diver", 500.0, 500.0);
+    diver.unit.hp = 500;
+    diver.unit.max_hp = 1000;
+    let p = spawn_player(&s, &client, diver, 0x100);
+    client.conn.active_char = Some(p.clone());
+    let obj = WorldObject::from(&p);
+    let world = s.world.world(0).unwrap();
+    for fall_vel in [500u16, 8599, 9000] {
+        let mv = UnitMove {
+            x: 500.0,
+            y: 500.0,
+            z: 95.0,
+            fall_vel,
+            ..UnitMove::default()
+        };
+        assert_eq!(
+            super::movement::on_unit_moved(&s, &world, &obj, 0, &mv),
+            fall_vel
+        );
+        let landing = MoveType::new(MoveKind::Unit(mv));
+        crate::world::session::move_unit(&s, &mut client.conn, 0x100, landing).await;
+        assert_eq!(p.data().unit.hp, 500, "fallVel {fall_vel} must not heal");
+        assert!(p.data().unit.is_under_water);
+    }
 }
 
 #[tokio::test]
