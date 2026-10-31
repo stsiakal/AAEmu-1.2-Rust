@@ -2991,7 +2991,10 @@ two bots before the fix (a foreign `Mount` caster, an NPC-only skill and a far d
   window sends a plain `CSStartSkill` with a `SavePortalInfo` object. `SkillData` now sources the
   skills whose effect is `SpecialEffect` 30 `SavePortal` (`CLIENT_SKILL_SPECIAL_EFFECT_SOURCES`,
   narrow by type id, not by effect class). The effect still requires the Memory Ink reagent
-  (`skill_reagents`) and only renames the caster's own portal.
+  (`skill_reagents`) and only renames the caster's own portal. The same list now includes type
+  53 `AttachTo`: the 1.2 slave action bar (`FUN_393bbb80`) adds 13863 "Take the Passenger Seat"
+  and `FUN_39362f50` sends it as a plain `CSStartSkill`, and no source table names it. Its effect
+  only binds the caster to the target slave at the value1 seat.
 
 ### Item, vehicle bar and SavePortal hardening (2026-10-30)
 

@@ -1593,6 +1593,9 @@ fn passenger_data() -> GameData {
         )],
         ..crate::systems::skills::tests::skill_template(PASSENGER_SKILL)
     });
+    // `SkillData::load` marks the 1.2 AttachTo skill (special type 53) as client-sourced, so a
+    // character that never learned it may cast it from the slave action bar.
+    d.skills.add_client_sourced_skill(PASSENGER_SKILL);
     d
 }
 
@@ -1614,21 +1617,18 @@ async fn passenger_skill_13863_seats_point_two_and_a_taken_seat_answers_97() {
     let mut b = TestClient::new(&server, 2, 2);
     let mut c = TestClient::new(&server, 3, 3);
     let pa = spawn_player(&server, &a, test_character(1, "Driver", 100.0, 100.0), PA);
-    let mut passenger = test_character(2, "Passenger", 101.0, 100.0);
-    passenger
-        .skills
-        .skills
-        .push(crate::models::char_data::Skill {
-            id: PASSENGER_SKILL,
-            level: 1,
-        });
-    let pb = spawn_player(&server, &b, passenger, PB);
-    let mut third = test_character(3, "Third", 102.0, 100.0);
-    third.skills.skills.push(crate::models::char_data::Skill {
-        id: PASSENGER_SKILL,
-        level: 1,
-    });
-    let pc = spawn_player(&server, &c, third, 0x00F0_0003);
+    let pb = spawn_player(
+        &server,
+        &b,
+        test_character(2, "Passenger", 101.0, 100.0),
+        PB,
+    );
+    let pc = spawn_player(
+        &server,
+        &c,
+        test_character(3, "Third", 102.0, 100.0),
+        0x00F0_0003,
+    );
     a.conn.active_char = Some(pa.clone());
     b.conn.active_char = Some(pb.clone());
     c.conn.active_char = Some(pc.clone());
