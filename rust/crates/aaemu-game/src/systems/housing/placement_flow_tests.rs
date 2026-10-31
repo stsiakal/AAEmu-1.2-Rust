@@ -320,17 +320,41 @@ async fn a_unit_inside_the_footprint_is_refused_with_overlap_unit() {
 }
 
 #[tokio::test]
-async fn a_house_rotated_into_the_footprint_is_refused_even_outside_the_radius_sum() {
+async fn a_rotated_house_uses_the_clients_snapped_axis_aligned_box() {
+    let f = fixture(data());
+    let world = f.server.world.world(0).unwrap();
+    let house = manager::create(&f.server, DESIGN, 101, &world, 0, 0).unwrap();
+    {
+        let mut h = house.data();
+        h.id = f.server.ids.housing.get_next_id().unwrap();
+        // 25 m east and 45 degrees: the turned 24 m box would reach the spot (old SAT
+        // refused), but the client's mode-2 house box is the snapped axis-aligned square
+        // (x 15340..15364), which only touches the new footprint at x = 15340.
+        h.unit.scale = 1.0;
+        h.unit
+            .transform
+            .set_xyz(ACCEPTED.0 + 25.0, ACCEPTED.1, 100.0);
+        h.unit.transform.rot_z = std::f32::consts::FRAC_PI_4;
+    }
+    assert!(f.server.systems.housing.manager.insert(&house));
+    ops::build(&f.server, &f.player, 1001, &packet(ACCEPTED.0, ACCEPTED.1));
+    assert_eq!(
+        f.server.systems.housing.manager.count(),
+        2,
+        "the client accepts this spot against the snapped axis-aligned box"
+    );
+
     let mut f = fixture(data());
     let world = f.server.world.world(0).unwrap();
     let house = manager::create(&f.server, DESIGN, 101, &world, 0, 0).unwrap();
     {
         let mut h = house.data();
         h.id = f.server.ids.housing.get_next_id().unwrap();
-        // 23 m east: outside the old garden-radius sum (11 + 11), inside the 45° box margin.
+        // 20 m east: the snapped box (x 15336..15360) overlaps the new footprint.
+        h.unit.scale = 1.0;
         h.unit
             .transform
-            .set_xyz(ACCEPTED.0 + 23.0, ACCEPTED.1, 100.0);
+            .set_xyz(ACCEPTED.0 + 20.0, ACCEPTED.1, 100.0);
         h.unit.transform.rot_z = std::f32::consts::FRAC_PI_4;
     }
     assert!(f.server.systems.housing.manager.insert(&house));
