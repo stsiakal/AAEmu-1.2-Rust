@@ -219,8 +219,8 @@ fn build_error(f: &mut Fixture, x: f32, y: f32) -> Option<i16> {
     })
 }
 
-/// A physical unit collider in the middle of the accepted footprint.
-fn install_unit_collider(server: &crate::server::GameServer) {
+/// A physical living collider in the middle of the accepted footprint.
+fn install_unit_collider(server: &crate::server::GameServer, obj_id: u32) {
     server
         .systems
         .ai
@@ -248,7 +248,7 @@ fn install_unit_collider(server: &crate::server::GameServer) {
     assert!(physics
         .lock()
         .sync_living(
-            500,
+            obj_id,
             &crate::systems::ai::collision::data::LivingParams::default(),
             Vec3::new(ACCEPTED.0, ACCEPTED.1, 100.0),
         )
@@ -272,7 +272,7 @@ async fn area_338_captured_spot_is_refused_and_the_fitting_spot_is_accepted() {
 #[tokio::test]
 async fn a_unit_inside_the_footprint_is_refused_with_overlap_unit() {
     let mut f = fixture(data());
-    install_unit_collider(&f.server);
+    install_unit_collider(&f.server, 500);
     assert_eq!(
         build_error(&mut f, ACCEPTED.0, ACCEPTED.1),
         Some(crate::systems::economy::error_message::HOUSE_CANNOT_LOCATE_OVERLAP_UNIT)
@@ -321,6 +321,44 @@ async fn a_rotated_house_uses_the_clients_snapped_axis_aligned_box() {
     assert_eq!(
         build_error(&mut f, ACCEPTED.0, ACCEPTED.1),
         Some(crate::systems::economy::error_message::HOUSE_CANNOT_LOCATE_OVERLAP_HOUSE)
+    );
+}
+
+#[tokio::test]
+async fn doodads_attached_to_a_house_are_ignored_by_the_unit_overlap() {
+    let f = fixture(data());
+    install_unit_collider(&f.server, 501);
+    let world = f.server.world.world(0).unwrap();
+    let house = manager::create(&f.server, DESIGN, 101, &world, 0, 0).unwrap();
+    {
+        let mut h = house.data();
+        h.id = f.server.ids.housing.get_next_id().unwrap();
+        h.unit.scale = 1.0;
+        h.unit
+            .transform
+            .set_xyz(ACCEPTED.0 + 100.0, ACCEPTED.1, 100.0);
+    }
+    assert!(f.server.systems.housing.manager.insert(&house));
+    let doodad = crate::world::Entity::new(501, crate::models::doodad::Doodad::new(4001));
+    f.server
+        .systems
+        .housing
+        .manager
+        .add_attached(&house, doodad);
+    assert_eq!(
+        f.server
+            .systems
+            .housing
+            .manager
+            .attached(house.obj_id)
+            .len(),
+        1
+    );
+    ops::build(&f.server, &f.player, 1001, &packet(ACCEPTED.0, ACCEPTED.1));
+    assert_eq!(
+        f.server.systems.housing.manager.count(),
+        2,
+        "the attached doodad collider must not refuse the placement"
     );
 }
 

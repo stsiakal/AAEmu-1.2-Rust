@@ -1,6 +1,6 @@
 //! Server-side placement checks using the original 1.2 housing polygons and eligibility data.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::data::{HousingData, HousingTemplate};
 use crate::data::GameData;
@@ -180,6 +180,7 @@ fn player_owned(server: &GameServer, player: &PlayerRef, obj_id: u32) -> bool {
 }
 
 /// `FUN_39335860`: the footprint collides with a unit, doodad, gimmick or ship (not a house).
+#[allow(clippy::too_many_arguments)]
 fn validate_unit_overlap(
     server: &GameServer,
     player: &PlayerRef,
@@ -188,6 +189,7 @@ fn validate_unit_overlap(
     y0: f32,
     side: f32,
     z: f32,
+    ignored: &HashSet<u32>,
 ) -> Result<(), i16> {
     let half = side * 0.5;
     let center = [x0 + half, y0 + half, z];
@@ -209,7 +211,7 @@ fn validate_unit_overlap(
         if kind == ObjKind::House || obj_id == player.obj_id {
             continue;
         }
-        if player_owned(server, player, obj_id) {
+        if player_owned(server, player, obj_id) || ignored.contains(&obj_id) {
             continue;
         }
         return Err(err::HOUSE_CANNOT_LOCATE_OVERLAP_UNIT);
@@ -342,11 +344,13 @@ pub fn validate_house(
     }
     if cells > 0 {
         let side = cells as f32 * FOOTPRINT_CELL;
+        let mut ignored = HashSet::new();
         for house in server.systems.housing.manager.all() {
-            let (house_instance, id, position, scale) = {
+            let (house_instance, obj_id, id, position, scale) = {
                 let h = house.data();
                 (
                     h.unit.transform.instance_id,
+                    house.obj_id,
                     h.unit.template_id,
                     h.unit.transform.local(),
                     h.unit.scale,
@@ -355,20 +359,25 @@ pub fn validate_house(
             if house_instance != instance {
                 continue;
             }
+            // `FUN_39335860` puts every attached doodad of every house in the collision
+            // query's skip list.
+            for doodad in server.systems.housing.manager.attached(obj_id) {
+                ignored.insert(doodad.obj_id);
+            }
             let Some(other) = data.template(id) else {
                 continue;
             };
             let other_cells = footprint_cells(other.garden_radius * scale);
             if other_cells == 0 {
-                // Mode-1 houses use the ghost model box (`FUN_390318f0` /
-                // `FUN_39332c10`); the server has no render-model bounds (PORTING.md).
+                // Mode-1 houses use the ghost model box (`FUN_390318f0` / `FUN_39332c10`);
+                // the server has no render-model bounds, so this stays lenient (PORTING.md).
                 continue;
             }
             if snapped_squares_overlap((x0, y0), cells, (position.x, position.y), other_cells) {
                 return Err(err::HOUSE_CANNOT_LOCATE_OVERLAP_HOUSE);
             }
         }
-        validate_unit_overlap(server, player, &world, x0, y0, side, z)?;
+        validate_unit_overlap(server, player, &world, x0, y0, side, z, &ignored)?;
     }
     Ok(())
 }
@@ -467,6 +476,7 @@ mod tests {
         );
         let mut h = House::new(7, 1);
         h.unit.tl_id = 7;
+        h.unit.scale = 1.0;
         h.unit.transform.set_xyz(510., 510., 100.);
         let house = Entity::new(20, h);
         assert!(server.systems.housing.manager.insert(&house));
@@ -598,6 +608,7 @@ mod tests {
             let mut h = House::new(7 + i as u32, 1);
             h.id = 7 + i as u32;
             h.account_id = 1001;
+            h.unit.scale = 1.0;
             h.unit.tl_id = 7 + i as u16;
             h.unit.transform.set_xyz(x, 300., 100.);
             let house = Entity::new(20 + i as u32, h);
