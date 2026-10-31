@@ -16,6 +16,8 @@ struct Counts {
     failed: u64,
     unsupported: u64,
     skipped: u64,
+    /// Quests in a zone the 1.2 data marks closed; not played by default, never a failure.
+    closed_zone: u64,
     /// Quests refused with error 621 (`QuestDailyLimit`); retried in later runs.
     daily_limit: u64,
 }
@@ -28,6 +30,7 @@ impl Counts {
             "failed" => self.failed += 1,
             "unsupported" => self.unsupported += 1,
             "skipped" => self.skipped += 1,
+            "closed-zone" => self.closed_zone += 1,
             // `completed-before` was the old name for the same error 621 result.
             "daily-limit" | "completed-before" => self.daily_limit += 1,
             _ => self.failed += 1,
@@ -39,15 +42,17 @@ impl Counts {
             + self.failed
             + self.unsupported
             + self.skipped
+            + self.closed_zone
             + self.daily_limit
     }
-    fn values(&self) -> [u64; 6] {
+    fn values(&self) -> [u64; 7] {
         [
             self.passed,
             self.passed_gm,
             self.failed,
             self.unsupported,
             self.skipped,
+            self.closed_zone,
             self.daily_limit,
         ]
     }
@@ -104,12 +109,13 @@ struct Dashboard {
     bug_fingerprints: Vec<Fingerprint>,
 }
 
-const COLUMNS: [&str; 6] = [
+const COLUMNS: [&str; 7] = [
     "passed",
     "passed (GM-assisted)",
     "failed",
     "unsupported",
     "skipped",
+    "closed-zone",
     "daily limit",
 ];
 
@@ -260,12 +266,13 @@ fn render(d: &Dashboard) -> String {
     }
     s.push_str(&format!(
         "**Totals:** {} passed, {} passed (GM-assisted), {} failed, {} unsupported, {} skipped, \
-         {} daily limit.\n\n",
+         {} closed-zone, {} daily limit.\n\n",
         d.totals.passed,
         d.totals.passed_gm,
         d.totals.failed,
         d.totals.unsupported,
         d.totals.skipped,
+        d.totals.closed_zone,
         d.totals.daily_limit
     ));
 
@@ -384,6 +391,7 @@ fn add_counts(a: Counts, b: Counts) -> Counts {
         failed: a.failed + b.failed,
         unsupported: a.unsupported + b.unsupported,
         skipped: a.skipped + b.skipped,
+        closed_zone: a.closed_zone + b.closed_zone,
         daily_limit: a.daily_limit + b.daily_limit,
     }
 }
@@ -510,11 +518,11 @@ mod tests {
         let md = std::fs::read_to_string(dir.join("crawl.md")).unwrap();
         // The same quest keeps one row per character: B does not replace A.
         assert!(
-            md.contains("| nuian/CrawlerA | 1 | 0 | 0 | 0 | 0 | 0 |"),
+            md.contains("| nuian/CrawlerA | 1 | 0 | 0 | 0 | 0 | 0 | 0 |"),
             "{md}"
         );
         assert!(
-            md.contains("| nuian/CrawlerB | 0 | 0 | 1 | 0 | 0 | 0 |"),
+            md.contains("| nuian/CrawlerB | 0 | 0 | 1 | 0 | 0 | 0 | 0 |"),
             "{md}"
         );
         assert!(md.contains("Ignored 1 legacy result line(s)"), "{md}");
@@ -534,15 +542,17 @@ mod tests {
         counts.add(&result(2, "passed", true));
         counts.add(&result(3, "failed", false));
         counts.add(&result(4, "daily-limit", false));
+        counts.add(&result(5, "closed-zone", false));
         assert_eq!(counts.passed, 1);
         assert_eq!(counts.passed_gm, 1);
         assert_eq!(counts.failed, 1);
+        assert_eq!(counts.closed_zone, 1);
         assert_eq!(counts.daily_limit, 1);
-        assert_eq!(counts.total(), 4);
+        assert_eq!(counts.total(), 5);
 
         let mut dashboard = Dashboard {
             generated: "test".into(),
-            results: 4,
+            results: 5,
             totals: counts,
             ..Dashboard::default()
         };

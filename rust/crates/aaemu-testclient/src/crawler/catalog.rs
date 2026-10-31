@@ -176,6 +176,9 @@ pub struct Quest {
     /// `Some` when the crawler cannot play this quest (yet), with the reason.
     pub unsupported: Option<String>,
     pub instance: bool,
+    /// The quest's zone, or one of its objective zones, is `closed` in the 1.2 data. The server
+    /// evicts characters below access level 100 from such zones (`zone_access::update`).
+    pub closed_zone: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -220,6 +223,8 @@ pub struct Catalog {
     /// NPC groups used by skill requirements (not the quest monster groups).
     pub skill_npc_groups: HashMap<u32, Vec<u32>>,
     pub zones: HashMap<u32, String>,
+    /// `zones.id` rows with `closed = 't'` (1.2 closed zones, e.g. Bronze Rock 19/138/139).
+    pub closed_zones: HashSet<u32>,
 }
 
 pub struct Summary {
@@ -314,13 +319,18 @@ fn read_detail(conn: &Connection, class: &str, id: u32) -> Result<Option<Detail>
     Ok(Some(d))
 }
 
-fn load_zones(conn: &Connection) -> Result<HashMap<u32, String>> {
+fn load_zones(conn: &Connection) -> Result<(HashMap<u32, String>, HashSet<u32>)> {
     let mut zones = HashMap::new();
-    for_each_row(conn, "SELECT id, name FROM zones", [], |r| {
-        zones.insert(r.u32("id")?, r.string("name")?);
+    let mut closed = HashSet::new();
+    for_each_row(conn, "SELECT id, name, closed FROM zones", [], |r| {
+        let id = r.u32("id")?;
+        zones.insert(id, r.string("name")?);
+        if r.bool_str("closed")? {
+            closed.insert(id);
+        }
         Ok(())
     })?;
-    Ok(zones)
+    Ok((zones, closed))
 }
 
 fn load_groups(
@@ -365,8 +375,10 @@ impl Catalog {
     pub fn load(compact: &Path, data_dir: &Path) -> Result<Self> {
         let conn = Connection::open_with_flags(compact, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("opening {}", compact.display()))?;
+        let (zones, closed_zones) = load_zones(&conn)?;
         let mut cat = Catalog {
-            zones: load_zones(&conn)?,
+            zones,
+            closed_zones,
             ..Catalog::default()
         };
         cat.npc_groups = load_groups(
@@ -511,6 +523,7 @@ impl Catalog {
             let quest_comps: Vec<u32> = comp_order.get(&id).cloned().unwrap_or_default();
             let zone = cat.zones.get(&zone_id).cloned().unwrap_or_default();
             let instance = zone.starts_with("instance") || zone.starts_with("arche_mall");
+            let mut closed_zone = cat.closed_zones.contains(&zone_id);
 
             let mut objectives = Vec::new();
             let mut gates = Vec::new();
@@ -544,6 +557,13 @@ impl Catalog {
                 let acts = acts_by_comp.get(cid).cloned().unwrap_or_default();
                 for act in acts {
                     let d = detail(&conn, &act.ty, act.detail_id)?;
+                    // Zone-kill acts carry the zone the objective must be done in. The data has
+                    // no per-NPC zone, so a quest whose own zone is open but whose objective
+                    // names a closed zone is still closed-zone.
+                    let objective_zone = d.v("zone_id");
+                    if objective_zone != 0 && cat.closed_zones.contains(&objective_zone) {
+                        closed_zone = true;
+                    }
                     let counts = counts_as_objective(&act.ty);
                     let objective_index = if counts {
                         let i = act_index;
@@ -958,6 +978,7 @@ impl Catalog {
                 gate_items,
                 unsupported,
                 instance,
+                closed_zone,
             });
         }
 
@@ -1308,4 +1329,163 @@ fn read_detail_doodad(conn: &Connection, class: &str, id: u32) -> Result<Option<
 /// Borrow-free helper so the closures above do not fight over `conn` mutability.
 fn conn_ordered(conn: &Connection) -> Result<&Connection> {
     Ok(conn)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "aaemu-testclient-catalog-{tag}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    /// Schema of the real `compact.sqlite3` tables `Catalog::load` reads. The `zones` table is
+    /// copied verbatim from the compact database.
+    const FIXTURE_SCHEMA: &str = r#"
+        CREATE TABLE zones (
+            id int PRIMARY KEY,
+            name TEXT,
+            zone_key INT,
+            group_id INT,
+            closed NUM,
+            display_text TEXT,
+            faction_id INT,
+            zone_climate_id INT,
+            abox_show NUM
+        );
+        CREATE TABLE quest_contexts (
+            id int PRIMARY KEY, name TEXT, category_id INT, REPEATABLE NUM, LEVEL INT,
+            let_it_done NUM, detail_id INT, zone_id INT, score INT
+        );
+        CREATE TABLE quest_components (
+            id int PRIMARY KEY, quest_context_id INT, component_kind_id INT
+        );
+        CREATE TABLE quest_acts (
+            id int PRIMARY KEY, quest_component_id INT, act_detail_id INT, act_detail_type TEXT
+        );
+        CREATE TABLE quest_act_con_accept_npcs (id int PRIMARY KEY, npc_id INT);
+        CREATE TABLE quest_act_obj_talks (id int PRIMARY KEY, npc_id INT);
+        CREATE TABLE unit_reqs (
+            id INT, owner_id INT, owner_type TEXT, kind_id INT, value1 INT, value2 INT
+        );
+        CREATE TABLE quest_monster_npcs (
+            id int PRIMARY KEY, quest_monster_group_id INT, npc_id INT
+        );
+        CREATE TABLE quest_item_group_items (
+            id int PRIMARY KEY, quest_item_group_id INT, item_id INT
+        );
+        CREATE TABLE npc_group_members (id INT, npc_group_id INT, npc_id INT);
+        CREATE TABLE items (id int PRIMARY KEY, name TEXT, use_skill_id INT);
+        CREATE TABLE doodad_func_groups (id int PRIMARY KEY, doodad_almighty_id INT);
+        CREATE TABLE doodad_funcs (
+            id int PRIMARY KEY, doodad_func_group_id INT, actual_func_id INT,
+            actual_func_type TEXT, func_skill_id INT
+        );
+        CREATE TABLE quest_act_obj_zone_kills (id int PRIMARY KEY, zone_id INT, count_pk INT);
+    "#;
+
+    fn write_fixture(dir: &Path) -> PathBuf {
+        let db = dir.join("compact.sqlite3");
+        let conn = Connection::open(&db).expect("fixture db");
+        conn.execute_batch(FIXTURE_SCHEMA).expect("fixture schema");
+        conn.execute_batch(
+            r#"
+            INSERT INTO zones VALUES
+                (19, 'w_bronze_rock_1', 154, 0, 't', NULL, 148, NULL, 'f'),
+                (1, 'w_nuian_open', 2, 0, 'f', NULL, 148, NULL, 'f'),
+                (138, 'w_bronze_rock_2', 192, 0, 1, NULL, 148, NULL, 'f');
+            INSERT INTO quest_contexts VALUES
+                (2098, 'closed zone quest', 0, 'f', 8, 'f', 0, 19, 0),
+                (2099, 'open zone quest', 0, 'f', 8, 'f', 0, 1, 0),
+                (2100, 'open zone, closed objective', 0, 'f', 8, 'f', 0, 1, 0);
+            INSERT INTO quest_components VALUES
+                (1, 2098, 2), (2, 2098, 4),
+                (3, 2099, 2), (4, 2099, 4),
+                (5, 2100, 2), (6, 2100, 4);
+            INSERT INTO quest_acts VALUES
+                (1, 1, 1, 'QuestActConAcceptNpc'),
+                (2, 2, 1, 'QuestActObjTalk'),
+                (3, 3, 2, 'QuestActConAcceptNpc'),
+                (4, 4, 2, 'QuestActObjTalk'),
+                (5, 5, 3, 'QuestActConAcceptNpc'),
+                (6, 6, 1, 'QuestActObjZoneKill');
+            INSERT INTO quest_act_con_accept_npcs VALUES (1, 5001), (2, 5002), (3, 5003);
+            INSERT INTO quest_act_obj_talks VALUES (1, 5001), (2, 5002);
+            INSERT INTO quest_act_obj_zone_kills VALUES (1, 138, 1);
+            "#,
+        )
+        .expect("fixture rows");
+
+        let world = dir.join("Worlds").join("main_world");
+        std::fs::create_dir_all(&world).expect("spawn dir");
+        let spawns = r#"[{"UnitId":5001,"Position":{"X":1.0,"Y":2.0,"Z":3.0}},
+                          {"UnitId":5002,"Position":{"X":4.0,"Y":5.0,"Z":6.0}},
+                          {"UnitId":5003,"Position":{"X":7.0,"Y":8.0,"Z":9.0}}]"#;
+        std::fs::write(world.join("npc_spawns.json"), spawns).expect("npc spawns");
+        std::fs::write(world.join("doodad_spawns.json"), "[]").expect("doodad spawns");
+        db
+    }
+
+    fn quest(cat: &Catalog, id: u32) -> &Quest {
+        cat.quests
+            .iter()
+            .find(|q| q.id == id)
+            .unwrap_or_else(|| panic!("quest {id} in the catalog"))
+    }
+
+    #[test]
+    fn closed_zone_quests_are_classified_from_the_zones_table() {
+        let dir = temp_dir("closed-zone");
+        let db = write_fixture(&dir);
+        let cat = Catalog::load(&db, &dir).expect("catalog");
+
+        assert_eq!(cat.closed_zones, HashSet::from([19, 138]));
+        assert!(quest(&cat, 2098).closed_zone, "quest zone is closed");
+        assert!(!quest(&cat, 2099).closed_zone, "quest zone is open");
+
+        // The nursery schema mirrors the real booleans: 't' and 1 are closed, 'f' is not.
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_objective_in_a_closed_zone_is_classified_even_when_the_quest_zone_is_open() {
+        let dir = temp_dir("closed-objective");
+        let db = write_fixture(&dir);
+        let cat = Catalog::load(&db, &dir).expect("catalog");
+
+        let q = quest(&cat, 2100);
+        assert_eq!(q.zone, "w_nuian_open");
+        assert!(q.closed_zone, "zone kill objective is in closed zone 138");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The real data: Bronze Rock is `closed` and its quests are all in that zone. Needs
+    /// `AAEMU_COMPACT_DB` (see AGENTS.md); CI does not run it.
+    #[test]
+    #[ignore = "needs AAEMU_COMPACT_DB pointing at the real compact.sqlite3"]
+    fn real_data_bronze_rock_quests_are_closed_zone() {
+        let Ok(db) = std::env::var("AAEMU_COMPACT_DB") else {
+            return;
+        };
+        let db = Path::new(&db);
+        let data = db.parent().expect("compact.sqlite3 has a data directory");
+        let cat = Catalog::load(db, data).expect("catalog");
+        for id in [2098, 2099, 2100, 2101, 2102, 2103] {
+            let q = quest(&cat, id);
+            assert_eq!(q.zone, "w_bronze_rock_1");
+            assert!(q.closed_zone, "quest {id} in closed zone {}", q.zone_id);
+        }
+        let open = quest(&cat, 1125);
+        assert_eq!(open.zone, "e_rainbow_field_3");
+        assert!(!open.closed_zone);
+    }
 }

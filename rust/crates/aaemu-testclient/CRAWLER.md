@@ -42,6 +42,12 @@ $TC crawl --race nuian \
   lane's private MySQL) unless `--mysql-port` names another port. `Configurations/**/*.json` is
   merged in the server's order. Without `--game-config` the GM bootstrap prints the SQL the
   account needs.
+- `--gm-closed-zones` plays quests in zones the 1.2 data marks `closed` (for example Bronze
+  Rock) and re-grants the account and the character access level 100 right before character
+  select. The server's closed-zone check reads the **character's** access level, and a
+  character created in the same run starts from the server config default (0), so the
+  pre-login grant alone does not protect it. Default off: closed-zone quests are recorded as
+  `closed-zone` and not played (see "Output").
 - `--min-level` raises the character before each quest (setup); `0` uses the quest level.
   `--limit` counts quests the crawler can actually attempt, not unsupported/gated ones;
   without it the crawler attempts every quest currently available in the level band.
@@ -67,14 +73,16 @@ $TC crawl --race nuian \
 targets, turn-in, rewards, race/faction/level requirements and the nearest authored target
 positions. It is written on every run and never committed.
 
-Each result records `passed`, `daily-limit`, `failed`, `unsupported` or `skipped`, the failing
-step (`accept`, `objective N <act>`, `turn-in`, ...), the objective counters reached, the
-duration, the server WARN/ERROR lines in the quest window and new bug-report paths. A quest is
-marked `gm_assisted` (with the objective list) when a GM command or the pre-accept setup
-satisfied an objective: an item hand-over for a gather act with no highlight doodad, a gather
-or level act the setup `/level`/gate/starter item made true at accept, or `/level` for a level
-act. `daily-limit` is error 621 (`QuestDailyLimit`); it is not a pass and is retried in later
-runs.
+Each result records `passed`, `daily-limit`, `failed`, `unsupported`, `skipped` or
+`closed-zone`, the failing step (`accept`, `objective N <act>`, `turn-in`, ...), the objective
+counters reached, the duration, the server WARN/ERROR lines in the quest window and new
+bug-report paths. `closed-zone` means the quest's zone (or one of its objective zones) has
+`closed = 't'` in `zones`; it is deliberately not a failure and has its own dashboard column.
+A quest is marked `gm_assisted` (with the objective list) when a GM command or the pre-accept
+setup satisfied an objective: an item hand-over for a gather act with no highlight doodad, a
+gather or level act the setup `/level`/gate/starter item made true at accept, or `/level` for
+a level act. `daily-limit` is error 621 (`QuestDailyLimit`); it is not a pass and is retried
+in later runs.
 
 `crawl.json` / `crawl.md` aggregate the latest result per race, character and quest: totals per
 race, then one row per character, level band, zone and act kind (with GM-assisted passes in
@@ -102,6 +110,12 @@ starter spheres, empty/"reserve" templates, and doodads whose data offers no int
 skill. Quests in instance worlds and quests whose data has no main-world spawn for a required
 NPC/doodad are skipped.
 
-Known live failure worth triage: in Bronze Rock the faction-3 quest mobs (e.g. quest 2101,
-2102, 2103 targets) take no damage from the auto attack, even after `CSSetForceAttack`, while
-faction-115 monsters die normally.
+Quests in closed zones are classified as `closed-zone` before any packet is sent: the quest's
+`quest_contexts.zone_id` or an objective's zone act points at a `zones` row with
+`closed = 't'`. The 2026-10-30 crawl blamed the Bronze Rock failures (quests 2098-2103) on
+faction-3 quest mobs taking no damage; that was wrong. Those zones are closed (154/192/193 in
+the client's zone keys), the server evicts a character whose character access level is below
+100 after about 10 s (`world/zone_access.rs`), and the crawler's fights were interrupted by
+the repeated eviction teleport. Kill objectives there are not evidence of a damage bug; the
+general crawler limit (auto attack only, no gear) still applies to high-level mobs. Use
+`--gm-closed-zones` to play those quests on purpose.

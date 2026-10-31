@@ -332,6 +332,7 @@ pub async fn run(cfg: &CrawlConfig, catalog: &Catalog) -> Result<()> {
                 "daily-limit" => "limit",
                 "skipped" => "skip",
                 "unsupported" => "UNSP",
+                "closed-zone" => "CZone",
                 _ => "FAIL",
             },
             result.quest,
@@ -445,6 +446,8 @@ fn finish_result(
         Err(f) => {
             if f.step == "unsupported" {
                 r.status = "unsupported".into();
+            } else if f.step == "closed-zone" {
+                r.status = "closed-zone".into();
             } else if f.step == "accept" && f.reason.contains("daily limit") {
                 // Error 621 (`QuestDailyLimit`). It is not a completion: only the retry marker.
                 r.status = "daily-limit".into();
@@ -586,6 +589,15 @@ async fn connect(cfg: &CrawlConfig, _catalog: &Catalog) -> Result<Session> {
         }
     };
 
+    // The closed-zone check reads the character's own access level
+    // (`zone_access::needs_return`), not the account's. A character created in this run is
+    // inserted with the server config default (0) after the pre-login grant, so grant again
+    // before `select_character` reloads its row.
+    if cfg.gm_closed_zones {
+        grant_gm(cfg, account_id)
+            .context("raising the crawler character to the GM access level")?;
+    }
+
     game.select_character(character.id).await?;
     game.wait_sc(sc::SCCharacterStatePacket).await?;
     game.drain(QUIET, Duration::from_secs(10)).await?;
@@ -654,34 +666,15 @@ async fn crawl_quest(
         gm_assisted_steps: Vec::new(),
         duration_ms: 0,
     };
-    if let Some(reason) = &quest.unsupported {
-        evidence.outcome = Err(QuestFailure::new("unsupported", reason));
-        return evidence;
-    }
-    let verdict = catalog.gate_verdict(
-        quest,
-        cfg.race,
-        quest.level.max(cfg.min_level).max(2),
-        completed,
-    );
-    let gate_items = match verdict {
-        GateVerdict::Skip(reason) => {
-            evidence.outcome = Err(QuestFailure::new("gate", reason));
+    let plan = match play_refusal(cfg, catalog, quest, completed) {
+        Ok(plan) => plan,
+        Err(f) => {
+            evidence.outcome = Err(f);
             return evidence;
         }
-        GateVerdict::Play { items } => items,
     };
-    if quest.instance {
-        evidence.outcome = Err(QuestFailure::new("gate", "instance world"));
-        return evidence;
-    }
-    let Some(anchor) = anchor_of(catalog, quest) else {
-        evidence.outcome = Err(QuestFailure::new(
-            "gate",
-            "no authored position for its targets",
-        ));
-        return evidence;
-    };
+    let gate_items = plan.gate_items;
+    let anchor = plan.anchor;
 
     let started = Instant::now();
     let deadline = started + cfg.quest_timeout;
@@ -1765,24 +1758,63 @@ fn best_member(
         })
 }
 
+#[derive(Debug)]
+struct PlayPlan {
+    gate_items: Vec<u32>,
+    anchor: (f32, f32, f32),
+}
+
+/// The checks that decide whether the crawler can play a quest at all, before any packet is
+/// sent. `crawl_quest` records the returned [`QuestFailure`]; `is_attemptable` uses the same
+/// verdict so `--limit` never counts a quest that `crawl_quest` will not play.
+fn play_refusal(
+    cfg: &CrawlConfig,
+    catalog: &Catalog,
+    quest: &Quest,
+    completed: &HashSet<u32>,
+) -> std::result::Result<PlayPlan, QuestFailure> {
+    if quest.closed_zone && !cfg.gm_closed_zones {
+        let zone = if quest.zone.is_empty() {
+            quest.zone_id.to_string()
+        } else {
+            quest.zone.clone()
+        };
+        return Err(QuestFailure::new(
+            "closed-zone",
+            format!("zone {zone} is closed in the 1.2 data (--gm-closed-zones plays it)"),
+        ));
+    }
+    if let Some(reason) = &quest.unsupported {
+        return Err(QuestFailure::new("unsupported", reason));
+    }
+    let gate_items = match catalog.gate_verdict(
+        quest,
+        cfg.race,
+        quest.level.max(cfg.min_level).max(2),
+        completed,
+    ) {
+        GateVerdict::Skip(reason) => return Err(QuestFailure::new("gate", reason)),
+        GateVerdict::Play { items } => items,
+    };
+    if quest.instance {
+        return Err(QuestFailure::new("gate", "instance world"));
+    }
+    let Some(anchor) = anchor_of(catalog, quest) else {
+        return Err(QuestFailure::new(
+            "gate",
+            "no authored position for its targets",
+        ));
+    };
+    Ok(PlayPlan { gate_items, anchor })
+}
+
 fn is_attemptable(
     cfg: &CrawlConfig,
     catalog: &Catalog,
     quest: &Quest,
     completed: &HashSet<u32>,
 ) -> bool {
-    quest.unsupported.is_none()
-        && !quest.instance
-        && anchor_of(catalog, quest).is_some()
-        && matches!(
-            catalog.gate_verdict(
-                quest,
-                cfg.race,
-                quest.level.max(cfg.min_level).max(2),
-                completed
-            ),
-            GateVerdict::Play { .. }
-        )
+    play_refusal(cfg, catalog, quest, completed).is_ok()
 }
 
 fn anchor_of(catalog: &Catalog, quest: &Quest) -> Option<(f32, f32, f32)> {
@@ -2464,6 +2496,7 @@ mod tests {
             gate_items: Vec::new(),
             unsupported: None,
             instance: false,
+            closed_zone: false,
         }
     }
 
@@ -2517,6 +2550,53 @@ mod tests {
             gm_assisted_steps: Vec::new(),
             duration_ms: 0,
         }
+    }
+
+    #[test]
+    fn closed_zone_quests_are_reported_closed_zone_unless_gm_mode_is_on() {
+        let mut cfg = CrawlConfig::defaults();
+        let mut q = quest(Vec::new());
+        q.zone_id = 19;
+        q.zone = "w_bronze_rock_1".into();
+        q.starter.kind = "npc".into();
+        q.starter.npc = 5001;
+        q.closed_zone = true;
+        // The closed-zone verdict wins over the unsupported one: the quest never gets played
+        // either way, and the count of closed-zone quests must stay complete.
+        q.unsupported = Some("doodad 1 has no interaction skill in the data".into());
+        let mut catalog = Catalog::default();
+        catalog.npc_spawns.insert(5001, vec![[10.0, 20.0, 30.0]]);
+        let completed = HashSet::new();
+
+        assert!(!is_attemptable(&cfg, &catalog, &q, &completed));
+        let failure = play_refusal(&cfg, &catalog, &q, &completed).unwrap_err();
+        assert_eq!(failure.step, "closed-zone");
+        assert!(failure.reason.contains("w_bronze_rock_1"), "{failure}");
+        let r = finish_result(&cfg, &q, outcome(Some(failure)), 1);
+        assert_eq!(r.status, "closed-zone");
+
+        // The flag opts in: the closed-zone refusal is gone, so the quest's own unsupported
+        // objective is what is reported now.
+        cfg.gm_closed_zones = true;
+        let failure = play_refusal(&cfg, &catalog, &q, &completed).unwrap_err();
+        assert_eq!(failure.step, "unsupported");
+    }
+
+    #[test]
+    fn a_closed_zone_quest_with_a_playable_plan_is_attemptable_with_the_flag() {
+        let mut cfg = CrawlConfig::defaults();
+        cfg.gm_closed_zones = true;
+        let mut q = quest(Vec::new());
+        q.zone_id = 19;
+        q.zone = "w_bronze_rock_1".into();
+        q.starter.kind = "npc".into();
+        q.starter.npc = 5001;
+        q.closed_zone = true;
+        let mut catalog = Catalog::default();
+        catalog.npc_spawns.insert(5001, vec![[10.0, 20.0, 30.0]]);
+        assert!(is_attemptable(&cfg, &catalog, &q, &HashSet::new()));
+        let plan = play_refusal(&cfg, &catalog, &q, &HashSet::new()).unwrap();
+        assert_eq!(plan.anchor, (10.0, 20.0, 30.0));
     }
 
     #[test]
