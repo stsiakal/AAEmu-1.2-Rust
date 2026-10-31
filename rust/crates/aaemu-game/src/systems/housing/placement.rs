@@ -1,5 +1,7 @@
 //! Server-side placement checks using the original 1.2 housing polygons and eligibility data.
 
+use std::collections::HashMap;
+
 use super::data::{HousingData, HousingTemplate};
 use crate::server::GameServer;
 use crate::systems::ai::collision::world::{ObjKind, Owner};
@@ -47,6 +49,14 @@ fn housing_areas(data: &GameData, world_template_id: u32) -> Vec<&Area> {
         .unwrap_or_default()
 }
 
+fn areas_at<'a>(areas: &[&'a Area], x: f32, y: f32) -> Vec<&'a Area> {
+    areas
+        .iter()
+        .copied()
+        .filter(|area| subzone::is_inside(&area.points, [x, y, 0.0]))
+        .collect()
+}
+
 /// `FUN_39331ba0`: all four corners of one 4 m cell must lie in the same housing polygon.
 fn cell_inside_one_area(areas: &[&Area], x: f32, y: f32) -> bool {
     let corners = [
@@ -62,12 +72,53 @@ fn cell_inside_one_area(areas: &[&Area], x: f32, y: f32) -> bool {
     })
 }
 
+/// The account's houses counted per `(housing_group_id, category_id)` for the authored
+/// `max_construct_count` limit.
+fn owned_group_counts(
+    server: &GameServer,
+    data: &HousingData,
+    account: u32,
+) -> HashMap<(u32, u32), usize> {
+    let mut counts = HashMap::new();
+    for house in server.systems.housing.manager.by_account(account) {
+        let (instance, template_id, pos) = {
+            let h = house.data();
+            (
+                h.unit.transform.instance_id,
+                h.unit.template_id,
+                h.unit.transform.local(),
+            )
+        };
+        let Some(world) = server.world.world(instance) else {
+            continue;
+        };
+        let Some(template) = data.template(template_id) else {
+            continue;
+        };
+        let areas = areas_at(
+            &housing_areas(&server.game_data, world.template.id),
+            pos.x,
+            pos.y,
+        );
+        for group in areas
+            .iter()
+            .filter_map(|area| data.areas.get(&area.id))
+            .filter_map(|id| data.groups.get(id))
+        {
+            *counts.entry((group.id, template.category_id)).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+/// `FUN_39897280`: the area's group must allow the category. Returns the matching group.
 fn validate_groups(
     data: &HousingData,
     areas: &[u32],
     category: u32,
     owned_categories: &[u32],
-) -> Result<(), i16> {
+    owned_counts: &HashMap<(u32, u32), usize>,
+) -> Result<u32, i16> {
     let mut error = err::HOUSE_CANNOT_LOACATE_INVALID_CATEGORY_AREA;
     for group in areas
         .iter()
@@ -81,6 +132,21 @@ fn validate_groups(
         {
             continue;
         }
+        let limit = data
+            .max_construct_count
+            .get(&(group.id, category))
+            .copied()
+            .unwrap_or(0);
+        if limit > 0 {
+            let used = owned_counts
+                .get(&(group.id, category))
+                .copied()
+                .unwrap_or(0);
+            if used >= limit as usize {
+                error = err::HOUSE_CANNOT_CONSTRUCT_IN_AREA_BY_MAX_CONSTRUCT_COUNT;
+                continue;
+            }
+        }
         if group.houseless && !owned_categories.is_empty() {
             error = err::HOUSE_CANNOT_OWN_MORE_HOUSELESS_CONDITION;
             continue;
@@ -90,7 +156,7 @@ fn validate_groups(
             error = err::HOUSE_CANNOT_OWN_MORE_EXISTING_CATEGORY_CONDITION;
             continue;
         }
-        return Ok(());
+        return Ok(group.id);
     }
     Err(error)
 }
@@ -234,7 +300,14 @@ pub fn validate_house(
                     .map(|t| t.category_id)
             })
             .collect::<Vec<_>>();
-        validate_groups(data, &areas, template.category_id, &owned_categories)?;
+        let owned_counts = owned_group_counts(server, data, account);
+        validate_groups(
+            data,
+            &areas,
+            template.category_id,
+            &owned_categories,
+            &owned_counts,
+        )?;
     }
     let cells = footprint_cells(template.garden_radius);
     if cells > 0 && fort.is_none() && !data.areas.is_empty() {
@@ -445,20 +518,196 @@ mod tests {
             },
         );
         data.group_categories.insert(9, vec![17]);
-        assert_eq!(validate_groups(&data, &[100], 17, &[]), Ok(()));
+        let none = HashMap::new();
+        assert_eq!(validate_groups(&data, &[100], 17, &[], &none), Ok(9));
         assert_eq!(
-            validate_groups(&data, &[100], 1, &[]),
+            validate_groups(&data, &[100], 1, &[], &none),
             Err(err::HOUSE_CANNOT_LOACATE_INVALID_CATEGORY_AREA)
         );
         assert_eq!(
-            validate_groups(&data, &[100], 17, &[17]),
+            validate_groups(&data, &[100], 17, &[17], &none),
             Err(err::HOUSE_CANNOT_OWN_MORE_EXISTING_CATEGORY_CONDITION)
         );
         data.groups.get_mut(&9).unwrap().houseless = true;
         assert_eq!(
-            validate_groups(&data, &[100], 17, &[1]),
+            validate_groups(&data, &[100], 17, &[1], &none),
             Err(err::HOUSE_CANNOT_OWN_MORE_HOUSELESS_CONDITION)
         );
-        assert!(validate_groups(&data, &[999], 17, &[]).is_err());
+        assert!(validate_groups(&data, &[999], 17, &[], &none).is_err());
+    }
+
+    #[test]
+    fn placement_groups_enforce_the_authored_max_construct_count() {
+        let mut data = HousingData::default();
+        data.areas.insert(100, 9);
+        data.groups.insert(
+            9,
+            HousingGroup {
+                id: 9,
+                ..Default::default()
+            },
+        );
+        data.group_categories.insert(9, vec![17]);
+        data.max_construct_count.insert((9, 17), 2);
+        let mut counts = HashMap::new();
+        counts.insert((9, 17), 1usize);
+        assert_eq!(validate_groups(&data, &[100], 17, &[], &counts), Ok(9));
+        counts.insert((9, 17), 2);
+        assert_eq!(
+            validate_groups(&data, &[100], 17, &[], &counts),
+            Err(err::HOUSE_CANNOT_CONSTRUCT_IN_AREA_BY_MAX_CONSTRUCT_COUNT)
+        );
+        // A zero limit means unlimited.
+        data.max_construct_count.insert((9, 17), 0);
+        assert_eq!(validate_groups(&data, &[100], 17, &[], &counts), Ok(9));
+    }
+
+    #[tokio::test]
+    async fn placement_counts_the_accounts_houses_against_the_authored_limit() {
+        use crate::data::{world_data::Zone, GameData};
+        use crate::models::house::House;
+        use crate::systems::npcs::subzone::Area;
+        use crate::test_support::*;
+        use crate::world::Entity;
+        let mut data = GameData::empty();
+        data.zones.zones.insert(
+            TEST_ZONE,
+            Zone {
+                id: 42,
+                zone_key: TEST_ZONE,
+                ..Default::default()
+            },
+        );
+        data.systems
+            .npcs
+            .subzone
+            .housing_zones
+            .entry(0)
+            .or_default()
+            .insert(
+                42,
+                vec![Area {
+                    id: 500,
+                    name: "Housing".into(),
+                    points: vec![
+                        [100., 100., 0.],
+                        [900., 100., 0.],
+                        [900., 900., 0.],
+                        [100., 900., 0.],
+                    ],
+                }],
+            );
+        let template = HousingTemplate {
+            id: 1,
+            category_id: 17,
+            garden_radius: 8.,
+            ..Default::default()
+        };
+        data.systems.housing.add_template(template.clone());
+        data.systems.housing.areas.insert(500, 1);
+        data.systems.housing.groups.insert(
+            1,
+            HousingGroup {
+                id: 1,
+                ..Default::default()
+            },
+        );
+        data.systems.housing.group_categories.insert(1, vec![17]);
+        data.systems.housing.max_construct_count.insert((1, 17), 2);
+        let server = test_server_with(data);
+        let client = TestClient::new(&server, 1, 1001);
+        let player = spawn_player(&server, &client, test_character(1, "Owner", 500., 500.), 10);
+        for (i, x) in [300., 320.].into_iter().enumerate() {
+            let mut h = House::new(7 + i as u32, 1);
+            h.id = 7 + i as u32;
+            h.account_id = 1001;
+            h.unit.tl_id = 7 + i as u16;
+            h.unit.transform.set_xyz(x, 300., 100.);
+            let house = Entity::new(20 + i as u32, h);
+            assert!(server.systems.housing.manager.insert(&house));
+        }
+        assert_eq!(
+            validate_house(&server, &player, &template, 500., 500., 100.),
+            Err(err::HOUSE_CANNOT_CONSTRUCT_IN_AREA_BY_MAX_CONSTRUCT_COUNT)
+        );
+    }
+
+    /// Real 1.2 data: the client's own area-338 polygon, design 171's category/group and the
+    /// authored `max_construct_count` row.
+    /// `AAEMU_COMPACT_DB=... AAEMU_GAME_PAK=... cargo test -p aaemu-game
+    /// real_area_338_footprint -- --ignored`.
+    #[test]
+    #[ignore = "needs AAEMU_COMPACT_DB and AAEMU_GAME_PAK"]
+    fn real_area_338_footprint_accepts_only_the_fitting_spot() {
+        use crate::data::client_files::ClientFileManager;
+        use crate::data::world_data::ZoneData;
+        use crate::data::world_templates::WorldTemplates;
+        use crate::data::GameData;
+        use crate::systems::npcs::subzone::SubZoneData;
+        use crate::systems::DataLoadCtx;
+        use rusqlite::{Connection, OpenFlags};
+        use std::path::PathBuf;
+        let (Ok(path), Ok(pak)) = (
+            std::env::var("AAEMU_COMPACT_DB"),
+            std::env::var("AAEMU_GAME_PAK"),
+        ) else {
+            return;
+        };
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let app = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("app");
+        let files = ClientFileManager::from_sources(&[pak], &app);
+        let ctx = DataLoadCtx {
+            conn: &conn,
+            app_path: &app,
+            files: &files,
+            language: "en_us",
+        };
+        let mut data = GameData::empty();
+        data.worlds = WorldTemplates::load(&files, &app).unwrap();
+        data.zones = ZoneData::load(&conn, 0).unwrap();
+        data.systems.housing = HousingData::load(&ctx).unwrap();
+        data.systems.npcs.subzone = SubZoneData::load(&ctx).unwrap();
+        let main = data
+            .worlds
+            .get_world_template_by_name("main_world")
+            .unwrap();
+        let areas = housing_areas(&data, main.id);
+        let area338 = areas
+            .iter()
+            .find(|area| area.id == 338)
+            .expect("client area 338");
+        assert_eq!(data.systems.housing.areas.get(&338), Some(&15));
+        assert!(data.systems.housing.group_categories[&15].contains(&18));
+        assert_eq!(
+            data.systems.housing.max_construct_count.get(&(1, 8)),
+            Some(&3)
+        );
+        let cells = footprint_cells(11.0);
+        assert_eq!(cells, 6);
+        let list = [*area338];
+        let (x0, y0) = footprint_origin(15328.4, 14631.8, cells);
+        for ix in 0..cells {
+            for iy in 0..cells {
+                assert!(
+                    cell_inside_one_area(
+                        &list,
+                        x0 + ix as f32 * FOOTPRINT_CELL,
+                        y0 + iy as f32 * FOOTPRINT_CELL
+                    ),
+                    "accepted cell {ix},{iy}"
+                );
+            }
+        }
+        let (x0, y0) = footprint_origin(15338.53, 14632.33, cells);
+        let inside = (0..cells).all(|ix| {
+            (0..cells).all(|iy| {
+                cell_inside_one_area(
+                    &list,
+                    x0 + ix as f32 * FOOTPRINT_CELL,
+                    y0 + iy as f32 * FOOTPRINT_CELL,
+                )
+            })
+        });
+        assert!(!inside, "the captured spot must not fit area 338");
     }
 }
