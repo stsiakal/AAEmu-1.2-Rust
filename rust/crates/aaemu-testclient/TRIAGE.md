@@ -28,7 +28,10 @@ Data and server evidence:
 
 Crawler handling:
 
-- Quests whose zone (or objective zone act) is closed are recorded as `closed-zone` before
-  any packet is sent, not as failures, and have their own dashboard column.
-- `--gm-closed-zones` opts in to playing them and re-grants access level 100 to the account
-  and the character immediately before character select.
+- Quests in closed zones are still attempted. A pass there stays a pass; a failed attempt is
+  recorded as `closed-zone` instead of `failed`, as is a failure during a quest whose own zone
+  is open when an `SCErrorMsg 287` eviction is seen. The dashboard's per-zone table counts the
+  closed-zone results per zone.
+- `--gm-closed-zones` re-grants access level 100 to the account and the character immediately
+  before character select, so the server does not evict the character; a failure is still
+  classified the same way.

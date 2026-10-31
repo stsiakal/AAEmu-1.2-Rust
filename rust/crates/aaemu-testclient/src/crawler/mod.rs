@@ -114,8 +114,8 @@ pub struct CrawlConfig {
     pub no_grant_gm: bool,
     /// Do not retry quests that already failed in the result file.
     pub skip_failed: bool,
-    /// Play quests in zones the 1.2 data marks closed, and raise the crawler characters to
-    /// access level 100 (the server evicts lower access levels from a closed zone).
+    /// Raise the crawler characters to access level 100 before they enter the world, so the
+    /// server does not evict them from zones the 1.2 data marks closed.
     pub gm_closed_zones: bool,
 }
 

@@ -16,7 +16,8 @@ struct Counts {
     failed: u64,
     unsupported: u64,
     skipped: u64,
-    /// Quests in a zone the 1.2 data marks closed; not played by default, never a failure.
+    /// Quests played and failed in a zone the 1.2 data marks closed, or that failed while the
+    /// character was evicted from one; never counted as failures.
     closed_zone: u64,
     /// Quests refused with error 621 (`QuestDailyLimit`); retried in later runs.
     daily_limit: u64,
@@ -570,6 +571,34 @@ mod tests {
         let second = md.find("| 6-10 |").expect("6-10 row");
         let third = md.find("| 11-15 |").expect("11-15 row");
         assert!(first < second && second < third, "{md}");
+    }
+
+    #[test]
+    fn per_zone_rows_count_closed_zone_results() {
+        let dir = temp_dir("dashboard-closed-zone");
+        let mut pass = result(1, "passed", false);
+        pass.zone = "w_cradle_of_genesis".into();
+        let mut closed = result(2, "closed-zone", false);
+        closed.zone = "w_cradle_of_genesis".into();
+        let mut failed = result(3, "failed", false);
+        failed.zone = "w_solzreed_1".into();
+        let lines: Vec<String> = [&pass, &closed, &failed]
+            .into_iter()
+            .map(|r| serde_json::to_string(r).unwrap())
+            .collect();
+        std::fs::write(dir.join("nuian-CrawlerA.jsonl"), lines.join("\n")).unwrap();
+
+        write(&dir).unwrap();
+        let md = std::fs::read_to_string(dir.join("crawl.md")).unwrap();
+        assert!(
+            md.contains("| w_cradle_of_genesis | 1 | 0 | 0 | 0 | 0 | 1 | 0 |"),
+            "{md}"
+        );
+        assert!(
+            md.contains("| w_solzreed_1 | 0 | 0 | 1 | 0 | 0 | 0 | 0 |"),
+            "{md}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
