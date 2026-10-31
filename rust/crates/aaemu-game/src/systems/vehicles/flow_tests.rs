@@ -226,6 +226,16 @@ fn bc(v: u32) -> Vec<u8> {
     v.to_le_bytes()[..3].to_vec()
 }
 
+/// Put a not-yet-seated test player next to `target` so the client-reach bind check passes.
+fn stand_next_to(
+    world: &Arc<crate::world::WorldInstance>,
+    player: &PlayerRef,
+    target: &WorldObject,
+) {
+    let t = world.world_pos_rot(target);
+    player.data().unit.transform.set_xyz(t.x + 1.0, t.y, t.z);
+}
+
 /// Captures the tracing output of the current test thread (error-line assertions).
 #[derive(Clone, Default)]
 struct LogBuffer(Arc<Mutex<Vec<u8>>>);
@@ -1291,6 +1301,7 @@ async fn summon_item_cast_rejects_unowned_items_then_creates_and_binds_vehicle()
     assert!(ops(&frames).contains(&sc::SCSlaveStatePacket));
     assert_eq!(slave.data().unit.template_id, SLAVE_TEMPLATE);
     let tl = slave.data().unit.tl_id;
+    stand_next_to(&world, &pa, &WorldObject::from(&slave));
     slaves::bind_slave_by_tl(&server, &pa, u32::from(tl));
     assert_eq!(pa.data().unit.transform.parent_obj_id, slave.obj_id);
     assert!(ops(&a.drain()).contains(&sc::SCSlaveBoundPacket));
@@ -1380,6 +1391,7 @@ async fn slave_summon_bind_drive_and_despawn() {
     );
 
     // Bind as driver: SCUnitAttached + SCSlaveBound to everybody around.
+    stand_next_to(&world, &pa, &WorldObject::from(&slave));
     slaves::bind_slave_by_tl(&server, &pa, u32::from(tl));
     for c in [&mut a, &mut b] {
         let f = c.drain();
@@ -1458,12 +1470,12 @@ async fn slave_summon_bind_drive_and_despawn() {
     assert!(ops(&b.drain()).contains(&sc::SCUnitsRemovedPacket));
 }
 
-/// A seat another character already holds answers `slave_already_has_master` 0x61 instead of
-/// the C# silent return, keeps the occupant, and frees the seat when the occupant leaves. The
-/// check and the reservation happen under the slave's one lock, so the seat can never be
-/// handed to two characters.
+/// A seat another character already holds is silent, as in the C#: no error and no attach,
+/// the occupant stays, and the seat frees when the occupant leaves. The check and the
+/// reservation happen under the slave's one lock, so the seat can never be handed to two
+/// characters. The C# owners-mark refusal is the only taken-driver case that sends 0x61.
 #[tokio::test]
-async fn a_taken_seat_answers_slave_already_has_master_and_keeps_the_occupant() {
+async fn a_taken_seat_is_silent_and_keeps_the_occupant() {
     use crate::models::slave::Slave;
     use crate::world::Entity;
 
@@ -1508,11 +1520,11 @@ async fn a_taken_seat_answers_slave_already_has_master_and_keeps_the_occupant() 
     b.drain();
     c.drain();
 
-    // The driver seat is taken: B is refused with the 1.2 `slave_already_has_master` error.
+    // The driver seat is taken: B is ignored silently (C# behaviour), not attached.
     slaves::bind_slave(&server, &pb, cart.obj_id, attach_point::DRIVER, 7);
-    assert_eq!(
-        error_codes(&b.drain()),
-        vec![super::error::SLAVE_ALREADY_HAS_MASTER]
+    assert!(
+        b.drain().is_empty(),
+        "a taken seat must not answer an error or attach"
     );
     assert_eq!(
         cart.data().attached_characters,
@@ -1534,13 +1546,11 @@ async fn a_taken_seat_answers_slave_already_has_master_and_keeps_the_occupant() 
     attached.push(7);
     assert_eq!(body(&b.drain(), sc::SCUnitAttachedPacket), attached);
     assert!(ops(&a.drain()).contains(&sc::SCUnitAttachedPacket));
+    c.drain();
 
-    // A third character on the taken passenger seat gets the same error.
+    // A third character on the taken passenger seat is ignored silently too.
     slaves::bind_slave(&server, &pc, cart.obj_id, attach_point::PASSENGER0, 7);
-    assert_eq!(
-        error_codes(&c.drain()),
-        vec![super::error::SLAVE_ALREADY_HAS_MASTER]
-    );
+    assert!(c.drain().is_empty());
     assert_eq!(cart.data().attached_characters.len(), 2);
 
     // Leaving frees the seat for the next character.
@@ -1553,6 +1563,35 @@ async fn a_taken_seat_answers_slave_already_has_master_and_keeps_the_occupant() 
             (attach_point::DRIVER, 0x00F0_0003)
         ]
     );
+
+    // The C# owners-mark refusal is the only taken-driver error: a non-summoner driver bind
+    // on a marked slave answers `slave_already_has_master` 0x61.
+    slaves::unbind_slave(&server, &pc, 3, slaves::attach_reason::SLAVE_BINDING);
+    slaves::unbind_slave(&server, &pb, 3, slaves::attach_reason::SLAVE_BINDING);
+    let mark = crate::models::buff::Buff::new(
+        crate::data::skills::BuffTemplate {
+            id: slaves::buff::OWNERS_MARK,
+            kind: crate::data::skills::BuffKind::Good,
+            duration: 0,
+            level_duration: 0,
+            tick: 0.0,
+            stack_rule: 0,
+            max_stack: 1,
+            init_min_charge: 0,
+            save_rule_id: 0,
+            real_time: false,
+        },
+        crate::models::buff::SkillCaster { kind: 0, obj_id: 0 },
+        None,
+        0,
+    );
+    cart.data().unit.buffs.effects.push(mark);
+    slaves::bind_slave(&server, &pb, cart.obj_id, attach_point::DRIVER, 7);
+    assert_eq!(
+        error_codes(&b.drain()),
+        vec![super::error::SLAVE_ALREADY_HAS_MASTER]
+    );
+    assert!(cart.data().attached_characters.is_empty());
 }
 
 const PASSENGER_SKILL: u32 = 13_863;
@@ -1601,9 +1640,9 @@ fn passenger_data() -> GameData {
 
 /// Skill 13863 (`Take the Passenger Seat`) seats the caster at point 2 through the real
 /// `CSStartSkill` handler and `AttachTo` special effect; a second character on the same seat
-/// is answered with `slave_already_has_master`.
+/// is ignored silently, as the C# does.
 #[tokio::test]
-async fn passenger_skill_13863_seats_point_two_and_a_taken_seat_answers_97() {
+async fn passenger_skill_13863_seats_point_two_and_a_taken_seat_is_silent() {
     use crate::models::slave::Slave;
     use crate::systems::skills::handlers::{start_skill, CSStartSkillPacket};
     use crate::systems::skills::types::{SkillCastTarget, SkillCaster, SkillObject};
@@ -1679,11 +1718,13 @@ async fn passenger_skill_13863_seats_point_two_and_a_taken_seat_answers_97() {
     a.drain();
     c.drain();
 
-    // The passenger seat is now taken: the second cast is refused, not silently dropped.
+    // The passenger seat is now taken: the second cast attaches nobody and sends no error.
     cast(&mut c, 0x00F0_0003, cart.obj_id);
-    assert_eq!(
-        error_codes(&c.drain()),
-        vec![super::error::SLAVE_ALREADY_HAS_MASTER]
+    let fc = c.drain();
+    assert!(
+        !ops(&fc).contains(&sc::SCUnitAttachedPacket) && !ops(&fc).contains(&sc::SCErrorMsgPacket),
+        "a taken seat must be silent: {:x?}",
+        ops(&fc)
     );
     assert_eq!(
         cart.data().attached_characters,
@@ -1691,6 +1732,223 @@ async fn passenger_skill_13863_seats_point_two_and_a_taken_seat_answers_97() {
     );
     assert_eq!(pc.data().unit.transform.parent_obj_id, 0);
     b.drain();
+}
+
+/// The client's own bind reach: 12076 uses a 4.0 m surface gap (`FUN_39346290` ->
+/// `FUN_39093860(..., 16.0)`), 13863 3.0 m (`FUN_393bf270` -> 9.0), widened to 3.5 m while
+/// riding a mate (the S11 reading of `+0x3c26`; capture-pending S11-C5). A forged bind / cast
+/// from outside is refused with `TOO_FAR_AWAY` 0x9a; inside it attaches.
+#[tokio::test]
+async fn a_slave_outside_the_client_reach_is_refused_and_an_in_reach_one_is_seated() {
+    use crate::models::slave::Slave;
+    use crate::systems::skills::handlers::{start_skill, CSStartSkillPacket};
+    use crate::systems::skills::types::{SkillCastTarget, SkillCaster, SkillObject};
+    use crate::world::Entity;
+
+    let server = server_with(passenger_data());
+    crate::systems::economy::bridges::install(&server);
+    crate::systems::npcs::install_hooks(&server);
+    super::install_hooks(&server);
+    let mut a = TestClient::new(&server, 1, 1);
+    let mut b = TestClient::new(&server, 2, 2);
+    let mut c = TestClient::new(&server, 3, 3);
+    let pa = spawn_player(&server, &a, test_character(1, "Near", 100.0, 100.0), PA);
+    let pb = spawn_player(&server, &b, test_character(2, "Far", 110.0, 100.0), PB);
+    let pc = spawn_player(
+        &server,
+        &c,
+        test_character(3, "Mounted", 106.1, 100.0),
+        0x00F0_0003,
+    );
+    a.conn.active_char = Some(pa.clone());
+    b.conn.active_char = Some(pb.clone());
+    c.conn.active_char = Some(pc.clone());
+    for p in [&pb, &pc] {
+        let mut d = p.data();
+        d.unit.hp = 1000;
+        d.unit.max_hp = 1000;
+    }
+    let world = server.world.world(0).unwrap();
+    let mut cart = Slave::new(0, SLAVE_TEMPLATE);
+    cart.unit.transform.set_xyz(102.9, 100.0, 100.0);
+    cart.unit.tl_id = 3;
+    cart.unit.hp = 1000;
+    cart.unit.max_hp = 1000;
+    cart.summoner_obj_id = PA;
+    cart.summoner_id = pa.character_id;
+    let cart = Entity::new(0x300, cart);
+    world.spawn(&cart, &server.view_ctx());
+    a.drain();
+    b.drain();
+    c.drain();
+
+    let cast = |client: &mut TestClient, caster: u32, target: u32| {
+        start_skill(
+            &server,
+            &mut client.conn,
+            CSStartSkillPacket {
+                skill_id: PASSENGER_SKILL,
+                caster: SkillCaster::Unit(caster),
+                target: SkillCastTarget::Unit(target),
+                flag: 0,
+                skill_object: SkillObject::None,
+            },
+        );
+    };
+
+    // Far driver bind (7.1 m > 4.0 m) through the 0x031 handler path.
+    slaves::bind_slave_by_tl(&server, &pb, 3);
+    assert_eq!(error_codes(&b.drain()), vec![super::error::TOO_FAR_AWAY]);
+    assert!(cart.data().attached_characters.is_empty());
+
+    // Far passenger cast (7.1 m > 3.0 m) through the real skill runner.
+    cast(&mut b, PB, cart.obj_id);
+    let fb = b.drain();
+    assert!(error_codes(&fb).contains(&super::error::TOO_FAR_AWAY));
+    assert!(!ops(&fb).contains(&sc::SCUnitAttachedPacket));
+    assert!(cart.data().attached_characters.is_empty());
+
+    // In-reach driver bind (2.9 m < 4.0 m).
+    slaves::bind_slave_by_tl(&server, &pa, 3);
+    assert_eq!(
+        cart.data().attached_characters,
+        vec![(attach_point::DRIVER, PA)]
+    );
+    a.drain();
+    slaves::unbind_slave(&server, &pa, 3, slaves::attach_reason::SLAVE_BINDING);
+    a.drain();
+
+    // 3.2 m is out of the 3.0 m passenger reach...
+    cast(&mut c, 0x00F0_0003, cart.obj_id);
+    assert!(error_codes(&c.drain()).contains(&super::error::TOO_FAR_AWAY));
+    assert!(cart.data().attached_characters.is_empty());
+    // ...but inside the 3.5 m mounted reach.
+    pc.data().is_riding = true;
+    cast(&mut c, 0x00F0_0003, cart.obj_id);
+    assert_eq!(
+        cart.data().attached_characters,
+        vec![(attach_point::PASSENGER0, 0x00F0_0003)]
+    );
+}
+
+/// One slave at a time: the client refuses a second bind with `slave_unbind_first` 0x66
+/// (`FUN_39346290`), and a forged second bind (driver or passenger) gets the same error.
+#[tokio::test]
+async fn a_character_on_one_slave_cannot_bind_a_second_one() {
+    use crate::models::slave::Slave;
+    use crate::world::Entity;
+
+    let server = server_with(slave_data());
+    let mut a = TestClient::new(&server, 1, 1);
+    let pa = spawn_player(&server, &a, test_character(1, "Rider", 100.0, 100.0), PA);
+    a.conn.active_char = Some(pa.clone());
+    let world = server.world.world(0).unwrap();
+    let mut first = Slave::new(0, SLAVE_TEMPLATE);
+    first.unit.transform.set_xyz(101.0, 100.0, 100.0);
+    first.unit.tl_id = 3;
+    first.unit.hp = 1000;
+    first.unit.max_hp = 1000;
+    first.summoner_obj_id = PA;
+    let first = Entity::new(0x300, first);
+    world.spawn(&first, &server.view_ctx());
+    let mut second = Slave::new(0, SLAVE_TEMPLATE);
+    second.unit.transform.set_xyz(102.0, 100.0, 100.0);
+    second.unit.tl_id = 4;
+    second.unit.hp = 1000;
+    second.unit.max_hp = 1000;
+    second.summoner_obj_id = PA;
+    let second = Entity::new(0x301, second);
+    world.spawn(&second, &server.view_ctx());
+    a.drain();
+
+    slaves::bind_slave(&server, &pa, first.obj_id, attach_point::DRIVER, 7);
+    assert_eq!(
+        first.data().attached_characters,
+        vec![(attach_point::DRIVER, PA)]
+    );
+    a.drain();
+
+    // The 0x031 handler path to a second slave.
+    slaves::bind_slave_by_tl(&server, &pa, 4);
+    assert_eq!(
+        error_codes(&a.drain()),
+        vec![super::error::SLAVE_UNBIND_FIRST]
+    );
+    assert!(second.data().attached_characters.is_empty());
+
+    // The 13863 passenger path to a second slave.
+    slaves::bind_slave(&server, &pa, second.obj_id, attach_point::PASSENGER0, 7);
+    assert_eq!(
+        error_codes(&a.drain()),
+        vec![super::error::SLAVE_UNBIND_FIRST]
+    );
+    assert!(second.data().attached_characters.is_empty());
+
+    // A second seat on the same slave is refused too (the client's same-slave bind is silent,
+    // but a forged one must not duplicate the character).
+    slaves::bind_slave(&server, &pa, first.obj_id, attach_point::PASSENGER0, 7);
+    assert_eq!(
+        error_codes(&a.drain()),
+        vec![super::error::SLAVE_UNBIND_FIRST]
+    );
+    assert_eq!(first.data().attached_characters.len(), 1);
+}
+
+/// A cannon (slave kind 7 / 8) only has its gunner seat at point 1: the passenger skill 13863
+/// is refused even though only the interaction list used to filter it.
+#[tokio::test]
+async fn a_cannon_refuses_the_passenger_seat_skill() {
+    use crate::models::slave::Slave;
+    use crate::systems::skills::handlers::{start_skill, CSStartSkillPacket};
+    use crate::systems::skills::types::{SkillCastTarget, SkillCaster, SkillObject};
+    use crate::systems::vehicles::data::SlaveTemplate;
+    use crate::world::Entity;
+
+    let mut d = passenger_data();
+    d.systems.vehicles.slave_templates.insert(
+        8,
+        SlaveTemplate {
+            id: 8,
+            slave_kind: super::data::slave_kind::SLAVE_EQUIPMENT,
+            ..SlaveTemplate::default()
+        },
+    );
+    let server = server_with(d);
+    crate::systems::economy::bridges::install(&server);
+    crate::systems::npcs::install_hooks(&server);
+    super::install_hooks(&server);
+    let mut a = TestClient::new(&server, 1, 1);
+    let pa = spawn_player(&server, &a, test_character(1, "Gunner", 100.0, 100.0), PA);
+    a.conn.active_char = Some(pa.clone());
+    {
+        let mut c = pa.data();
+        c.unit.hp = 1000;
+        c.unit.max_hp = 1000;
+    }
+    let world = server.world.world(0).unwrap();
+    let mut cannon = Slave::new(0, 8);
+    cannon.unit.transform.set_xyz(101.0, 100.0, 100.0);
+    cannon.unit.tl_id = 3;
+    cannon.summoner_obj_id = PA;
+    let cannon = Entity::new(0x300, cannon);
+    world.spawn(&cannon, &server.view_ctx());
+    a.drain();
+
+    start_skill(
+        &server,
+        &mut a.conn,
+        CSStartSkillPacket {
+            skill_id: PASSENGER_SKILL,
+            caster: SkillCaster::Unit(PA),
+            target: SkillCastTarget::Unit(cannon.obj_id),
+            flag: 0,
+            skill_object: SkillObject::None,
+        },
+    );
+    let fa = a.drain();
+    assert_eq!(error_codes(&fa), vec![super::error::SLAVE_CANNOT_BIND]);
+    assert!(!ops(&fa).contains(&sc::SCUnitAttachedPacket));
+    assert!(cannon.data().attached_characters.is_empty());
 }
 
 /// A deck stander's transform is hull-local (`parent_obj_id` set) but it is not in the hull's
@@ -1896,6 +2154,7 @@ async fn client_motion_and_despawn_cannot_control_other_players_or_slaves() {
     assert!(world.slave(slave.obj_id).is_some());
 
     // A passenger is not the driver, even when attached to the same vehicle.
+    stand_next_to(&world, &pa, &WorldObject::from(&slave));
     slaves::bind_slave(&server, &pa, slave.obj_id, attach_point::PASSENGER0, 7);
     crate::world::session::move_unit(&server, &mut a.conn, slave.obj_id, ship.clone()).await;
     assert_eq!(slave.data().throttle_request, 0);
@@ -3337,6 +3596,7 @@ async fn real_cart_and_ship_slaves_offer_the_passenger_seat() {
         let mut s = Slave::new(0, t.id);
         s.unit.model_id = t.model_id;
         s.unit.tl_id = server.ids.tl.get_next_id().unwrap() as u16;
+        s.unit.transform.set_xyz(100.0, 100.0, 100.0);
         s.summoner_obj_id = PA;
         s.summoner_id = pa.character_id;
         let slave = Entity::new(server.ids.object.get_next_id().unwrap(), s);
@@ -4664,6 +4924,13 @@ async fn ship_cannon_gunner_seat_skill_and_leaving() {
     let cannon_tl = u32::from(cannon.data().unit.tl_id);
     assert!(slaves::is_manned_cannon(&server, &cannon));
     assert!(!slaves::is_manned_cannon(&server, &hull));
+    // `create_core` puts the hull 5 m in front of the owner and the cannon on its equipment
+    // point; the 12076 bind reach is 4.0 m.
+    let cannon_pos = world.world_pos_rot(&WorldObject::from(&cannon));
+    pa.data()
+        .unit
+        .transform
+        .set_xyz(cannon_pos.x, cannon_pos.y + 1.0, cannon_pos.z);
 
     let target = spawn_npc_at(&server, 0x5000, CANNON_TARGET_NPC, 130.0, 130.0);
     target.data().unit.hp = 1000;
@@ -4707,6 +4974,7 @@ async fn ship_cannon_gunner_seat_skill_and_leaving() {
     assert!(cannon.data().attached_characters.is_empty());
 
     // The ship owner mans it at the gunner seat, behind the barrel.
+    stand_next_to(&world, &pa, &WorldObject::from(&cannon));
     slaves::bind_slave_by_tl(&server, &pa, cannon_tl);
     assert!(ops(&a.drain()).contains(&sc::SCUnitAttachedPacket));
     assert_eq!(
@@ -4716,6 +4984,8 @@ async fn ship_cannon_gunner_seat_skill_and_leaving() {
     assert_eq!(pa.data().unit.transform.parent_obj_id, cannon.obj_id);
     let t = pa.data().unit.transform;
     assert_eq!((t.x, t.y, t.z), slaves::GUNNER_SEAT_OFFSET);
+    b.drain();
+    c.drain();
 
     // The gunner follows the cannon on the moving ship.
     let before = world.world_pos_rot(&WorldObject::from(&pa));
@@ -4728,10 +4998,27 @@ async fn ship_cannon_gunner_seat_skill_and_leaving() {
     );
     assert!((after.y - before.y + 10.0).abs() < 1e-3);
 
-    // Second gunner: a crew member standing on the ship is refused, one gunner per cannon.
+    // Second gunner: a crew member standing on the ship is ignored silently (C# taken seat),
+    // one gunner per cannon. Put the crew member at the cannon's own local offset so it is
+    // inside the 4.0 m bind reach after the hull moved.
     world.attach_child(&WorldObject::from(&hull), &WorldObject::from(&pb));
+    let cannon_local = cannon.data().unit.transform;
+    pb.data().unit.transform.set_position(
+        cannon_local.x,
+        cannon_local.y,
+        cannon_local.z,
+        0.0,
+        0.0,
+        0.0,
+    );
     slaves::bind_slave_by_tl(&server, &pb, cannon_tl);
-    assert!(error_codes(&b.drain()).contains(&super::error::SLAVE_ALREADY_HAS_MASTER));
+    let fbp = b.drain();
+    assert!(
+        fbp.is_empty(),
+        "a taken cannon seat must be silent: {:x?} {:?}",
+        ops(&fbp),
+        error_codes(&fbp)
+    );
     assert_eq!(cannon.data().attached_characters.len(), 1);
     // ... and cannot cast its skills either.
     fire(&mut b, 130.0, 130.0);
@@ -4776,6 +5063,7 @@ async fn ship_cannon_gunner_seat_skill_and_leaving() {
     assert_eq!(pb.data().unit.transform.parent_obj_id, 0);
 
     // Recalling the ship unbinds a gunner too.
+    stand_next_to(&world, &pa, &WorldObject::from(&cannon));
     slaves::bind_slave_by_tl(&server, &pa, cannon_tl);
     assert_eq!(cannon.data().attached_characters.len(), 1);
     slaves::delete(&server, Some(&pa), world.id, hull.obj_id, false);
@@ -4853,6 +5141,7 @@ async fn seated_gunner_turret_state_is_stored_and_broadcast() {
     let cannon_tl = u32::from(cannon.data().unit.tl_id);
     a.drain();
     b.drain();
+    stand_next_to(&world, &pa, &WorldObject::from(&cannon));
     slaves::bind_slave_by_tl(&server, &pa, cannon_tl);
     a.drain();
     b.drain();
@@ -4909,6 +5198,7 @@ async fn unseated_player_cannot_set_turret_state() {
     let cannon_tl = u32::from(cannon.data().unit.tl_id);
     a.drain();
     b.drain();
+    stand_next_to(&world, &pa, &WorldObject::from(&cannon));
     slaves::bind_slave_by_tl(&server, &pa, cannon_tl);
     a.drain();
     b.drain();
@@ -4956,6 +5246,7 @@ async fn hull_passenger_cannot_aim_the_cannon_child() {
         .expect("cannon child");
     a.drain();
     b.drain();
+    stand_next_to(&world, &pa, &WorldObject::from(&hull));
     slaves::bind_slave(
         &server,
         &pa,
@@ -5012,6 +5303,7 @@ async fn turret_state_is_throttled_and_deduplicated() {
     let cannon_tl = u32::from(cannon.data().unit.tl_id);
     a.drain();
     b.drain();
+    stand_next_to(&world, &pa, &WorldObject::from(&cannon));
     slaves::bind_slave_by_tl(&server, &pa, cannon_tl);
     a.drain();
     b.drain();
@@ -5094,6 +5386,7 @@ async fn turret_aim_inside_the_window_is_stored_and_relayed_by_the_tick() {
     let cannon_tl = u32::from(cannon.data().unit.tl_id);
     a.drain();
     b.drain();
+    stand_next_to(&world, &pa, &WorldObject::from(&cannon));
     slaves::bind_slave_by_tl(&server, &pa, cannon_tl);
     a.drain();
     b.drain();
@@ -5150,6 +5443,7 @@ async fn late_viewer_sees_the_newest_turret_aim() {
         .expect("cannon child");
     let cannon_tl = u32::from(cannon.data().unit.tl_id);
     a.drain();
+    stand_next_to(&world, &pa, &WorldObject::from(&cannon));
     slaves::bind_slave_by_tl(&server, &pa, cannon_tl);
     a.drain();
     send_turret_state(&mut a, &server, cannon.obj_id, 0.25, -0.5).await;
@@ -5201,6 +5495,7 @@ async fn passenger_seat_can_set_the_slave_turret_state() {
     .expect("vehicle");
     a.drain();
     b.drain();
+    stand_next_to(&world, &pa, &WorldObject::from(&slave));
     slaves::bind_slave(
         &server,
         &pa,
@@ -5255,6 +5550,7 @@ async fn late_viewer_receives_the_stored_turret_state() {
         .expect("cannon child");
     let cannon_tl = u32::from(cannon.data().unit.tl_id);
     a.drain();
+    stand_next_to(&world, &pa, &WorldObject::from(&cannon));
     slaves::bind_slave_by_tl(&server, &pa, cannon_tl);
     a.drain();
     send_turret_state(&mut a, &server, cannon.obj_id, 0.25, -0.5).await;
@@ -5319,6 +5615,7 @@ async fn real_cannon_slaves_store_the_turret_state() {
         s.unit.tl_id = server.ids.tl.get_next_id().expect("tl") as u16;
         s.unit.name = t.name.clone();
         s.unit.model_id = t.model_id;
+        s.unit.transform.set_xyz(100.0, 100.0, 100.0);
         s.unit.level = t.level as u8;
         s.summoner_id = pa.character_id;
         s.summoner_obj_id = PA;

@@ -17,7 +17,7 @@ use crate::net::registry::{ClientPacket, PacketRegistry};
 use crate::opcodes::{cs, sc};
 use crate::packets::packet_def;
 use crate::server::GameServer;
-use crate::systems::vehicles::data::{attach_point, slave_kind};
+use crate::systems::vehicles::data::attach_point;
 use crate::world::{SlaveRef, WorldObject};
 
 /// `SkillsEnum` values used by the interaction code.
@@ -249,16 +249,10 @@ pub fn interaction_option(t: &super::data::NpcTemplate) -> u32 {
 /// 2). The interaction list therefore offers the driver seat (12076) while it is free and the
 /// passenger seat (13863) once the driver seat is taken; point 2 is the only passenger seat the
 /// 1.2 data reaches (`special_effects` 2378 type 53 value1 2). A cannon (slave kind 7 / 8) has
-/// only its gunner seat, and a slave with both seats taken keeps 12076 so the bind answers
-/// `slave_already_has_master` 0x61.
+/// only its gunner seat, and a slave with both seats taken keeps 12076; the bind then ignores
+/// the taken seat silently (C# behaviour).
 pub(crate) fn slave_interaction_skill(server: &GameServer, slave: &SlaveRef) -> u32 {
-    let template_id = slave.data().unit.template_id;
-    let kind = server
-        .game_data
-        .systems
-        .vehicles
-        .slave_template(template_id)
-        .map_or(0, |t| t.slave_kind);
+    let kind = crate::systems::vehicles::slaves::slave_kind(server, slave);
     let (driver_taken, passenger_taken) = {
         let d = slave.data();
         (
@@ -269,7 +263,7 @@ pub(crate) fn slave_interaction_skill(server: &GameServer, slave: &SlaveRef) -> 
     if !driver_taken {
         return skills_enum::SLAVE_OCCUPY;
     }
-    if !passenger_taken && !matches!(kind, slave_kind::SIEGE_WEAPON | slave_kind::SLAVE_EQUIPMENT) {
+    if !passenger_taken && !crate::systems::vehicles::slaves::is_cannon_kind(kind) {
         return skills_enum::SLAVE_PASSENGER;
     }
     skills_enum::SLAVE_OCCUPY
@@ -872,6 +866,7 @@ mod tests {
     #[tokio::test]
     async fn start_interaction_slave_offers_the_passenger_seat_once_the_driver_seat_is_taken() {
         use crate::models::slave::Slave;
+        use crate::systems::vehicles::data::slave_kind;
         use crate::systems::vehicles::data::SlaveTemplate;
         use crate::systems::vehicles::slaves;
         use crate::test_support::*;
@@ -975,7 +970,7 @@ mod tests {
     #[tokio::test]
     async fn slave_interaction_skill_never_offers_a_passenger_seat_on_a_cannon() {
         use crate::models::slave::Slave;
-        use crate::systems::vehicles::data::{attach_point, SlaveTemplate};
+        use crate::systems::vehicles::data::{attach_point, slave_kind, SlaveTemplate};
         use crate::test_support::*;
         use crate::world::Entity;
 

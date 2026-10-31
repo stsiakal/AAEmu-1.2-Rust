@@ -1351,6 +1351,50 @@ pub fn unbind_slave(server: &GameServer, character: &PlayerRef, tl_id: u32, reas
     );
 }
 
+/// Why [`bind_slave`] refused a seat.
+enum BindRefusal {
+    TooFar,
+    CannonPassenger,
+    SeatTaken,
+    OwnersMark,
+}
+
+/// Surface gap the client's own bind reach checks allow: the 12076 driver bind uses
+/// `FUN_39346290` -> `FUN_39093860(..., 16.0)` (strictly under 4.0 m); the 13863 passenger
+/// interaction uses `FUN_393bf270` -> `FUN_39093860(..., 9.0)` (strictly under 3.0 m), widened
+/// to 12.25 (3.5 m) when the target's `+0x3c26` flag is set. The S11 client work reads that flag
+/// as "riding a mate" (capture-pending S11-C5); the decompile also uses `+0x3c26` as the dead
+/// flag (`FUN_39346290` refuses a dead target with 0x144), so the mounted reading is not
+/// proven. This keeps the S11 reading the passenger-seat task asked for.
+fn bind_reach(character: &PlayerRef, point: u8) -> f32 {
+    if point == attach_point::DRIVER {
+        4.0
+    } else if character.data().is_riding {
+        3.5
+    } else {
+        3.0
+    }
+}
+
+/// `SlaveTemplate.SlaveKind` (0 when the template is not loaded).
+pub fn slave_kind(server: &GameServer, slave: &SlaveRef) -> u32 {
+    server
+        .game_data
+        .systems
+        .vehicles
+        .slave_template(slave.data().unit.template_id)
+        .map_or(0, |t| t.slave_kind)
+}
+
+/// A cannon (slave kind 7 siege weapon / 8 slave equipment) has only its gunner seat at point
+/// 1, never a passenger seat.
+pub fn is_cannon_kind(kind: u32) -> bool {
+    matches!(
+        kind,
+        super::data::slave_kind::SIEGE_WEAPON | super::data::slave_kind::SLAVE_EQUIPMENT
+    )
+}
+
 /// `BindSlave(character, objId, attachPoint, bondKind)`.
 pub fn bind_slave(
     server: &GameServer,
@@ -1365,36 +1409,86 @@ pub fn bind_slave(
     let Some(slave) = world.slave(obj_id) else {
         return;
     };
-    // No "already attached elsewhere" guard: the 1.2 client refuses a second slave bind
-    // (`FUN_39346290` -> 0x66) but sends 13863 while riding a mate, and what the original
-    // server does there is capture-pending (S11-C5); see PORTING.md.
-    // Check and reserve the seat under the slave's one lock, so two binds racing for the same
-    // point cannot both pass. The 1.2 client's message table maps 0x61 to
-    // `slave_already_has_master` (the C# used it for the driver owners-mark refusal) and has no
-    // separate seat-taken text, so a taken seat answers the same error instead of the C# silent
-    // return.
-    let reserved = {
-        let mut d = slave.data();
-        let reserve = !d.has_attached_at(point)
-            && !(point == attach_point::DRIVER
-                && d.unit.buffs.check_buff(buff::OWNERS_MARK)
-                && d.summoner_obj_id != character.obj_id);
-        if reserve {
-            d.attached_characters.push((point, character.obj_id));
-        }
-        reserve
-    };
-    if !reserved {
+    // One slave at a time: the 1.2 client refuses a second slave bind with
+    // `slave_unbind_first` 0x66 (`FUN_39346290`). A mate is not in a slave's
+    // `attached_characters`, so the S11-C5 mate case stays open. `get_is_mounted` walks every
+    // slave, so it runs before this slave's lock.
+    if get_is_mounted(&world, character.obj_id).is_some() {
         tracing::debug!(
-            "BindSlave: character {} cannot take seat {} of slave {} (taken or owners mark)",
+            "BindSlave: character {} is already on a slave; refusing seat {} of {}",
             character.obj_id,
             point,
             obj_id
         );
-        error(character, error::SLAVE_ALREADY_HAS_MASTER);
+        error(character, error::SLAVE_UNBIND_FIRST);
         return;
     }
     let me = WorldObject::from(character);
+    // The client's reach is a surface gap (its collision shapes; the server's edge-to-edge
+    // `distance_to` is the same model-radius approximation the S11 port uses). Snapshot it
+    // before the slave lock (the player is a different object lock); the comparison and the
+    // reservation run under that one lock.
+    let gap = crate::systems::skills::geometry::distance_to(
+        server,
+        &crate::systems::skills::geometry::Target::Obj(me.clone()),
+        &crate::systems::skills::geometry::Target::Obj(WorldObject::from(&slave)),
+        true,
+    );
+    let reach = bind_reach(character, point);
+    let cannon = is_cannon_kind(slave_kind(server, &slave));
+    // Check and reserve the seat under the slave's one lock, so two binds racing for the same
+    // point cannot both pass.
+    let refusal = {
+        let mut d = slave.data();
+        if gap >= reach {
+            Some(BindRefusal::TooFar)
+        } else if point != attach_point::DRIVER && cannon {
+            Some(BindRefusal::CannonPassenger)
+        } else if d.has_attached_at(point) {
+            Some(BindRefusal::SeatTaken)
+        } else if point == attach_point::DRIVER
+            && d.unit.buffs.check_buff(buff::OWNERS_MARK)
+            && d.summoner_obj_id != character.obj_id
+        {
+            Some(BindRefusal::OwnersMark)
+        } else {
+            d.attached_characters.push((point, character.obj_id));
+            None
+        }
+    };
+    if let Some(refusal) = refusal {
+        match refusal {
+            BindRefusal::TooFar => {
+                tracing::debug!(
+                    "BindSlave: character {} is {gap:.3} m from slave {} (reach {reach} m)",
+                    character.obj_id,
+                    obj_id
+                );
+                error(character, error::TOO_FAR_AWAY);
+            }
+            BindRefusal::CannonPassenger => {
+                tracing::debug!(
+                    "BindSlave: slave {} is a cannon and has no passenger seat",
+                    obj_id
+                );
+                error(character, error::SLAVE_CANNOT_BIND);
+            }
+            BindRefusal::SeatTaken => {
+                // The C# returns silently; the client message table has no seat-taken text and
+                // the original server's answer is capture-pending (S11-C2).
+                tracing::debug!(
+                    "BindSlave: seat {} of slave {} is taken; ignoring",
+                    point,
+                    obj_id
+                );
+            }
+            BindRefusal::OwnersMark => {
+                // The C# sends `SlaveAlreadyHasMaster` for this driver-seat refusal only.
+                error(character, error::SLAVE_ALREADY_HAS_MASTER);
+            }
+        }
+        return;
+    }
     broadcast(
         server,
         &me,
@@ -1682,19 +1776,9 @@ pub fn bind_slave_by_tl(server: &GameServer, character: &PlayerRef, tl_id: u32) 
     if slave.data().unit.is_dead() {
         return;
     }
-    if is_manned_cannon(server, &slave) {
-        if !may_man_cannon(character, &slave, &world) {
-            error(character, error::SLAVE_CANNOT_BIND);
-            return;
-        }
-        if slave.data().has_attached_at(attach_point::DRIVER) {
-            error(character, error::SLAVE_ALREADY_HAS_MASTER);
-            return;
-        }
-        if get_is_mounted(&world, character.obj_id).is_some() {
-            error(character, error::SLAVE_UNBIND_FIRST);
-            return;
-        }
+    if is_manned_cannon(server, &slave) && !may_man_cannon(character, &slave, &world) {
+        error(character, error::SLAVE_CANNOT_BIND);
+        return;
     }
     bind_slave(
         server,

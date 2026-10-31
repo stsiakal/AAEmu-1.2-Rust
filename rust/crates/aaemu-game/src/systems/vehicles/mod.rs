@@ -265,7 +265,11 @@ pub mod error {
     pub const NOT_ENOUGH_MONEY: i16 = 26;
     pub const NOT_ENOUGH_ITEM: i16 = 27;
     pub const SLAVE_CANNOT_BIND: i16 = 96;
+    /// `SLAVE_ALREADY_HAS_MASTER`: only the C# owners-mark driver refusal (a taken seat is
+    /// silent, as in the C#).
     pub const SLAVE_ALREADY_HAS_MASTER: i16 = 97;
+    /// `TOO_FAR_AWAY`: the client's 0x9a bind / interaction reach refusal.
+    pub const TOO_FAR_AWAY: i16 = 154;
     /// `SLAVE_SPAWN_SHIP_NEED_MORE_SPACE`: the 1.2 client's summon search found no spot.
     pub const SLAVE_SPAWN_SHIP_NEED_MORE_SPACE: i16 = 100;
     pub const SLAVE_SPAWN_ITEM_LOCKED: i16 = 101;
