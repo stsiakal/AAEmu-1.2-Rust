@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 use super::catalog::{Catalog, GateVerdict, Objective, Quest};
 use super::CrawlConfig;
 use crate::game::{
-    AddedStack, BagStack, DoodadInfo, GameClient, GameState, Packet, UnitInfo, LEVEL_PROXY,
+    AddedStack, BagStack, DoodadInfo, GameClient, GameEvent, GameState, Packet, UnitInfo,
+    LEVEL_PROXY,
 };
 use crate::login::LoginClient;
 use crate::record::Recorder;
@@ -38,7 +39,7 @@ pub struct QuestResult {
     /// ignores.
     #[serde(default)]
     pub character: String,
-    /// `passed`, `daily-limit`, `failed`, `unsupported` or `skipped`.
+    /// `passed`, `daily-limit`, `failed`, `unsupported`, `skipped` or `closed-zone`.
     pub status: String,
     /// `accept`, `objective 2`, `turn-in`, ...
     pub step: String,
@@ -332,6 +333,7 @@ pub async fn run(cfg: &CrawlConfig, catalog: &Catalog) -> Result<()> {
                 "daily-limit" => "limit",
                 "skipped" => "skip",
                 "unsupported" => "UNSP",
+                "closed-zone" => "CZone",
                 _ => "FAIL",
             },
             result.quest,
@@ -407,6 +409,9 @@ struct QuestOutcome {
     reports: Vec<String>,
     objectives: Vec<ObjectiveResult>,
     gm_assisted_steps: Vec<String>,
+    /// The server sent `SCErrorMsg 287` (`closed_zone`) while the quest was running: the
+    /// character was inside a closed zone without access level 100.
+    evicted: bool,
     duration_ms: u64,
 }
 
@@ -416,6 +421,7 @@ fn finish_result(
     out: QuestOutcome,
     account_id: u32,
 ) -> QuestResult {
+    let evicted = out.evicted;
     let mut r = QuestResult {
         quest: quest.id,
         name: quest.name.clone(),
@@ -450,6 +456,11 @@ fn finish_result(
                 r.status = "daily-limit".into();
             } else if f.step == "gate" {
                 r.status = "skipped".into();
+            } else if quest.closed_zone || evicted {
+                // The quest was played and failed, but in a zone the 1.2 data marks closed (or
+                // the server evicted the character from one during it). This is not evidence of
+                // a server failure: keep it out of `failed`, and keep passes above as passes.
+                r.status = "closed-zone".into();
             }
             r.step = f.step;
             r.reason = f.reason;
@@ -586,6 +597,15 @@ async fn connect(cfg: &CrawlConfig, _catalog: &Catalog) -> Result<Session> {
         }
     };
 
+    // The closed-zone check reads the character's own access level
+    // (`zone_access::needs_return`), not the account's. A character created in this run is
+    // inserted with the server config default (0) after the pre-login grant, so grant again
+    // before `select_character` reloads its row.
+    if cfg.gm_closed_zones {
+        grant_gm(cfg, account_id)
+            .context("raising the crawler character to the GM access level")?;
+    }
+
     game.select_character(character.id).await?;
     game.wait_sc(sc::SCCharacterStatePacket).await?;
     game.drain(QUIET, Duration::from_secs(10)).await?;
@@ -652,36 +672,18 @@ async fn crawl_quest(
         reports: Vec::new(),
         objectives: Vec::new(),
         gm_assisted_steps: Vec::new(),
+        evicted: false,
         duration_ms: 0,
     };
-    if let Some(reason) = &quest.unsupported {
-        evidence.outcome = Err(QuestFailure::new("unsupported", reason));
-        return evidence;
-    }
-    let verdict = catalog.gate_verdict(
-        quest,
-        cfg.race,
-        quest.level.max(cfg.min_level).max(2),
-        completed,
-    );
-    let gate_items = match verdict {
-        GateVerdict::Skip(reason) => {
-            evidence.outcome = Err(QuestFailure::new("gate", reason));
+    let plan = match play_refusal(cfg, catalog, quest, completed) {
+        Ok(plan) => plan,
+        Err(f) => {
+            evidence.outcome = Err(f);
             return evidence;
         }
-        GateVerdict::Play { items } => items,
     };
-    if quest.instance {
-        evidence.outcome = Err(QuestFailure::new("gate", "instance world"));
-        return evidence;
-    }
-    let Some(anchor) = anchor_of(catalog, quest) else {
-        evidence.outcome = Err(QuestFailure::new(
-            "gate",
-            "no authored position for its targets",
-        ));
-        return evidence;
-    };
+    let gate_items = plan.gate_items;
+    let anchor = plan.anchor;
 
     let started = Instant::now();
     let deadline = started + cfg.quest_timeout;
@@ -690,7 +692,9 @@ async fn crawl_quest(
 
     // A reward or hand-over that trailed the previous quest is still in the ledger.
     cleanup_added_items(session).await;
+    let events_before = session.game.state.events.len();
     let body = run_quest_body(session, cfg, catalog, quest, anchor, &gate_items, deadline).await;
+    evidence.evicted = closed_zone_error_since(&session.game.state.events, events_before);
     if let Ok(steps) = &body {
         evidence.gm_assisted_steps = steps.clone();
     }
@@ -1765,24 +1769,52 @@ fn best_member(
         })
 }
 
+#[derive(Debug)]
+struct PlayPlan {
+    gate_items: Vec<u32>,
+    anchor: (f32, f32, f32),
+}
+
+/// The checks that decide whether the crawler can play a quest at all, before any packet is
+/// sent. `crawl_quest` records the returned [`QuestFailure`]; `is_attemptable` uses the same
+/// verdict so `--limit` never counts a quest that `crawl_quest` will not play.
+fn play_refusal(
+    cfg: &CrawlConfig,
+    catalog: &Catalog,
+    quest: &Quest,
+    completed: &HashSet<u32>,
+) -> std::result::Result<PlayPlan, QuestFailure> {
+    if let Some(reason) = &quest.unsupported {
+        return Err(QuestFailure::new("unsupported", reason));
+    }
+    let gate_items = match catalog.gate_verdict(
+        quest,
+        cfg.race,
+        quest.level.max(cfg.min_level).max(2),
+        completed,
+    ) {
+        GateVerdict::Skip(reason) => return Err(QuestFailure::new("gate", reason)),
+        GateVerdict::Play { items } => items,
+    };
+    if quest.instance {
+        return Err(QuestFailure::new("gate", "instance world"));
+    }
+    let Some(anchor) = anchor_of(catalog, quest) else {
+        return Err(QuestFailure::new(
+            "gate",
+            "no authored position for its targets",
+        ));
+    };
+    Ok(PlayPlan { gate_items, anchor })
+}
+
 fn is_attemptable(
     cfg: &CrawlConfig,
     catalog: &Catalog,
     quest: &Quest,
     completed: &HashSet<u32>,
 ) -> bool {
-    quest.unsupported.is_none()
-        && !quest.instance
-        && anchor_of(catalog, quest).is_some()
-        && matches!(
-            catalog.gate_verdict(
-                quest,
-                cfg.race,
-                quest.level.max(cfg.min_level).max(2),
-                completed
-            ),
-            GateVerdict::Play { .. }
-        )
+    play_refusal(cfg, catalog, quest, completed).is_ok()
 }
 
 fn anchor_of(catalog: &Catalog, quest: &Quest) -> Option<(f32, f32, f32)> {
@@ -1981,6 +2013,19 @@ fn own_skill_response(packet: &Packet, skill_id: u32, caster: u32) -> bool {
         && stream.read_u16().is_ok()
         && stream.read_u8().is_ok()
         && stream.read_bc().ok() == Some(caster)
+}
+
+/// 1.2 `SCErrorMsg` error id for a closed zone (`zone_access::CLOSED_ZONE`).
+const CLOSED_ZONE_ERROR: i16 = 287;
+
+/// Whether the server sent a closed-zone error in `events[since..]`. `GameState` observes
+/// every packet, including the ones `wait_for` consumes, so this sees an eviction anywhere in
+/// the quest, not only on the drains.
+fn closed_zone_error_since(events: &[GameEvent], since: usize) -> bool {
+    events.get(since..).is_some_and(|tail| {
+        tail.iter()
+            .any(|e| matches!(e, GameEvent::ErrorMsg(CLOSED_ZONE_ERROR)))
+    })
 }
 
 fn last_events(game: &GameClient) -> String {
@@ -2464,6 +2509,7 @@ mod tests {
             gate_items: Vec::new(),
             unsupported: None,
             instance: false,
+            closed_zone: false,
         }
     }
 
@@ -2515,8 +2561,111 @@ mod tests {
             reports: Vec::new(),
             objectives: Vec::new(),
             gm_assisted_steps: Vec::new(),
+            evicted: false,
             duration_ms: 0,
         }
+    }
+
+    fn closed_zone_quest() -> Quest {
+        let mut q = quest(Vec::new());
+        q.zone_id = 19;
+        q.zone = "w_bronze_rock_1".into();
+        q.starter.kind = "npc".into();
+        q.starter.npc = 5001;
+        q.closed_zone = true;
+        q
+    }
+
+    fn failure() -> QuestFailure {
+        QuestFailure::new(
+            "objective 1 QuestActObjMonsterHunt",
+            "npc 39148 (4728) did not die",
+        )
+    }
+
+    #[test]
+    fn a_pass_in_a_closed_zone_stays_a_pass() {
+        let cfg = CrawlConfig::defaults();
+        let q = closed_zone_quest();
+        let r = finish_result(&cfg, &q, outcome(None), 1);
+        assert_eq!(r.status, "passed");
+        assert_eq!(r.step, "complete");
+    }
+
+    #[test]
+    fn a_failure_in_a_closed_zone_is_recorded_as_closed_zone() {
+        let cfg = CrawlConfig::defaults();
+        let q = closed_zone_quest();
+        let r = finish_result(&cfg, &q, outcome(Some(failure())), 1);
+        assert_eq!(r.status, "closed-zone");
+        assert_eq!(r.step, "objective 1 QuestActObjMonsterHunt");
+        assert!(r.reason.contains("did not die"), "{}", r.reason);
+    }
+
+    #[test]
+    fn a_failure_in_an_open_zone_stays_failed() {
+        let cfg = CrawlConfig::defaults();
+        let q = quest(Vec::new());
+        assert!(!q.closed_zone);
+        let r = finish_result(&cfg, &q, outcome(Some(failure())), 1);
+        assert_eq!(r.status, "failed");
+    }
+
+    #[test]
+    fn an_eviction_from_a_closed_zone_makes_an_open_zone_failure_closed_zone() {
+        let cfg = CrawlConfig::defaults();
+        let q = quest(Vec::new());
+        assert!(!q.closed_zone);
+        let mut out = outcome(Some(failure()));
+        out.evicted = true;
+        let r = finish_result(&cfg, &q, out, 1);
+        assert_eq!(r.status, "closed-zone");
+    }
+
+    #[test]
+    fn closed_zone_does_not_hide_unsupported_or_gated_quests() {
+        let cfg = CrawlConfig::defaults();
+        let mut q = closed_zone_quest();
+        q.unsupported = Some("empty template".into());
+        let r = finish_result(
+            &cfg,
+            &q,
+            outcome(Some(QuestFailure::new("unsupported", "empty template"))),
+            1,
+        );
+        assert_eq!(r.status, "unsupported");
+        let r = finish_result(
+            &cfg,
+            &q,
+            outcome(Some(QuestFailure::new("gate", "race 4"))),
+            1,
+        );
+        assert_eq!(r.status, "skipped");
+    }
+
+    #[test]
+    fn closed_zone_quests_are_still_attempted() {
+        let cfg = CrawlConfig::defaults();
+        assert!(!cfg.gm_closed_zones);
+        let q = closed_zone_quest();
+        let mut catalog = Catalog::default();
+        catalog.npc_spawns.insert(5001, vec![[10.0, 20.0, 30.0]]);
+        assert!(is_attemptable(&cfg, &catalog, &q, &HashSet::new()));
+        let plan = play_refusal(&cfg, &catalog, &q, &HashSet::new()).unwrap();
+        assert_eq!(plan.anchor, (10.0, 20.0, 30.0));
+    }
+
+    #[test]
+    fn closed_zone_errors_are_detected_since_the_snapshot() {
+        let events = [
+            GameEvent::ErrorMsg(CLOSED_ZONE_ERROR),
+            GameEvent::ErrorMsg(621),
+        ];
+        assert!(closed_zone_error_since(&events, 0));
+        assert!(!closed_zone_error_since(&events, 1));
+        assert!(!closed_zone_error_since(&events, 2));
+        assert!(!closed_zone_error_since(&[GameEvent::ErrorMsg(621)], 0));
+        assert!(!closed_zone_error_since(&[], 0));
     }
 
     #[test]

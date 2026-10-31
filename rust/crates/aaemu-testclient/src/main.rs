@@ -22,7 +22,8 @@
 //!                          [--deadline-ms 570000]
 //! aaemu-testclient crawl --race nuian|elf|firran|harani --out DIR [--levels a-b]
 //!                        [--from-quest N] [--limit N] [--min-level N] [--skip-failed]
-//!                        [--game-config F] [--server-log F] [--bugreports DIR]
+//!                        [--gm-closed-zones] [--game-config F] [--server-log F]
+//!                        [--bugreports DIR]
 //!                        Play every quest of one race (see CRAWLER.md).
 //! aaemu-testclient crawl --dashboard --out DIR
 //! ```
@@ -58,6 +59,7 @@ impl Args {
             "dashboard",
             "no-grant-gm",
             "skip-failed",
+            "gm-closed-zones",
         ];
         let mut it = std::env::args().skip(1);
         let cmd = it.next().unwrap_or_else(|| "help".into());
@@ -222,6 +224,7 @@ fn crawl_config(args: &Args) -> anyhow::Result<CrawlConfig> {
     }
     cfg.no_grant_gm = args.has("no-grant-gm");
     cfg.skip_failed = args.has("skip-failed");
+    cfg.gm_closed_zones = args.has("gm-closed-zones");
     Ok(cfg)
 }
 

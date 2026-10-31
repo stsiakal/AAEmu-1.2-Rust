@@ -114,6 +114,9 @@ pub struct CrawlConfig {
     pub no_grant_gm: bool,
     /// Do not retry quests that already failed in the result file.
     pub skip_failed: bool,
+    /// Raise the crawler characters to access level 100 before they enter the world, so the
+    /// server does not evict them from zones the 1.2 data marks closed.
+    pub gm_closed_zones: bool,
 }
 
 impl CrawlConfig {
@@ -140,6 +143,7 @@ impl CrawlConfig {
             min_level: 0,
             no_grant_gm: false,
             skip_failed: false,
+            gm_closed_zones: false,
         }
     }
 
@@ -177,6 +181,10 @@ impl CrawlConfig {
 
 /// Runs one crawler process.
 pub async fn run(cfg: CrawlConfig) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !(cfg.gm_closed_zones && cfg.no_grant_gm),
+        "--gm-closed-zones raises the character access level through MySQL; drop --no-grant-gm"
+    );
     std::fs::create_dir_all(&cfg.out)
         .with_context(|| format!("creating output directory {}", cfg.out.display()))?;
     let catalog = catalog::Catalog::load(&cfg.compact, &cfg.data_dir)?;
