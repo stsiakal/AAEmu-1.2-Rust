@@ -2,6 +2,7 @@
 
 use super::data::{HousingData, HousingTemplate};
 use crate::server::GameServer;
+use crate::systems::ai::collision::world::{ObjKind, Owner};
 use crate::systems::economy::error_message as err;
 use crate::systems::npcs::subzone::{self, Area};
 use crate::data::GameData;
@@ -13,6 +14,8 @@ const FOOTPRINT_CELL: f32 = 4.0;
 const FOOTPRINT_MAX_CELLS: i32 = 12;
 /// `FUN_39332180` / `FUN_39337fb0`: refuse when the terrain spread exceeds 6 m.
 const MAX_TERRAIN_SPREAD: f32 = 6.0;
+/// `FUN_39335860`: the unit/doodad collision query uses entity mask 0x1f.
+const UNIT_OVERLAP_MASK: u32 = 0x1f;
 
 /// `FUN_39897170`: `n = int((garden_radius * 2 + 3) * 0.25)`; `n >= 12` has no footprint.
 fn footprint_cells(garden_radius: f32) -> i32 {
@@ -90,6 +93,59 @@ fn validate_groups(
         return Ok(());
     }
     Err(error)
+}
+
+fn player_owned(server: &GameServer, player: &PlayerRef, obj_id: u32) -> bool {
+    let Some(world) = server
+        .world
+        .world_of(&crate::world::WorldObject::from(player))
+    else {
+        return false;
+    };
+    let character_id = player.character_id;
+    world.object(obj_id).is_some_and(|object| match object {
+        crate::world::WorldObject::Slave(s) => s.data().unit.owner_id == character_id,
+        crate::world::WorldObject::Mate(m) => m.data().unit.owner_id == character_id,
+        _ => false,
+    })
+}
+
+/// `FUN_39335860`: the footprint collides with a unit, doodad, gimmick or ship (not a house).
+fn validate_unit_overlap(
+    server: &GameServer,
+    player: &PlayerRef,
+    world: &WorldInstance,
+    x0: f32,
+    y0: f32,
+    side: f32,
+    z: f32,
+) -> Result<(), i16> {
+    let half = side * 0.5;
+    let center = [x0 + half, y0 + half, z];
+    let Some(found) = crate::systems::ai::collision::box_obstacles(
+        server,
+        world.id,
+        center,
+        [half, half, half],
+        0.0,
+        UNIT_OVERLAP_MASK,
+    ) else {
+        return Ok(());
+    };
+    for (owner, _) in found {
+        let Owner::Object { kind, obj_id } = owner else {
+            continue;
+        };
+        // Houses are the 0x71 rule; the placing character and its own mount are ignored.
+        if kind == ObjKind::House || obj_id == player.obj_id {
+            continue;
+        }
+        if player_owned(server, player, obj_id) {
+            continue;
+        }
+        return Err(err::HOUSE_CANNOT_LOCATE_OVERLAP_UNIT);
+    }
+    Ok(())
 }
 
 /// `FUN_39337fb0` / `FUN_39332180`: the 6 m terrain spread over the placement square.
@@ -218,7 +274,9 @@ pub fn validate_house(
     }
     if cells > 0 {
         let (x0, y0) = footprint_origin(x, y, cells);
-        validate_terrain(server, &world, x0, y0, cells as f32 * FOOTPRINT_CELL)?;
+        let side = cells as f32 * FOOTPRINT_CELL;
+        validate_unit_overlap(server, player, &world, x0, y0, side, z)?;
+        validate_terrain(server, &world, x0, y0, side)?;
     }
     Ok(())
 }

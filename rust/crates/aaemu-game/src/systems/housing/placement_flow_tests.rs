@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aaemu_physics::math::Vec3;
+
 use super::data::{HousingGroup, HousingItemHousings, HousingTemplate, Taxation};
 use super::hooks::{slot_type, HouseConstructionError, HouseItem, HousingEconomyHooks};
 use super::manager;
@@ -17,6 +19,8 @@ use crate::data::world_templates::{WorldTemplate, WorldTemplates};
 use crate::data::GameData;
 use crate::opcodes::sc;
 use crate::server::GameServer;
+use crate::systems::ai::collision::terrain::tests::Plane;
+use crate::systems::ai::collision::world::CellContent;
 use crate::systems::npcs::heightmap::{
     HeightmapConfig, HeightmapWorlds, WorldHeightmap, CELL_HMAP_RESOLUTION,
 };
@@ -245,6 +249,42 @@ fn install_ramp_heightmap(server: &crate::server::GameServer) {
         )));
 }
 
+/// A physical unit collider in the middle of the accepted footprint.
+fn install_unit_collider(server: &crate::server::GameServer) {
+    server
+        .systems
+        .ai
+        .collision
+        .test_files
+        .set(Arc::new(HashMap::new()))
+        .ok();
+    server
+        .systems
+        .ai
+        .collision
+        .test_terrain
+        .set(Arc::new(Plane {
+            a: 100.0,
+            b: 0.0,
+            c: 0.0,
+            n: 1024,
+        }))
+        .ok();
+    let physics = crate::systems::ai::collision::phys_world(server, 0).expect("physics world");
+    physics.lock().insert_cell(CellContent {
+        cell: (14, 14),
+        ..Default::default()
+    });
+    assert!(physics
+        .lock()
+        .sync_living(
+            500,
+            &crate::systems::ai::collision::data::LivingParams::default(),
+            Vec3::new(ACCEPTED.0, ACCEPTED.1, 100.0),
+        )
+        .is_some());
+}
+
 #[tokio::test]
 async fn area_338_captured_spot_is_refused_and_the_fitting_spot_is_accepted() {
     let mut f = fixture(data());
@@ -266,5 +306,15 @@ async fn a_six_metre_terrain_spread_is_refused_with_terrain_too_low() {
     assert_eq!(
         build_error(&mut f, ACCEPTED.0, ACCEPTED.1),
         Some(crate::systems::economy::error_message::HOUSE_CANNOT_LOCATE_TERRAIN_TOO_LOW)
+    );
+}
+
+#[tokio::test]
+async fn a_unit_inside_the_footprint_is_refused_with_overlap_unit() {
+    let mut f = fixture(data());
+    install_unit_collider(&f.server);
+    assert_eq!(
+        build_error(&mut f, ACCEPTED.0, ACCEPTED.1),
+        Some(crate::systems::economy::error_message::HOUSE_CANNOT_LOCATE_OVERLAP_UNIT)
     );
 }
