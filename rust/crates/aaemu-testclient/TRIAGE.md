@@ -22,9 +22,9 @@ Data and server evidence:
   invulnerability exists in the damage path, and `can_attack` accepts both. The audit's own
   level table shows kills succeed only against level <= 3 mobs (the crawler fights unarmed
   with auto attack only), which explains the rest.
-- The pre-login GM grant updates the account and already-existing characters, but a
-  character created in that run is inserted with the server config's character default (0),
-  so the closed-zone check still evicted it.
+- Before this change the pre-login GM grant updated the account and
+  already-existing characters, but a character created in that run was inserted with the
+  server config's character default (0), so the closed-zone check still evicted it.
 
 Crawler handling:
 
