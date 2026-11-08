@@ -3535,18 +3535,39 @@ is no longer mirrored (see "Known deviations", dead NPC returned and healed).
   scroll count.
 * systems::economy / skills (renew and physical enchant, 2026-11, stage 1): the C#
   `RenewEquipment` (57), `PhysicalEnchantWeapon` (20) and `PhysicalEnchantArmor` (21) actions only
-  logged. Rust ports the 1.2 client's pair predicate `FUN_397cca90` (`X2RenewItem.Renew` ->
+  logged. **Renew** ports the 1.2 client's pair predicate `FUN_397cca90` (`X2RenewItem.Renew` ->
   `FUN_394e92d0`): armor needs a `base_equipment` source and a non-`base_equipment` target with
   the same armor-type record; a weapon needs the same holdable slot type and renew category, with
   the renew category in 1..3. The client's toast ids are sent for the same refusals (20 slot out
-  of range, 27 item missing, 206 not a bag item, 1 not a renewable pair). For 20/21 the
+  of range, 27 item missing, 206 not a bag item, 1 not a renewable pair).
+  **Physical enchant is a single-item cast and does not use that pair predicate.** Skills 10521 /
+  10522 (`기본강화-무기` / `기본강화-방어구`) target type 9 (Item) and are common skills
+  (auto-learn, no learn requirement, ability 0), so the client sends a plain `CSStartSkill`
+  (caster = the player, target = one `SkillCastItemTarget`); the NPC dialog texts
+  (ui_texts 1428-1463) describe one item with money + archium and a 1x / 2x / 4x archium choice.
+  The enchanted item is the target's item id, looked up in the bag; `SkillCastItemTarget`'s
+  `obj_id` is the item owner (`FUN_394e92d0`), not a slot. The effect applies from
+  `application_method_id 2` (Source), so the effect target is the caster; the standard
+  `target.ObjId == targetCaster.ObjId ? targetCaster : SkillCastUnitTarget` rewrite (the C#
+  `ApplyEffects`, mirrored in Rust) therefore keeps the item target because the owner id is the
+  caster's. Refusals use `ItemCannotUse` (24, invalid item / wrong arm), `NotReady` (206, NPC
+  ability ladder) and `NotEnoughFriendship` (28); missing items use `NotEnoughItem` (27). The
   enchanter's `physical_enchant_abilities` row (npc template id, armor flag, next enchant step)
   is checked: `min_friendship > 0` is always unmet because 1.2 grants no NPC friendship
   (`track_friendship` is false for every NPC), and the row's `success_ratio` is rolled. The next
   enchant step is INFERRED as `temper_physical - 100 + 1` (`IT2-ENCHANT-LEVEL`). Stage 1 never
   changes an item: what a success consumes / transforms is capture-blocked (`IT2-STAGE2`); the
-  outcome is logged. The enchanter NPC is the cast's NPC operand when it has one, else the
+  outcome is logged. The money / archium formula, the multiplier effect, the great-success chance
+  and the "enchant durability" storage are capture-blocked (`IT2-COST`, log-only, never refused
+  on a guessed cost). The enchanter NPC is the cast's NPC operand when it has one, else the
   character's current interaction object (`CSInteractNPC`), because the 1.2 cast carries no NPC.
+  **HARD RULE:** stage 2 of physical enchant (any change to the item: grade, durability,
+  destruction) must not land until the `IT2-COST` rule (money + archium, the 1x / 2x / 4x
+  multiplier) is settled and enforced; otherwise it is a free enchant.
+  **OPEN (`IT2-RENEW-SLOT`):** `item_target_slot` (`systems/skills/effects/special/items.rs:120`)
+  treats `SkillCastItemTarget.obj_id` as a bag slot, while the enchant evidence says `obj_id` is
+  the owner's id. If that is right, real renew casts fail the slot range check. Needs a capture,
+  or a check of the renew request builder `FUN_394e92d0`; renew is left unchanged for now.
 * systems::economy / npcs / skills (lunafrost, 2026-10): the C# `InteractionEffect` passed the
   `SkillItem` caster and `SkillCastItemTarget` to `MagicalEnchant.Execute`; the Rust bridge dropped
   them, so a lunafrost never applied. They are forwarded now. `MagicalEnchant` also looks the item up
@@ -5066,14 +5087,64 @@ and in NPC wandering / buff remaining times.
   `dominion::rights::join_policy_allows` (`/joinsiege` and `/dominion register`), so no path
   can add a member whose rank forbids joining. **Capture-pending assumptions:** the placement
   thresholds behind 625 (resurrection point), 633 (house), 661 (another zone) and 741
-  (obstacle), and the "siege too imminent" window behind 760, are UNKNOWN and are NOT
-  enforced (no refusal today); the cancellation trigger's UI is UNKNOWN. The check order is
-  this server's policy. Tests:
+  (obstacle), and the "siege too imminent" window behind 760, are UNKNOWN. The four
+  placement refusals are implemented with INFERRED thresholds in the WP-SD2b
+  placement-refusals bullet below (625 stays behind a default-off switch); 760 is not
+  enforced. The cancellation trigger's UI is UNKNOWN. The check order is this server's
+  policy. Tests:
   `camp_use_records_a_declaration_consumes_the_item_and_announces_the_team` (real
   `CSStartSkillPacket` item cast, item consumed once, cancel zero team),
   `camp_use_refusals_use_the_client_ids_and_keep_the_item` (342/343/344/386/345/459/444/639/
   442/443, item kept each time), `unrelated_stale_or_rank_ineligible_members_cannot_join`
   (581 on the join path), `the_gm_register_path_also_applies_the_join_policy`.
+* systems::housing (WP-SD2b placement refusals, 2026-11-08): the four declaration placement
+  refusals run after the authored `radius_declare` (345) and before the rank policy (459),
+  each with a `Housing.SiegeDeclare*` threshold. Every numeric threshold is **INFERRED**:
+  the 1.2 texts name the situation but no capture or decompiled server rule gives a
+  distance (`round6-siege.md` "Thresholds"). The ids exist in the client error table
+  (`x2game.dll.c` cases 0x271 = 625, 0x279 = 633, 0x295 = 661, 0x2e5 = 741, 0x2ed = 749):
+  * **633 `SIEGE_CANNOT_DECLARE_NEAR_HOUSE`** (ui 5020 "cannot declare near a house",
+    INFERRED source text). Data: the house's `garden_radius` square, the same
+    `GetHouseAtLocation` query the server uses (`house_at_location_in_world`), with
+    `Housing.SiegeDeclareHouseMargin` metres beyond the plot. Default `0` refuses a spot
+    inside a plot only (the text's minimum reading); the retail margin is UNKNOWN,
+    capture-pending.
+  * **661 `SIEGE_CANNOT_DECLARE_NEAR_OTHER_ZONE`** (ui 5159 "too close to another zone",
+    INFERRED source text). Data: the authored zone at the spot (`WorldInstance.zone_id_at`
+    -> `zones.group_id`) must be the besieged dominion's group; `Housing.SiegeDeclareZoneMargin`
+    metres additionally refuses when a different group is within that distance (ring
+    sampling of the zone grid, INFERRED approximation). Default `0` checks the spot itself
+    only; the retail margin is UNKNOWN, capture-pending.
+  * **625 `SIEGE_CANNOT_DECLARE_NEAR_RESURRECT_POS`** (ui 4837 text "cannot declare near a
+    peace area"; the key name says resurrection point, the text is the reading used here).
+    Data source: the only 1.2 peace data is the zone conflict table (`conflict_zones`): a
+    group with no row never enters a PvP state, and the combat fallback is
+    `ConflictType.Peace` (`systems/skills/combat.rs`, C# `CharacterCombat.cs`), while a row
+    whose current state is `Peace` is peaceful now. `Housing.SiegeDeclarePeaceCheck`
+    defaults **false** because the declaration rule itself is UNKNOWN (the siege zones are
+    not conflict-zone rows, so the besieged group is never counted); when on,
+    `Housing.SiegeDeclarePeaceMargin` metres around the spot are sampled. INFERRED,
+    capture-pending.
+  * **741 `SIEGE_CANNOT_DECLARE_OBSTACLE`** (ui 5783 "there are obstacles nearby", INFERRED
+    source text). Data: the house builder's collision query (`collision::box_obstacles`,
+    mask 0x1f) at the spot; houses are the 633 rule, vegetation / brush / the caster and its
+    own mount do not refuse, and an incomplete (saturated) query counts as blocked (unlike the house
+    builder, `housing/placement.rs`, which skips that marker; for a 0.35 m box the difference is
+    theoretical). `Housing.SiegeDeclareObstacleRadius`
+    defaults to the player capsule radius 0.35 m (INFERRED; the retail radius is UNKNOWN,
+    capture-pending).
+  * **D1a 749 `LOCATE_INVALID_DOMINION_AREA`** for item 29800 "Blueprint: Territory
+    Statue" is unchanged: it is implemented in `systems::npcs::doodad::placement`
+    (`FUN_393a8fa0` step 7, `fort::state_at`, `re-placement-fakeuse.md` D1a) and covered by
+    the `CSCreateDoodadPacket` row above and the `territory_statue_*` tests; this change
+    adds no second gate.
+  Tests: `camp_placement_refuses_a_house_plot_and_honours_the_house_margin`,
+  `camp_placement_refuses_another_zone_group_and_honours_the_zone_margin`,
+  `camp_peace_check_is_off_by_default_and_honours_its_margin`,
+  `camp_placement_refuses_obstacles_and_honours_the_radius` (each drives the real
+  `CSStartSkillPacket` camp cast and fails without its check),
+  `siege_declare_placement_thresholds_default_and_bind` (config defaults and overrides).
+  The "siege too imminent" window behind 760 remains UNKNOWN and is not enforced.
 * systems::housing (WP-SD2c, 2026-11-06): the headquarters follow the declaration. The camp
   doodad bound by SD2b is the offense HQ from acceptance: `Headquarters::bind_declaration`
   stores it against the declaration (no siege record yet) and `bind_materialised` stamps it
