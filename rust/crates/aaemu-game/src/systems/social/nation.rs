@@ -103,7 +103,17 @@ impl NationSettings {
     /// Loads ids 46 / 50 / 51 / 54; a missing or non-positive row keeps the default (the
     /// client's value array is zero-initialised, so it also reads 0; NATION-17).
     pub fn load(conn: &rusqlite::Connection) -> rusqlite::Result<Self> {
-        use crate::systems::skills::data::misc::load_content_config;
+        // `content_configs.value` by id (0 when the row is missing).
+        let load_content_config = |conn: &rusqlite::Connection, id: u32| -> rusqlite::Result<i32> {
+            use rusqlite::OptionalExtension;
+            conn.query_row(
+                "SELECT value FROM content_configs WHERE id = ?1",
+                [id],
+                |r| r.get::<_, i32>(0),
+            )
+            .optional()
+            .map(|v| v.unwrap_or(0))
+        };
         let mut settings = Self::default();
         let load = |id: u32, slot: &mut u32| -> rusqlite::Result<()> {
             let value = load_content_config(conn, id)?;
@@ -244,6 +254,9 @@ pub struct NationManager {
     /// nation the offer belongs to. The 1.2 client can only send the nation half of
     /// `CSRenameExpedition` from that dialog (RENAME-7).
     rename_offers: Mutex<HashMap<u32, u32>>,
+    /// Offline members the last periodic save wrote (`nation id`, ids); pruned from
+    /// `offline_members` by [`commit_save`](NationManager::commit_save) once that save committed.
+    pub(super) saved_offline: Mutex<Vec<(u32, Vec<u32>)>>,
 }
 
 /// Why a nation rename was refused.
@@ -467,6 +480,20 @@ impl NationManager {
         invites.push(pending);
     }
 
+    /// Removes the invitations whose timeout passed and returns their invitee character ids.
+    /// The list holds at most one invitation per invitee (`add_invite` replaces), so no other
+    /// nation invitation (popup type 0x29) can still be pending for an expired invitee.
+    pub fn expire_invites(&self, now_ms: i64) -> Vec<u32> {
+        let mut invites = self.invites.lock().unwrap_or_else(PoisonError::into_inner);
+        let expired: Vec<u32> = invites
+            .iter()
+            .filter(|i| !i.is_valid_at(now_ms))
+            .map(|i| i.invitee_character_id)
+            .collect();
+        invites.retain(|i| i.is_valid_at(now_ms));
+        expired
+    }
+
     /// Consumes the pending invite of `invitee_character_id`. `None` when there is none, it has
     /// expired, or it names another nation (a forged / replayed reply, NATION-11).
     pub fn take_invite(
@@ -498,20 +525,6 @@ impl NationManager {
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
             .any(|i| i.invitee_character_id == invitee_character_id && i.is_valid_at(now_ms))
-    }
-
-    /// Removes the invitations whose timeout passed and returns their invitee character ids.
-    /// The list holds at most one invitation per invitee (`add_invite` replaces), so no other
-    /// nation invitation (popup type 0x29) can still be pending for an expired invitee.
-    pub fn expire_invites(&self, now_ms: i64) -> Vec<u32> {
-        let mut invites = self.invites.lock().unwrap_or_else(PoisonError::into_inner);
-        let expired: Vec<u32> = invites
-            .iter()
-            .filter(|i| !i.is_valid_at(now_ms))
-            .map(|i| i.invitee_character_id)
-            .collect();
-        invites.retain(|i| i.is_valid_at(now_ms));
-        expired
     }
 
     /// The founding expedition handed its leadership to `character_id`: the nation's king
@@ -863,6 +876,26 @@ impl NationManager {
         }
     }
 
+    /// Drops one character from every nation's offline-member list (a kick moved its faction, so
+    /// a later save must not write the nation back).
+    pub fn remove_offline_member(&self, character_id: u32) {
+        for nation in self.write().iter_mut() {
+            nation.offline_members.retain(|&id| id != character_id);
+        }
+    }
+
+    /// After the save transaction committed: the offline members it wrote need no further
+    /// rewrites. Members added or kept since the snapshot stay untouched.
+    pub fn commit_save(&self) {
+        let saved = std::mem::take(&mut *self.saved_offline.lock().expect("nation saved poisoned"));
+        let mut nations = self.write();
+        for (id, members) in saved {
+            if let Some(nation) = nations.iter_mut().find(|n| n.id == id) {
+                nation.offline_members.retain(|m| !members.contains(m));
+            }
+        }
+    }
+
     /// This subsystem's part of `SaveManager.DoSave`: nations, their relation rows, the
     /// founding expedition's `mother` and the offline members' `faction_id`, in one
     /// transaction.
@@ -879,9 +912,20 @@ impl NationManager {
             .map(|p| p.character_id)
             .collect();
         let mut written = 0;
+        let mut saved = Vec::new();
         for nation in &nations {
             written += write_nation(server, tx, nation, &online).await?;
+            let members: Vec<u32> = nation
+                .offline_members
+                .iter()
+                .copied()
+                .filter(|id| !online.contains(id))
+                .collect();
+            if !members.is_empty() {
+                saved.push((nation.id, members));
+            }
         }
+        *self.saved_offline.lock().expect("nation saved poisoned") = saved;
         Ok(written)
     }
 }
@@ -2176,8 +2220,6 @@ pub fn pay_friend_treaty(server: &GameServer, payer: &PlayerRef, mail_id: i64) -
     true
 }
 
-/// The periodic nation tick (subscribed to the existing `TickManager`, NATION-17): applies due
-/// relation expiries, persists them, and sends the treaty-request mails that became due.
 /// Closes the popups of the immigration invitations that timed out (kind 7).
 pub fn sweep_expired_invites(server: &GameServer, now_ms: i64) {
     for invitee_id in server.systems.social.nations.expire_invites(now_ms) {
@@ -2189,6 +2231,8 @@ pub fn sweep_expired_invites(server: &GameServer, now_ms: i64) {
     }
 }
 
+/// The periodic nation tick (subscribed to the existing `TickManager`, NATION-17): applies due
+/// relation expiries, persists them, and sends the treaty-request mails that became due.
 pub fn run_periodic(server: &GameServer) {
     let now = Utc::now().timestamp();
     let expiries = server.systems.social.nations.expire_relations(now);
@@ -2897,6 +2941,11 @@ pub(super) async fn kick_offline(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    server
+        .systems
+        .social
+        .nations
+        .remove_offline_member(character_id);
     // The offline owner keeps its loaded HouseRefs; move them while the save lock is still
     // held, so no concurrent save writes the old faction back (NATION-5 follow-up).
     crate::systems::housing::update_owned_housing_faction(server, character_id, origin);
@@ -3117,6 +3166,11 @@ async fn kick_online_target(
     };
     faction::set_faction(server, target, origin).await;
     persist_faction(server, target_id, origin).await;
+    server
+        .systems
+        .social
+        .nations
+        .remove_offline_member(target_id);
     let result = SCFactionKickToOriginResultPacket {
         tgt_name: name,
         id: target_id,

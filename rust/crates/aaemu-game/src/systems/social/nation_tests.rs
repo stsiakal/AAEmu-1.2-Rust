@@ -824,6 +824,9 @@ fn spawn_candidate(
 ) -> PlayerRef {
     let mut character = test_character(id, name, 160.0, 100.0);
     character.unit.level = nation::IMMIGRATE_MIN_LEVEL;
+    // Alive: a guild invitation to a dead character is refused.
+    character.unit.hp = 100;
+    character.unit.max_hp = 100;
     spawn_player(server, client, character, obj_id)
 }
 
@@ -1863,6 +1866,8 @@ async fn guild_membership_uses_the_saved_top_level_faction() {
         0x301,
     );
     ally.data().unit.faction_id = 102;
+    ally.data().unit.hp = 100;
+    ally.data().unit.max_hp = 100;
     owner_client.drain();
     ally_client.drain();
     expedition::invite(&server, &owner, "Ally");
@@ -1970,7 +1975,7 @@ async fn guild_creation_requires_one_top_level_faction() {
     assert_eq!(created.faction.mother_id, 101);
     assert_eq!(created.members.len(), 5);
 
-    // One friend (165) is not Nuia: the creation is refused with 321 and no guild is created.
+    // One friend (165) is not Nuia: the creation is refused with 320 and no guild is created.
     let (mut clients, players) = spawn_party(&server, 50, &[101, 101, 101, 101, 165]);
     let owner = players[0].clone();
     owner.data().money = 20_000;
@@ -1983,7 +1988,7 @@ async fn guild_creation_requires_one_top_level_faction() {
     .handle(&server, &mut clients[0].conn)
     .await
     .unwrap();
-    assert_eq!(error_code(&clients[0].drain()), Some(321));
+    assert_eq!(error_code(&clients[0].drain()), Some(320));
     assert!(!server
         .expeditions
         .all()
@@ -2903,4 +2908,39 @@ async fn guards_of_the_treaty_alliance_become_friendly() {
             "guard {id}"
         );
     }
+}
+
+fn offline_nation(id: u32, members: Vec<u32>) -> Nation {
+    Nation {
+        id,
+        expedition_id: 0,
+        owner_character_id: 1,
+        owner_name: "King".into(),
+        name: "Kingdom".into(),
+        created_at: 0,
+        allow_change_name: 0,
+        relations: Vec::new(),
+        offline_members: members,
+    }
+}
+
+#[test]
+fn committed_save_prunes_only_the_written_offline_members() {
+    let nations = NationManager::default();
+    nations.add(offline_nation(7, vec![1, 2, 3]));
+    // The save wrote 1 and 2; 3 joined the list afterwards.
+    *nations.saved_offline.lock().unwrap() = vec![(7, vec![1, 2])];
+    nations.commit_save();
+    assert_eq!(nations.get(7).unwrap().offline_members, vec![3]);
+    // A second commit has nothing left to prune.
+    nations.commit_save();
+    assert_eq!(nations.get(7).unwrap().offline_members, vec![3]);
+}
+
+#[test]
+fn a_kick_removes_the_member_from_the_offline_list() {
+    let nations = NationManager::default();
+    nations.add(offline_nation(7, vec![1, 2]));
+    nations.remove_offline_member(2);
+    assert_eq!(nations.get(7).unwrap().offline_members, vec![1]);
 }

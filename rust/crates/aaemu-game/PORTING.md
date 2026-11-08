@@ -827,7 +827,7 @@ Land-vehicle placement keeps the strict check. Real-data check (needs `AAEMU_GAM
 | Area (C#) | Rust | Status | Notes |
 |---|---|---|---|
 | `TeamManager`, `Models/Game/Team` | `systems/social/team.rs`, `packets/team.rs` | done | Invitations (single / area with `SCAskToJoinTeamArea` / `SCTeamAreaInvited`, 30 s area cooldown, 60 s timeout, 500 ms sweep, 10k cap, stale-reply and owner-rights guards), invitation error replies, create, AskRiskyTeam (leave / kick / dismiss + auto-disband; the direct `CSLeaveTeam` / `CSKickTeamMember` / `CSDismissTeam` packets run the same actions), owner / role / marker / looting rule / ping / move, raid conversion, SetOffline / MemberRemoveFromTeam / UpdateAtLogin / UpdatePosition, 500 ms remote-member sync (delta cache, 5 s forced resync, upper-triangle pairs), zombie-team disband (5 min), loot winner helpers. Events (OnTeamJoin/Leave) are quest-side: not called. See "Area team invitations and invitation error replies". |
-| `ExpeditionManager`, `Models/Game/Expeditions` | `systems/social/expedition.rs`, `packets/expedition.rs` (`managers::expedition` re-exports) | done | Load, create (party checks, cost, `SCItemTaskSuccessPacket` money-only form), invite / reply, leave, kick, member role, owner, role policy, disband (stays listed as `$deleted-guild-<id>`), `Expedition.Save` per change, offline leave for character deletion. Guild rename: see "Guild rename" below. Sponsor is still log-only / not in 1.2 as in C#. |
+| `ExpeditionManager`, `Models/Game/Expeditions` | `systems/social/expedition.rs`, `packets/expedition.rs` (`managers::expedition` re-exports) | done | Load, create (party checks, cost, `SCItemTaskSuccessPacket` money-only form), invite / reply, leave, kick, member role, owner, role policy, disband (stays listed as `$deleted-guild-<id>`), `Expedition.Save` per change, offline leave for character deletion. Guild rename (GM-granted right, see "Guild rename" below), the sponsor id and the report / leader-only checks: see "Guild functions (2026-11-05)". |
 | `FamilyManager`, `Models/Game/Family` | `systems/social/family.rs`, `packets/family.rs` | done | Load, invite / reply / create, leave, kick (offline existence check), title, steward, login / logout, disband, save, offline leave for character deletion. |
 | `FriendMananger`, `CharacterFriends`, `CharacterBlocked` | `systems/social/friend.rs`, `packets/friend.rs` (`managers::friend` re-exports) | done | Add / remove friends (online or by DB name lookup), block / unblock (online or by `NameManager` for offline names), status changes incl. `InParty`, and the client's failure feedback for every refused add / remove / block / unblock (WP-SL2, see the deviation). The blocked list is enforced on every direct delivery path (whisper, team / area / expedition / family invite, friend add, trade and duel request); see the block-list deviation. |
 | `ChatManager`, `Models/Game/Chat` | `systems/social/chat.rs`, `session.rs` (`managers::chat` re-exports) | done | All channel kinds incl. party / raid / court, CleanUpChannels, party / raid / raid-leader / judge routing, per-channel spam delays (`SCChatSpamDelayPacket` + server-side enforcement, see "Chat spam" below). User channels (`CSJoinUserChatChannel`) are log-only as in C#. |
@@ -1042,7 +1042,9 @@ refuses a duplicate faction id (`FUN_398a5280`), so `EXPEDITION_ID` also extract
 #### Guild rename (expedition)
 
 `CSRenameExpeditionPacket` (0x009, `{ id, name, is_expedition }`) renames a guild when
-`is_expedition` is true; the nation half (`false`) is the nation rename (RENAME-7).
+`is_expedition` is true; the nation half (`false`) is the nation rename (RENAME-7, below). This
+section documents the guild flow (the GM-granted right model is described under "Guild
+functions (2026-11-05)"); the nation specifics follow below.
 
 Evidence (1.2 client):
 
@@ -1060,8 +1062,11 @@ Evidence (1.2 client):
   (`FUN_392f8db0`), zero the nation dialog. The handler does not read `errorMessage` in the
   decompile, so the code is informational for 1.2; the re-opened dialog is the visible result.
 * The error codes are the creation ones (compact/client error table `FUN_3956b860`):
-  296 `expedition_name_character`, 297 `expedition_name_length`, 299 `expedition_name_exist`.
-  The creation path and rename share `systems::social::rename::validate_faction_name`.
+  296 `expedition_name_character`, 297 `expedition_name_length`, 298
+  `expedition_name_badlist`, 299 `expedition_name_exist`. Creation and rename share
+  `systems::social::expedition::validate_name` (length, the configured regex, the
+  character-name block list, and a case-insensitive uniqueness test that skips dismissed
+  guilds and the guild itself).
 * The 1.2 compact database has no rename item, skill, special effect or `content_configs`
   entry; the only 1.2 client trigger is the server packet. The GM hook `/testguild rename`
   sends it (the access-level entry `testguild: 100` already existed without a C# command).
@@ -1069,47 +1074,53 @@ Evidence (1.2 client):
 Rules and deviations:
 
 * **Owner only.** The client's own pre-check and the server both require the guild owner
-  (`faction.owner_id` plus membership, checked under the expedition write lock together with
-  the name uniqueness test and the write).
-* **Offer required and bound to the guild.** `rename_expedition` requires the one-shot offer
-  created when the server sent `SCExpeditionShowRenameUI`; the offer stores
+  (`faction.owner_id` plus membership; a request naming another guild is refused).
+* **Right plus offer.** The leader needs the GM-granted `allow_change_name` right
+  ("Guild functions" above): no right is `FACTION_RIGHTS` (32). On top of it, the server keeps
+  the one-shot offer created when it sent `SCExpeditionShowRenameUI`; the offer stores
   `character -> expedition id`, so a request for another guild is refused even when the
-  character holds one. A forged CS without it is refused with error 307. The offer survives an
-  invalid / taken name so the retry dialog can correct it, is consumed on success, and is
-  dropped on leave-world (`world::session::leave_world_task`), on guild disband
-  (`dismiss_expedition`) and on an owner change. The map is capped (`MAX_RENAME_OFFERS`).
-  This is a server-side addition: the 1.2 C# only logged the packet.
-* **Uniqueness matches creation.** The create path compares exactly (`name.Equals(exp.Name)`
-  in C#), so rename does the same; it is **not** case-insensitive despite the MySQL column's
-  `utf8_general_ci` collation. Excluding the guild itself makes re-submitting the current name
-  a no-op rename. Since stage 4 all four name-changing paths (guild create, guild rename,
-  independence, nation rename) share `rename::faction_name_in_use`, which also covers nation
-  and static-faction names (RENAME-3); `rename::lock_names` serialises the check and the write
-  across the expedition and nation stores (RENAME-6).
+  character holds one. A request with the right but without the dialog is a forged packet and
+  is refused with error 307 `EXPEDITION_BAD_STATUS` (a server-side addition: the 1.2 C# only
+  logged the packet). The offer survives an invalid / taken name so the retry dialog can
+  correct it, is consumed on success, and is dropped on leave-world
+  (`social::session` / `world::session::leave_world_task`), on guild disband
+  (`dismiss_expedition`) and on an owner change (`apply_owner_change`). The map is capped
+  (`MAX_RENAME_OFFERS`). `grant_rename` and the login prompt record the offer too.
+* **Name rules shared with creation.** `validate_name` enforces the UTF-16 length, the
+  configured regex, the character-name block list and a case-insensitive uniqueness test that
+  skips dismissed guilds and the guild itself (re-submitting the current name in another case
+  is therefore a valid case change). The C# create path compared exactly and did not use the
+  block list.
+* **One shared namespace (RENAME-3).** Guild creation, guild rename, independence and nation
+  rename also check `rename::faction_name_in_use` over static factions, expeditions and
+  nations (exact comparison, the guild / nation being renamed excluded);
+  `rename::lock_names` keeps that check and the name write together across the expedition and
+  nation stores, which closes the create-vs-rename race (RENAME-6).
 * **Broadcast scope.** `SCFactionRenamed` goes to every online player
   (`WorldManager.broadcast_to_server`), because the faction list (`SCFactionListPacket`) and
   `SCFactionCreatedPacket` are server-wide too; sending it only to members would leave every
-  other client's guild list stale.
-* **Persistence** is the existing `Expedition.Save` (`REPLACE INTO expeditions`), awaited
-  before the broadcast.
+  other client's guild list stale. The guild chat channel is renamed as well, and the right is
+  spent unless the rename is a GM one (`by_gm = true` keeps it).
+* **Persistence** is the existing `Expedition.Save` (`REPLACE INTO expeditions`, including
+  `allow_change_name`), awaited before the broadcast.
 * **capture-pending (RENAME-1):** the production trigger (item / merge collision / quest) is
-  not established for 1.2; only the GM hook is wired. The nation rename reuses the shared
-  validation / retry / broadcast helpers (RENAME-7).
+  not established for 1.2; only the GM commands and the test hook are wired. The nation rename
+  reuses the shared shape / retry / broadcast helpers and the shared namespace (RENAME-7,
+  below).
 * **Known, not fixed (RENAME-2, 4, 5):**
   * **RENAME-2:** a failed save still broadcasts. `save()` only logs the error (and restores
     the pending removals); the in-memory name is broadcast as if persisted, and there is no
     periodic expedition save to retry it (`systems::social::System::save` covers ranking /
     nations / bounties / crime, not expeditions). The C# call site was synchronous too. A
     nation rename has a periodic nation save, so its failed immediate write is retried.
-  * **RENAME-4:** uniqueness is an exact string comparison, so case, space and Cyrillic
-    look-alikes are distinct (`Knights` / `knights` / `K nights` / homoglyphs). This mirrors
-    the C# `CreateExpedition` check; the MySQL column's `utf8_general_ci` collation does not
-    make the in-memory check case-insensitive.
+  * **RENAME-4:** the guild uniqueness test lowercases with Rust's Unicode rules, so case
+    variants collide (`Knights` / `knights`); space and Cyrillic look-alikes remain distinct
+    (`K nights` / homoglyphs), and the cross-store namespace check is exact. This matches the
+    MySQL `utf8_general_ci` intent but not its full collation.
   * **RENAME-5 (capture-pending):** the `SCFactionRetryRenamePacket.errorMessage` field width
     is unverified. The C# writes `i16`; the decompiled handler reads the name at `+0x14`,
     which suggests four bytes of error/padding, and it does not read the field at all. The
     C# layout is kept until a capture or server decompile settles it.
-
 #### Nation rename (RENAME-7)
 
 `CSRenameExpeditionPacket` (0x009) with `is_expedition = false` now renames the caller's
@@ -1138,7 +1149,6 @@ GM hook `/nation rename` (and the optional name form) and the tests call the sam
   is server-wide). An invalid name or a taken one answers `SCFactionRetryRename { xpdt =
   false, errorMessage, name }` with 296 / 297 / 299; the client does not read the error field
   in the decompile (RENAME-5), the re-opened dialog is the visible result.
-
 #### National tax (RENAME-8)
 
 `CSUpdateNationalTaxRatePacket` 0x013 `{zoneGroup u16, rate u32}` (`FUN_392f42f0` ->
@@ -1413,7 +1423,7 @@ live acceptance remain pending.
 | `ExpressTextManager`, `CSExpressEmotionPacket`, `SCEmotionExpressedPacket` | `systems/services/express_text.rs` | done | Deviation: an emote whose sender object id is not the sender's own character is dropped (the C# broadcast the client-supplied id). |
 | `LocalizationManager` | `systems/services/localization.rs` | done | 263 635 rows / 8 locales on the real DB. |
 | `ModelManager`, `Models/Game/Models/*` | `systems/services/models.rs` | done | Counts checked against compact.sqlite3 (gated test). |
-| `MusicManager`, `SongData`, music packets (`CSSaveUserMusicNotesPacket`, `CSSendUserMusicPacket`, `CSRequestMusicNotesPacket`, `CSEndMusicPacket`, `SCUserNoteLoadedPacket`) | `systems/services/music.rs` | done | `CreateSheetMusic` item work through `SheetMusicInventory` (economy; its `ItemSkillHooks::midi_cache` / `create_sheet_music` call this manager). Upload sanity is Rust-only (`music_note_limits` per Artistry grade, `Music.MaxSongChars`, UTF-16 size check, owned item in `instrument_sounds`; see the deviation below). |
+| `MusicManager`, `SongData`, music packets (`CSSaveUserMusicNotesPacket`, `CSSendUserMusicPacket`, `CSRequestMusicNotesPacket`, `CSEndMusicPacket`, `SCUserNoteLoadedPacket`) | `systems/services/music.rs` | done | `CreateSheetMusic` item work through `SheetMusicInventory` (economy; its `ItemSkillHooks::midi_cache` / `create_sheet_music` call this manager). Upload sanity is Rust-only (`music_note_limits` per Artistry grade, `Music.MaxSongChars`, owned source item; a UTF-16 size mismatch only logs a warning and the item is not required to be an instrument, the client sends the music paper; see the deviation below). |
 | `RadarManager`, `TelescopeRegistrationEntry`, telescope / fish finder packets | `systems/services/radar.rs` | done | Registered from `BuffTemplate.Start` / `Dispel` (skills), unregistered on leave. Ship lists through `RadarShipHooks` (vehicles). The radar / telescope feature is ported, not missing (gap-audit 2026-11-02 research `stealth.md` §0.1). Open items, none of them a port gap: shipyards are not sent in `SCTelescopeUnits` because the 1.2 client has no shipyard list wire format (only transfers, fish schools and the slave/ship list), so the C# "Add Shipyards" TODO is closed; the GM range is `World.RadarGmAccessLevel` (default `100`, the previous hard-coded value) instead of a hard-coded access-level check (`radar.rs` `gm_range_comes_from_config`); `evade_telescope` (buffs 4887 / 4950, "free from the telescope's gaze") is not consumed, as in the C# (which unit carries the buff is UNKNOWN). |
 | `Models/Tasks/ShutdownTask`, `SCNoticeMessagePacket` | `systems/services/shutdown.rs` | done | Count-down notices, final save, process exit; held in `server.systems.services.shutdown_task` (`SaveManager.ShutdownTask`). Buy-back wipe through `BUYBACK_WIPE` (economy). **Deviation:** the C# saved and exited without telling the clients (every client showed a disconnect error and quit). At T-0 the Rust task first broadcasts "The server is shutting down for maintenance.", refuses world entries (`GameServer::is_shutting_down`: `X2EnterWorld` / `CSSelectCharacter` / `CSSpawnCharacter` get `SCKicked(2)` + close), sends every connection `ConnCommand::ReturnToWorldList` (in-world: `LeaveWorldTask` to character select with no timer, i.e. save + `SCLeaveWorldGranted(1)` + `ChangeState(0)`; the client stays on its game connection and loads the lobby, so the world list request follows 2 s later: `GLPlayerReconnect` -> `LGPlayerReconnect` -> `SCReconnectAuth`, the `CSLeaveWorld(ServerSelect)` path, re-sent every 2 s to every connection still there, new ones included), waits up to 10 s for the clients to disconnect, kicks the rest with `SCKicked(2, "Server maintenance")`, then does the final save (3 tries), `shutdown::stop_server` (shared with the Ctrl+C path in `main.rs`) and the exit. A failed final save aborts the shutdown (as before: no exit) and reopens world entry; `/scripts shutdown cancel` is refused once T-0 passed. `/scripts forcedshutdown` still exits at once. |
 | `SusManager` | `systems/services/sus.rs` | done | `audit_char_sus` log + speed analysis. All 12 C# `LogActivity` sites are wired: crime / trial / coffer through `social::crime::sus_log`, `CSDestroyItem` (negative count) through `SusManager::log_activity_player_deferred` (`porting-md#10`). The 5 s `FinalizeTransform` caller runs from the move handler (see deviations). |
@@ -1869,7 +1879,8 @@ is no longer mirrored (see "Known deviations", dead NPC returned and healed).
   blocked (INFERRED), 354 not blocked. Self-add is therefore a **deviation from the C#** (which
   accepted it); the client's own 501 text makes the refusal the better-supported behaviour.
   The already-a-friend and already-blocked ids have no client text and are INFERRED. A friend
-  add whose target blocked the owner stays silent (capture-pending, `BLOCK-LIST-2`). There is
+  add whose target blocked the owner is answered with 551 as if the name were unknown (no
+  block text exists in the client; capture-pending, `BLOCK-LIST-2`). There is
   no list-size cap: no client constant was found (UNKNOWN).
 
 * systems::npcs (persistent doodads): `SpawnPersistentDoodads` skips the housing lookup for SLAVE-owned rows. In the C# every row with `houseId > 0` was resolved as a house, but for vehicle cargo racks `house_id` holds the hull id, so it logged "can't find it's owning house" (or, if a house with that id existed, parented the rack to it before the slave re-attach).
@@ -1963,6 +1974,9 @@ is no longer mirrored (see "Known deviations", dead NPC returned and healed).
     debug because its meaning is UNKNOWN. Sets 20 and 33 are unreachable through
     `quest_components.ai_command_set_id` (no row names them) and set 1 is a test set, so the
     shipped quest content does not use this path.
+  * **Opt-in (`Interaction.CommandSetLock`, default `false`):** the 1.2 client only loads the
+    column (`x2game12.c` `LoadAiCommandSetDescs`, no consumer found) and 302 of 325 sets are 'f', so
+    the rule below is off unless the flag is set.
   * While an `ai_command_sets` row with `can_interact = 'f'` runs, the NPC's
     `Npc.interactable` flag is false: `SCNpcInteractionStatusChanged{npc, false}` goes to the
     players around it at set start, the visibility path repeats it to players that enter sight
@@ -2028,23 +2042,24 @@ is no longer mirrored (see "Known deviations", dead NPC returned and healed).
 
 * systems::services (music uploads, WP-M1, 2026-11-06; note limits 2026-11-07): the C# stored any
   `CSSaveUserMusicNotes` body. The Rust refuses (warning, nothing queued, and
-  `SCErrorMsgPacket(UserNoteCannotSave)`) when `song_size` is not
-  `song.encode_utf16().count()`, when the song is longer than the player's `music_note_limits`
-  row, when it exceeds the outer `Music.MaxSongChars` sanity bound (default 3000, above the
-  data's 1000, so it never binds by default), or when `item_id` is not an item owned by the
-  player whose template is in `instrument_sounds`. The limit is the 1.2 client's own: it loads
-  `music_note_limits` (`dll.c:1207337`), `X2UserMusic.GetCompositionLimitInfos` returns
-  `{grade, compositionLimit}` per row (`FUN_39079ea0`), the composition UI matches the player's
-  `X2Ability.GetMyActabilityInfo(33)` grade (actability 33 `예술`, Lua `user_music.alb`), and
-  `SaveNotes`/`PreSaveNotes` allow a song only when `XlStringLen(song) <= limit`
-  (`FUN_39079640` / `FUN_390799e0` call `FUN_39082130`). Its save error is
-  `0x2aa user_note_cannot_save`, which is only shown when the note conversion fails
-  (`FUN_39428370(0x2aa)`); the UI also hard-caps the score input at 1000 characters
+  `SCErrorMsgPacket(UserNoteCannotSave)`) when the song is longer than the player's
+  `music_note_limits` row, when it exceeds the outer `Music.MaxSongChars` sanity bound (default
+  3000, above the data's 1000, so it never binds by default), or when `item_id` is not an item
+  owned by the player. A `song_size` that differs from the UTF-16 length is only logged (the
+  client writer's size unit is not evidenced). The item is NOT required to be an instrument: the
+  client looks up a bag item by its 64-bit id (`FUN_39079640` / `FUN_390799E0` -> `FUN_3961e9a0`,
+  id at the packet's second field), which is the music paper the following item cast (skill
+  22215) consumes; `instrument_sounds` is loaded by the client for its own UI (`dll.c:1559064`).
+  The limit is the 1.2 client's own: it loads `music_note_limits` (`dll.c:1207337`),
+  `X2UserMusic.GetCompositionLimitInfos` returns `{grade, compositionLimit}` per row
+  (`FUN_39079ea0`), the composition UI matches the player's `X2Ability.GetMyActabilityInfo(33)`
+  grade (actability 33 `예술`, Lua `user_music.alb`), and `SaveNotes`/`PreSaveNotes` allow a song
+  only when `XlStringLen(song) <= limit` (`FUN_39079640` / `FUN_390799e0` call `FUN_39082130`).
+  Its save error is `0x2aa user_note_cannot_save`, which is only shown when the note conversion
+  fails (`FUN_39428370(0x2aa)`); the UI also hard-caps the score input at 1000 characters
   (`SetMaxTextLength(scoreEdit, 1000)`). A grade above the table's last step uses the highest
-  authored limit (1000), never a lower one. The client resolves the same item before sending
-  (`FUN_39079640` -> `FUN_3961e9a0`, item id at the packet's second field) and loads
-  `instrument_sounds` itself (`dll.c:1559064`). The note grammar is still not parsed: no
-  server-side format is evidenced, so a grammar failure remains a client-side refusal (0x2aa).
+  authored limit (1000), never a lower one. The note grammar is still not parsed: no server-side
+  format is evidenced, so a grammar failure remains a client-side refusal (0x2aa).
 
 * systems::skills (music): the C# (and this port) send `SCSkillStarted` only for casts with a
   cast time. The play (22213), pause (22214) and close-the-score (22217) skills are instant
@@ -2256,6 +2271,9 @@ is no longer mirrored (see "Known deviations", dead NPC returned and healed).
   (its AI busy on another thread), `DeadBehavior`'s `ClearAllAggro` sent the corpse home and
   `ReturnState` restored its hp, so town guards kept fighting the mob they had killed (gray hp
   bar in the client). Test: `ai::flow_tests::guard_kill_while_the_mob_ai_is_busy_keeps_the_mob_dead`.
+  (its AI busy on another thread), `DeadBehavior`'s `ClearAllAggro` sent the corpse home and
+  `ReturnState` restored its hp, so town guards kept fighting the mob they had killed (gray hp
+  bar in the client). Test: `ai::flow_tests::guard_kill_while_the_mob_ai_is_busy_keeps_the_mob_dead`.
 * `Character.CheckWantedThreshold` (InfamyPoint >= 3000) / PIRATE-1: the Wanted / Contemptuous
   buffs are added under the character's data lock, but the faction is no longer assigned there.
   The check returns a "became a pirate" signal and every caller that has a live player runs
@@ -2279,16 +2297,17 @@ is no longer mirrored (see "Known deviations", dead NPC returned and healed).
   the select conversion runs before `CSNotifyInGamePacket` -> `TeamManager.UpdateAtLogin`, which
   would otherwise re-join the new pirate, and an ordinary member could not satisfy the owner
   check of the client kick path.
-  The guild removal is a dedicated server-side path
-  (`expedition::remove_member_for_faction_change`), not the client `Kick` handler: the C# `Kick`
+  The guild removal is a dedicated server-side path (`expedition::leave_forced`), not the
+  client `Kick` handler: the C# `Kick`
   only acts on roles whose policy has `Expel`, so ordinary members stayed in the guild after
   becoming pirates. Evidence for the kick itself: the 1.2 loading tips `ui_texts` 2833
   (`tips_of_day_84`) and 2848 (`tips_of_day_99`) say a guild member who becomes a pirate is
   forcibly removed ("If you belong to a guild and become a pirate, you'll be kicked out of your
   guild"), with no owner exception; the C# implementation matches for ordinary roles but never
   handled the owner (`Kick` removed an owner like anyone, leaving `OwnerId` on a non-member).
-  A guild whose mother faction already is the new faction is left alone, so a pirate guild keeps
-  its pirates (C# `Expedition.MotherId != factionId`; `ui_texts` 2847 allows pirate guilds).
+  A guild whose alliance already is the new faction's alliance is left alone, so a pirate guild
+  keeps its pirates (`alliance_id` of the mother vs the new faction; `ui_texts` 2847 allows
+  pirate guilds).
   **Owner decision (2026-11-03, PIRATE-1, replaces the earlier dismissal rule):** a guild owner
   who becomes a pirate is removed too, but the leadership first passes automatically to a
   remaining member. The successor is chosen by the highest `role`, then the longest membership.
@@ -2297,14 +2316,15 @@ is no longer mirrored (see "Known deviations", dead NPC returned and healed).
   lowest `character_id` is the stable stand-in (ids are allocated in creation order, so the
   first-created character wins); this is an approximation. The forced hand-over and the old
   owner's removal happen in **one** expedition write section (the client `ChangeOwner` path
-  keeps its own function), so a concurrent forced removal cannot see the already-pirate old
-  owner as an ordinary member and hand the guild back. A candidate whose faction (live for an
-  online member, saved `characters.faction_id` for an offline one) is not the guild mother is
-  skipped: a pirate heir would immediately undo the hand-over. The hand-over emits the normal
+  shares the transfer, so both move the nation king and drop rename offers), so a concurrent
+  forced removal cannot see the already-pirate old owner as an ordinary member and hand the
+  guild back. A candidate whose top-level faction, live for an online member and saved
+  `characters.faction_id` for an offline one, is not the guild mother's top-level faction
+  (alliance / runtime nation) is skipped: a pirate heir would immediately undo the hand-over,
+  while a same-alliance heir stays eligible. The hand-over emits the normal
   `SCExpeditionOwnerChanged` / role packets and saves like a client transfer. The 1.2 error 568
-  (`expedition_owner_cannot_change_during_siege`) is absent from both the C# and this port's
-  voluntary `ChangeOwner`; the forced path therefore bypasses it (if a 568 guard is added, only
-  the client path may apply it). The guild keeps its territory, siege registrations and nation;
+  (`expedition_owner_cannot_change_during_siege`) guards the voluntary `ChangeOwner` (Guild
+  functions); the forced path bypasses it, as a pirate conversion cannot wait for a siege. The guild keeps its territory, siege registrations and nation;
   the nation's king (`nations.owner_character_id` / `owner_name`, taken from the founding
   expedition's owner) moves to the new owner. The king is written in the same transaction as
   the expedition save (no window with king = pirate and owner = successor) and broadcast with
@@ -2323,6 +2343,10 @@ is no longer mirrored (see "Known deviations", dead NPC returned and healed).
   last-member dismissal, or the release).
   Known, not fixed: the login conversion's spawned guild removal can run after the login guild
   info was already sent (the client then shows the guild until the next refresh; score 2).
+* `CheckForDeletedCharactersDeletion`: the rename / `deleted = 1` / packets are done;
+  `DeleteCharacterAssets` (houses, guild, family, mail returns) is a later phase.
+* `GameConnection.OnDisconnect` → `UpdateLoginTime(0)` for connections that never entered (inserts
+  an `accounts` row with id 0 in C#) is skipped.
 * `CheckForDeletedCharactersDeletion`: the rename / `deleted = 1` / packets are done;
   `DeleteCharacterAssets` (houses, guild, family, mail returns) is a later phase.
 * `GameConnection.OnDisconnect` → `UpdateLoginTime(0)` for connections that never entered (inserts
@@ -3166,7 +3190,18 @@ is no longer mirrored (see "Known deviations", dead NPC returned and healed).
 * systems::instances (battlefield resurrection delay, 2026-11-05): `game_rule_sets.time_resurrection_delay` replaces the C# hard-coded 6 s wait before `OnKill` resurrects the victim. The 1.2 rows author 15 s for every rule set and 5 s for the Gladiator (28); the unit is INFERRED as seconds (the client loads the column with the rest of the rule set, `LoadGameRuleSetDescs`, but its death countdown comes from `SCUnitDeathPacket.resurrect_wait_time`). A rule set with 0 / NULL keeps the 6 s fallback. Tested by `instances::flow_tests::battlefield_resurrection_waits_the_rule_set_delay`, `gladiator_resurrection_waits_five_seconds`, `battlefield_resurrection_without_delay_keeps_six_seconds` and `instances::tests::battlefield_rule_set_loads_kill_conditions`.
 * systems::instances (instant game hardening, 2026-11-06): (1) `SCInviteToInstantGame.qualified_id` is now the game's zone instance (`zone_id << 32 | instance_id`) plus a per-game invitation counter instead of the constant `1`; `CSJoinInstantGame` and `CSEnteredInstantGameWorld` ignore a value that no longer matches the live invitation (a re-invite replaces it, a removal drops it, an expired invitation's timer only acts on its own value) and log at `debug`. What the client echoes is the invite value; no other meaning is evidenced. (2) `InstantGameManager.PlayerCanEnter` (present in the C# but never called) now gates `ApplyToBattlefield` with its existing checks (combat, instanced world, dead, tradepack, rebirth trauma, summoned vehicle) plus the C# TODO's states via the existing state: a duel (`DuelManager`), a seated juror (`JURY` buff 3621) and jail (`FORCIBLY_AWAITING_TRIAL` 3619, `PRISONER_NUIAN` 631, `PRISONER_HARANYAN` 2028); the refusal sends no packet because no 1.2 error id is evidenced. (3) The kill teleport restarts the `ZWUnitFell` fall tracker at the spawn z for the victim and (Gladiator) the killer (`FallTracker::reset_at`), so a fall from before the death cannot be measured across the respawn (`Prevent fall damage for both killer and victim on teleport`). (4) A player removed from a game unbinds its `OnKill` handler in `remove_player`, so every removal path (leave, decline, re-invite) and `DestroyInstantGame` leave no `CharacterEvents` subscription behind. (5) A game that never fills has no start expiry: only the 60 s invitation timeout exists, because no shipped rule set carries such a value (`game_rule_sets` has no such column), and none is invented. Tests: `instances::flow_tests::battlefield_stale_qualified_ids_are_ignored`, `battlefield_reinvite_replaces_the_qualified_id`, `battlefield_apply_refuses_a_duel_jury_or_jail`, `battlefield_kill_teleport_resets_fall_tracking`, `battlefield_end_unbinds_kill_events_without_an_origin_faction` and `systems::ai::collision::fall::tests::reset_at_restarts_a_fall_at_the_teleport_z`.
 * systems::instances / systems::social (RPA-09 temporary factions): duel Red / Blue team and battlefield corps factions are temporary. `UnitBase::faction_temporary` marks them, `SCUnitFactionChangedPacket.temp` is `true`, and they skip `Character.SetFaction`'s housing update, guild kick and party removal. `db_character::persisted_faction` writes the origin faction, so an autosave, logout or crash during a duel / battlefield never stores the temporary faction; the faction is also restored on duel end, battlefield leave and departure/save (`world::session::save_and_remove_from_world`). A duel applies the same temporary faction to each participant's active mates and owned slaves and restores it with the owner's (they copy the owner's faction at spawn and are not covered by `Character.SetFaction`). Tested by `duel::tests::temporary_team_factions_keep_guild_and_restore`, `disconnect_during_a_duel_restores_the_origin_faction`, `mate_and_slave_follow_the_duel_faction_and_get_it_back`, `instances::flow_tests::battlefield_entered_requires_actual_instance_and_subscribes_kills_once` and `db_character::tests::a_temporary_faction_is_never_persisted`.
-* systems::instances (tower defense): the C# command only sent packets to its caller and hard-coded zone group 5. The Rust runtime reserves controller positions from the existing NPC JSON by compact spawner membership; these controllers no longer spawn permanently. Manual controls affect the caller's instance/group. Automatic schedules are disabled by default and validate every selected event at startup. Orphan waves/targets no longer truncate later valid rows. Kill notifications use only `DoDie`, deduplicate the NPC handle and retain id-reuse semantics. Timers use monotonic real seconds; `tod` uses the accelerated game clock and day intervals count from scheduler startup. Spawn effects carry explicit event ownership for cleanup even when Unit.OwnerId is zero. Unsupported `DoodadAlmighty` targets, NPC groups without authored controller positions and reward/victory chains remain unavailable rather than being synthesized.
+* systems::instances (tower defense): the C# command only sent packets to its caller and hard-coded zone group 5. The Rust runtime reserves controller positions from the existing NPC JSON by compact spawner membership; these controllers no longer spawn permanently. Manual controls affect the caller's instance/group. Automatic schedules are disabled by default and validate every selected event at startup. Orphan waves/targets no longer truncate later valid rows. Kill notifications use only `DoDie`, deduplicate the NPC handle and retain id-reuse semantics. Timers use monotonic real seconds; `tod` uses the accelerated game clock and day intervals count from scheduler startup. Spawn effects carry explicit event ownership for cleanup even when Unit.OwnerId is zero. Unsupported `DoodadAlmighty` kill targets and spawner templates without authored positions remain unavailable rather than being synthesized (the rift waves, group sites and victory follow-ups are in the next entry).
+* systems::instances (tower defense, rift waves; observed with player bots on Crimson Rift, definition 3): the waves never reached their target and most definitions could not run.
+  * **AI settling cancelled the wave plot.** The rift summoners (`AiKind::Flytrap`, ai file 18) cast their wave plot as their `OnSpawn` skill (every 2 s, 25 tickets, `SpawnEffect` of the wave monsters). The AI walks `Spawning` -> `RunCommandSet` -> `Idle` -> `HoldPosition` within that time and the C# `Idle`/`HoldPosition` `Enter` call `InterruptSkills` (the Rust behaviors mirror them), which cancels the plot before the first tick. `ai/behaviors.rs` `interrupt_unless_event_controller` skips the interrupt for NPCs the running event owns (`tower_def::owns_npc`); every other NPC is interrupted as before.
+  * **`SpawnEffect` at a plot location.** The plots place the wave monsters through a plot `Location` target (`PlotTargetUpdateMethod` RandomArea, 15 m ring, 500 m above the landing point). The C# spawner reads the target's transform; the Rust bridge used the caster as stand-in for a position target, so the monsters appeared on the summoner. `npcs/bridges.rs` `spawn_effect` now spawns at the position (`SpawnManager::get_npc_spawner_at_pos`), on the ground below it for non-flying templates (`ground_level_for`).
+  * **Rift flight speed.** `Data/Path/razlomPPZden1-3.path` (the rifts' fly-in, ai 17) had no `Speed` action, so the path walker used the 1.0 m/s default and a rift needed 14+ minutes for its ~800 m although the first wave starts after 170 s (`tower_defs.first_wave_after`). The three files now start with `Speed|x|y|z|5` (same x/y/z as the first point): about 155-165 s, so the target reaches its stand before wave 1. The retail speed is not in the data; 5 m/s is derived from path length / `first_wave_after`.
+  * **`NpcGroup` wave spawners** (definitions 8, 28, 29, 31, 32, and 14 whose group has no positions: `npc_spawner_npcs.member_type = 'NpcGroup'`). The C# `SpawnNpcGroup` is `SpawnNpc` (the group id used as NPC template id), so nothing spawned; the spawn JSON has no group entry either, it lists every member of the group (one entry each, duplicates included) at the group's spawn site, which would have made the members permanent world NPCs. The loader (`SpawnManager::resolve_tower_groups`, data in `TowerDefData.{groups,spawner_groups,group_npcs}`) holds those entries back, treats a position whose entries are exactly an `npc_group_members` set as a group site, and registers one event spawner per member at site + `formation_offset` (rotated by the site yaw). Entries that complete no group are released as ordinary spawns (none in the shipped data). Group 143 (spawner 14344, definition 14) has no entries.
+  * **Victory follow-ups.** A definition whose `kill_npc_id` is a wave kill target of another definition (19 -> relic 13661, 20 -> relic 13647, both kill targets of wave 105 of the Golden Plains War 18; the other definitions use `kill_npc_id` to end their own event) is a follow-up: the death of that NPC in the running wave (kill count met) starts it in the same world, zone group and zone, the scheduler never starts it by clock, and the same NPC does not end it. Nothing else of a reward is synthesized (the C# had no tower defense runtime at all).
+  * **Still unavailable (no authored positions or content in the 1.2 data):** 4 (test dungeon: spawner 9880/NPC 8854 and wave NPCs 8842/8840/8841 have no position in any world file, a `DoodadAlmighty` kill target 3499), 14 (caravan escort: spawner 14460 and group 143 have no entries), 16 and 17 (fog-of-war notices: spawners 12271/12272), 21 (no target spawner, no waves), 23 (sun field test, spawner 15446), 24 (abyss entrance, spawner 15363), 25 (generic test spawner template 1), 26 (developer test, spawner 15687 and doodad 7297). Definition 33 (Mistmerrow's conflict) is absent from the compact. `/towerdef list` names the missing spawner for each.
+* systems::instances / world (2026-11-04, destroyed instances): in C# the gimmick, sphere quest, mate and transfer managers, the fish schools and the physics were members of the `WorldInstance` and went away with it. The Rust keeps them in per-instance-id tables, and nothing dropped them when a dungeon was destroyed, so the 50 ms gimmick tick (and the 500 ms sphere tick) kept calling `GetWorld` for the gone instance: `GetWorld: No such World Instance 100` was logged about 17 times a second for 4 hours (160,374 lines) after Sharpwind Mines was destroyed. `ai::gimmick::npc_gimmick` also created the gimmick registry of whatever instance an NPC stood in, even one without gimmicks. **Deviation:** `instances::worlds::remove_world` now ends with `forget_instance`, which drops those tables (gimmicks, spheres, fish schools, mates, transfers, ship physics, collision world); the gimmick and sphere ticks drop a registry whose instance is gone instead of asking for it; `npc_gimmick` and `despawn` only read the registry. `WorldManager::world` (`GetWorld`) counts every miss per instance id (`missing_lookups`) and logs a warning for the first one only (it was an error per call); the counter restarts when the id is created again, and `world_if_exists` is the quiet lookup for periodic walks. Tested by `instances::flow_tests::a_destroyed_dungeon_leaves_nothing_that_asks_for_its_instance`, `a_recycled_instance_id_starts_without_the_old_instances_registries`, `a_lookup_of_a_missing_instance_is_counted_and_logged_once` and (gated by `AAEMU_COMPACT_DB`) `real_dungeon_spawns_load_and_leave_returns_to_main_world`.
+* systems::ai (2026-11-04, instance hall floors): the NPCs of Kroloal Cradle stood about 191 m below their spawns, out of reach of a party (0 kills). The halls of the instance dungeons are models of the cell's `terrain/object.dat` / `big_object.dat` (the collision loader reads `brush.dat` and `vegetation.dat` only, see `rust/docs/physics/ZONE-PHYSICS-USAGE.md` §2.2), so the collision world has no floor there and `ground_height_probe` (2048 m deep) only finds the world template's terrain far below: the NPC spawns of Kroloal Cradle are 191-200 m above it, Howling Abyss up to 86 m, Sharpwind Mines (`instance_cuttingwind_deadmine`) 138 m, the Library 77 m, Sal Temple 50 m, Nachashgar 44 m, the Mirage Island 72 m (Burnt Castle Armory and Hadir Farm, which are terrain floors, stay within 4 m). `reference_height_in` accepted that hit for every walker step (roam, chase, return), so the first step of every walking monster dropped it to the terrain. **Deviation:** a walker's floor must now lie within `ai::npc::WALKER_MAX_DROP` (12 m) below its current level, for the probe and for the navmesh / heightmap fallback alike; a deeper floor is no floor, and the navmesh height (`GeoDataMode`, what the C# `GetReferenceHeight` returns) decides next, else the walker keeps its level. The hall floor model itself is still not part of the collision world: leaps, in-place resurrection (`GetResurrectablePosition`), doodad / plot / housing ground snaps and fall detection in these halls still use `ground_height` and can find the terrain; they are not changed here. Tested by `ai::npc::npc_height_tests::{hall_walker_does_not_drop_to_the_terrain_far_below, walker_steps_down_a_ledge_but_not_to_a_floor_beyond_the_drop_limit, hall_walker_takes_the_navmesh_height_when_the_terrain_is_far_below}` and (gated by `AAEMU_GAME_PAK`) `ai::collision::real_data_tests::real_instance_walkers_keep_the_floor_of_their_hall`, which resolves every NPC spawn of eight instance worlds against the real navmesh.
+* systems::instances (2026-11-04, dungeon request refusals): the C# `RequestDungeonInstance`, `RequestSystemInstance` and `CreateSystemInstance` refused a request for an unknown zone, a zone without a world or a dungeon entry, and a dungeon the server could not build (no zone keys, no world template, `CreateWorldInstance` failing) without sending anything, and `DoodadFuncEnterInstance` dropped the use of a character in a court case the same way; the 1.2 client shows nothing then and the door looks dead. **Deviation:** each of these refusals now sends `SCErrorMsg` (`NO_SERVER_INSTANCE_RESOURCE` 253 for the data and resource cases, `CANNOT_USE_PORTAL_IN_TRIAL` 611 for the court case) and logs a warning. The entry rules already answered: the entry limit (`enter_count` entries per 4 hours) sends `INSTANCE_VISIT_LIMIT` 453 (checked against the 1.2 `ui_texts`), level 470, party 671, capacity 471, the ticket item 632; the notification bytes of 453 are pinned by a test. Tested by `instances::flow_tests::{an_entry_over_the_visit_limit_is_answered_with_the_visit_limit_error, every_refused_dungeon_request_is_answered}`; the court-case answer has no test (a trial cannot be set up from the instances tests).
+* systems::instances (2026-11-04, silent dungeon door): a party member that died, respawned and cast the Kroloal Cradle entrance skill 18701 four times (and again 11 minutes later) produced a `StartSkill` line, never `DoodadFuncEnterInstance`, and no error. The live log of that session is not available here, so the exact trigger could not be reproduced; the silent paths of the entry flow that can produce it were found by reading the flow and are fixed, each with a test. (1) `request_dungeon_instance` step 1 returned `true` without a packet when the dungeon's character table listed the character. The C# calls `Dungeon.AddPlayer` there, which moves the member into the dungeon again ("Most likely an error in logic?"). A registration can outlive the move out of the dungeon (an earlier session of the same character that was not cleaned up, a transform that left the instance without the table following), and then the door never worked again for that character. (2) `Operation::enter` drops a use that meets another thread's reservation of the doodad (the C# `Doodad.Use` waited on its lock); a dropped use of an instance door gave no answer. (3) `DoodadFuncExitIndun` ignored the `false` of `request_leave_instance` (the character is in no instance's table), so the exit door of such a character was dead too. (4) `queue_player` of a dungeon destroyed in between returned `false` unannounced. **Deviation:** a table entry only counts when it is this very character standing in the instance (`rejoin_member`): an entry of another session or one the character's transform no longer backs is dropped and the character goes through a normal admission (no second entry is charged for a run it was admitted to), a character really inside is moved to the entrance again like the C# does (one event subscription per event); a busy instance door answers `TRY_LATER_INSTANCE`; an exit door for a character in no table returns it to the main world when its transform stands in an instance and answers `INVALID_RETURN_POS_INSTANCE` otherwise; a destroyed dungeon answers `TRY_LATER_INSTANCE`. A refused client cast of a doodad is logged at info with the result code (it was a debug line), so the next report shows the reason. Not changed: a cast the skill validation refuses (range, cooldown, a target in another instance) is still answered by the `SCSkillStarted` result code only, as before. Tested by `instances::flow_tests::{a_stale_dungeon_registration_does_not_swallow_the_door, a_member_inside_who_asks_for_the_door_is_moved_in_again_once, the_registration_of_an_earlier_session_does_not_block_the_new_one, an_exit_door_answers_a_character_no_instance_lists, a_busy_instance_door_tells_the_player_to_try_again}`.
 * systems::instances (dungeons/mentoring): replaces the mirrored double entry-item charge and unsafe dungeon destruction below. Each character pays once per run; re-entry is free, capacity counts pending admissions, and creation obeys `World.MaxInstances` including concurrent requests. Empty owner/leader resets remove the whole run binding; destruction cancels its loader and returns occupants before removing their world. Party join grants access without inserting a player into another world's object table. Mentor eligibility is captured at boss death for nearby living party members with complementary active quests, rechecked during interactions, and bound to selected chest participants. Four explicit 1.2 quest/chest bindings are verified by a gated real-data test. Missing reward chests use the authored templates at the boss position (two metres apart for the two-chest dungeons); this placement fallback and qualification policy are emulator extensions, not claimed native-server execution parity. Authored phases grant seal items through existing inventory/quest hooks and daily persistence; Gilda is not issued directly by mentoring.
 * systems::instances (2026-10-21, `CSInstanceLoaded` re-file): the reference 1.2 C# had the same gap - `LeaveDungeonInstance` / `LeaveSystemInstance` changed the transform and sent `SCLoadInstancePacket`, but `CSInstanceLoadedPacket` only sent `SCUnitStatePacket` and the time of day, so the client's emptied world stayed bare until the next move ran `Transform.FinalizeTransform` -> `AddVisibleObject`. Rust's `worlds::instance_loaded` now leaves the old instance's region grid (keeping the stale removal of its objects) and adds the character to the arrival instance's visibility grid, which sends the units / doodads / players in view and shows the character to them at once. A later C# commit (`ef0d41982`) fixed the same gap with `Transform.FinalizeTransform()` plus `ResendVisibleObjectsToCharacter(me, clientDroppedVisibility: true)`; that unconditional repaint could resend states, so Rust re-files through `add_visible_object`, which does nothing when the character is already filed in that region (a repeated `CSInstanceLoaded` or the next move sends nothing new). Tested by `instances::flow_tests::instance_return_refiles_character_and_sends_main_world_objects_without_movement`.
 * systems::instances (racing packets, 2026-11-05): `SCRaceCond` 0x1f6, `SCRacing` 0x1f7 and `SCRacingResult` 0x1f8 are defined from the 1.2 client readers (`FUN_397b88d0`: u8 rc, u32 type, u32 after; `FUN_397b8950`: u8 rc, u32 record, i32 v1; `FUN_397b0340`: i32 count, then `min(count, 10)` x {u32 type, u32 record} through `FUN_397a8870`), byte-exact tested. Nothing sends them yet: no 1.2 CS racing packet or join/leave Lua call exists, `race_track_shapes` carries no coordinates, and the meaning of `after` / `v1` / `record` is INFERRED only, so the race manager (WP-R2) and rank board (WP-R3) stay capture-pending (CAP-RACE-1). `SCRacingResultPacket` truncates to the 10 rows the client reads and warns. The C# had only the three opcode constants, no packet classes. The types stay in the opcode-coverage never-sent baseline until a sender lands.
@@ -5697,7 +5732,7 @@ Deviations from the 1.2 C# `ExpeditionManager` / `TeamManager`, which trusted ev
   now also require the caller's role to be strictly higher than the target's current role, so the
   leader (255) can neither be expelled nor demoted, and equals cannot act on each other. The
   client `Kick` packet keeps this guard; `Character.SetFaction`'s guild removal does not go
-  through it (see `remove_member_for_faction_change` above), so an owner can still leave on a
+  through it (see `leave_forced` above), so an owner can still leave on a
   faction change without allowing a client self-kick.
 - `ChangeLootingRule` accepted any character id as loot master. It must now be 0 or a member of the
   team; otherwise only that field is ignored (logged). Over-head markers are unchanged: their
@@ -5705,7 +5740,9 @@ Deviations from the 1.2 C# `ExpeditionManager` / `TeamManager`, which trusted ev
 - `ChangeExpeditionRolePolicy` required the editor's `Expel` flag and copied only `Name`, `Invite`,
   `JoinSiege`, `Promote` and `Expel`, so an edit silently dropped `DominionDeclare`, `Dismiss`,
   `Chat`, `ManagerChat` and `SiegeMaster` from the stored policy and the broadcast (the 1.2 packet
-  carries all nine flags). The Rust stores the whole policy and follows the 1.2 client's
+  carries all nine flags). The Rust first stored the whole policy; the later "Guild functions
+  (2026-11-05)" evidence (the 1.2 role-policy tab edits only the five dialog fields) supersedes
+  that: the other four keep their stored value now. It follows the 1.2 client's
   role-policy tab instead of the C# right: `expedition_management.alb` decorates each policy with
   `SET_POLICY = (role == 255)`, and `expedition_management_role_policy_tab.alb`'s
   `CanChangePolicy` requires that flag plus a lower target role. Only the owner may edit, and the
@@ -5776,6 +5813,158 @@ Error codes (all to the invitee unless noted; ids are the 1.2 `ErrorMessageType`
 The C# TODO codes 71 (`TEAM_LOADING`) and 77-to-the-invitee are no longer used. The 10.x
 community server (a reimplementation, not an oracle) sends 79 to the invitee when the inviter is
 in another team and 82/77 in the same split, which agrees with the inferred mapping.
+
+## Guild and party fixes (2026-11-04)
+
+Found by the player bots (`aaemu-playerbots`, guild / party scenarios) and reproduced in flow
+tests (`systems/social/flow_tests.rs`). The 1.2 client's `ui_texts` carry the text of every
+`ErrorMessageType` used below (key = the C# enum name in upper case), which is where "the right
+error" comes from; there is no retail oracle for which code the original server picked, so each
+is the closest text.
+
+- **Hard disconnect = clean leave socially.** The C# `OnDisconnect` never logged the character out
+  of its guild / family: guild members saw it online for ever, `last_leave_time` stayed at the
+  login time, the family kept the dead `Character`, and the dead session stayed in every chat
+  channel (so a party / guild / zone channel never became empty). `world::session::on_disconnect`
+  now runs `social::session::on_leave_world` (chat channels, family logout, pending guild
+  invitation, guild logout with the `SCExpeditionMemberStatusChanged` to the guild, which is also
+  what `leave_world_task` runs) and sets `leave_time`, for a character that still is the live
+  world entry. Kicks and server-side drops end in the same `on_disconnect`.
+  A connection keeps its `active_char` after a leave, so a later disconnect of a session that
+  already left is skipped (the character may be online on a newer session). Friends and the team
+  were already covered by `set_online(false)`. Not covered: the panic fallback
+  `force_release_connection` (only removes the world entry) and the GM `/disconnectme`, which
+  detaches the character on purpose like the C# (it stays in the world as a ghost).
+- **Guild leader cannot leave.** `ExpeditionManager.Leave` had no owner check, so the guild was left
+  without a role-255 member. The leader now gets `EXPEDITION_OWNER_CANNOT_LEAVE` (310, "you can
+  leave after delegating the leader position"); it must hand the guild over (`ChangeOwner`) or
+  dismiss it. A character that is not in a guild gets `ONLY_EXPEDITION_MEMBER`. (Deleting the
+  leader's character was already refused in the lobby.)
+- **Party invitations expire and die with a session.** The 60 s timeout the C# only applied when the
+  *answer* arrived is now also enforced by the 500 ms tick (`TeamManager::expire_invitations`; the
+  inviter gets `INVITATION_CANCELED_TIMEOUT`), an expired invitation no longer blocks a new
+  invitation of the same target, and `TeamManager::set_offline` (every way of going offline)
+  drops the invitations the character sent (their targets get `TEAM_INVITOR_OFFLINE`) and
+  received. Answering an invitation that is gone gets `TEAM_JOIN`; a late answer gets
+  `INVITATION_CANCELED_TIMEOUT` (and the inviter the usual `SCRejectedTeam`).
+- **Team chat on every join / leave path.** A member joining an existing team joins the raid (not
+  a party) and its party chat channel. `AskRiskyTeam` made the *acting unit* leave the channels,
+  so the kicker lost its party chat while the kicked member kept hearing it; the member that
+  leaves / is kicked leaves them now (before it is removed, the slot names its party).
+- **One team at a time.** Accepting an invitation while in a team is refused with `TEAM_JOIN_ALONE`
+  (the invitee) and `TEAM_INVITEE_IN_TEAM` / `TEAM_INVITEE_MEMBER` (the inviter); the invitation
+  itself is refused up front for such targets. The team of an invitation is the inviter's own
+  (the C# trusted the client's team id, so a member sending team id 0 invited without the
+  owner's right, and a stale id could name somebody else's team); a client team id naming another
+  existing team is `TEAM_NO_RIGHTS`.
+- **Feedback instead of silence.** Party: unknown / offline invitee `TEAM_INVITEE_OFFLINE`, yourself
+  `TEAM_YOURSELF`, not the owner (or marker of a raid) `TEAM_NO_RIGHTS`, full team `TEAM_FULL` to
+  the inviter (at the invitation, and again at the answer to both sides; an area invitation says
+  it once). Guild invite: not in a guild `ONLY_EXPEDITION_MEMBER`, role without the Invite right
+  `FACTION_INVITE_RIGHTS`, offline / unknown name `FACTION_INVITE_OFFLINE`, yourself
+  `FACTION_INVITE_SELF`, same guild `FACTION_INVITE_SAME`, another guild
+  `EXPEDITION_OTHER_EXPEDITION`, and a target that is
+  deciding on another invitation `EXPEDITION_OTHER_INVITATION` (the C# overwrote it; a pending
+  guild invitation now blocks a second until it is answered or expires). Guild reply: no / wrong
+  invitation `FACTION_JOIN_NO_INVITOR`, expired `INVITATION_CANCELED_TIMEOUT`, already in a guild
+  `EXPEDITION_ALREADY_MEMBER`, disbanded guild `FACTION_JOIN` (a disbanded guild stays in the
+  list, the C# let the reply join it); a refusal tells the inviter `FACTION_INVITE_REJECTED`.
+  Guild kick: not in a guild `ONLY_EXPEDITION_MEMBER`, no Expel right or not a higher rank
+  `FACTION_KICK_RIGHTS`, not a member `EXPEDITION_NO_TARGET` (a character "kicking" itself, as
+  `Character.SetFaction` does, stays silent).
+- Not changed here (silent as in the C#; fixed afterwards, see "Guild functions (2026-11-05)"):
+  the other guild management failures (`ChangeOwner`, `ChangeMemberRole`,
+  `ChangeExpeditionRolePolicy`, `Disband`), the nation / dead-target checks of a guild invite, and
+  the SetFaction removal described under "C# bugs noticed".
+
+## Guild functions (2026-11-05)
+
+The remaining guild (expedition) functions, found by comparing the C# with the 1.2 client's UI
+(`x2ui/expedition`, `dialoghandler`, the mirrored validators in `x2game12.c`). Error codes are
+`ErrorMessageType` values whose texts the client's `ui_texts` carry. Flow tests:
+`systems/social/guild_flow_tests.rs`; live suite `rust/verify/guild-funcs.vtest`.
+
+- **Rename (`CSRenameExpedition`, C#: logged only).** The C# never sent `SCExpeditionShowRenameUI`
+  and the data has no rename item, skill or cost, so the right is a server policy: the column
+  `expeditions.allow_change_name` (also sent as `SystemFaction.allow_change_name`, written as 0
+  before) says the leader may rename once. A GM grants it (`/allowguildrename <guild id | name>`):
+  the leader gets `SCExpeditionShowRenameUI` at once if online, else at its next login
+  (`prompt_rename_if_allowed` in `NotifyInGame`), and every client gets the faction record again
+  (`SCFactionList`). The leader sends `CSRenameExpedition {id, name, true}`: not in a guild 808,
+  not the leader of that guild 807, no pending right 32 (`FACTION_RIGHTS`; the nation variant
+  `is_expedition = false` gets 32 as well, its own rename stage owns it), a pending right but no
+  `SCExpeditionShowRenameUI` offer (a forged packet) 307 (`EXPEDITION_BAD_STATUS`, the server-side
+  guard from "Guild rename"), a name that breaks the
+  rules reopens the client's dialog with `SCFactionRetryRename(true, code, name)`. Success: name
+  saved, right cleared, `SCFactionRenamed(id, name, by_gm = false)` to every online player (the
+  client renames its faction record, clears its own flag and refreshes name plates) and the guild
+  chat channel is renamed. `/renameguild <guild id> <new name>` renames directly with
+  `by_gm = true` (the right stays). Both commands are access level 100 and apply the create
+  rules. The name rules are one function (`validate_name`) for create and rename, in the client's
+  order: UTF-16 length > 32 `EXPEDITION_NAME_LENGTH` 297, the configured regex
+  `EXPEDITION_NAME_CHARACTER` 296, the character-name block list (`blocked_texts.check_name`, as
+  the lobby applies it) `EXPEDITION_NAME_BADLIST` 298, a name another live guild uses
+  (case-insensitive; dismissed `$deleted-` guilds do not count) `EXPEDITION_NAME_EXIST` 299. The
+  C# only had the first, second and an exact-match duplicate check (dismissed guilds included).
+- **ChangeOwner (C#: silent).** Not a member 808; caller not the leader 32; to oneself 327
+  (`EXPEDITION_CHANGE_OWNER_SELF`); to somebody outside the guild 328; during a siege 568
+  (`EXPEDITION_OWNER_CANNOT_CHANGE_DURING_SIEGE`, the same siege test the dismissal uses).
+- **ChangeMemberRole (C#: silent).** Not a member 808; no Promote right, a target not strictly
+  below the caller, a new role not strictly below the caller, a new role without policy or the
+  leader's 255: 70 (`FACTION_CHANGE_MEMBER_ROLE_RIGHTS`); unknown target 309
+  (`EXPEDITION_NO_TARGET`).
+- **ChangeRolePolicy.** The C# let anybody with the Expel right edit any role's policy (a
+  Commander could edit the General's or its own). Now only the leader edits, and only roles below
+  255 that exist, a packet naming another guild is refused, all with 70; a role name that fails
+  the guild name regex / length 296. The 1.2 dialog edits the name and the invite / expel /
+  promote / siege-join flags only (`role_policy_tab_view.lua`), so the other flags keep the stored
+  value and the **stored** policy is what every member is sent (the packet's flags were
+  broadcast before).
+- **Invite.** A target of another top-level faction (the guild mother's alliance, with the
+  runtime nations overlaid; the character's **saved** faction, so a duel / battlefield temporary
+  faction is ignored, NATION-13/14) 304 `EXPEDITION_BAD_FACTION`; a dead target 307
+  `EXPEDITION_BAD_STATUS`; a target in a battlefield (instant game) 783
+  `FACTION_INVITE_BATTLEFIELD`. The C# returned silently. (The battlefield check has no flow
+  test: there is no light fixture for an instant game.) A blocked inviter is still dropped
+  silently before these replies (BLOCK-LIST-1).
+- **Create.** The C# dropped `CSCreateExpedition.id` and used the owner's faction as the guild's
+  `MotherId`. Now the sponsor faction is honored: valid sponsors by the owner's alliance are Nuia
+  (148): 101, 102, 103, 105, 106, 107; Haranya (149): 108, 109, 110, 111, 113; outlaws (114):
+  161 (the dialog's list); another sponsor 321 (`EXPEDITION_CREATE_FACTION`, "wrong sponsor");
+  0 (a client that sends none, the bots) keeps the owner's faction as before. It becomes
+  `expeditions.mother`. The sponsor list is chosen by the owner's **saved** faction (a
+  temporary duel / battlefield faction does not count, NATION-14), and its alliance is the
+  static `MotherId`. The readers of the guild's `mother_id` still work for a sponsor of the
+  alliance: the fort owner faction (`dominion/fort.rs`) just takes the sponsor, and
+  `Character.SetFaction`'s test compares **alliances** now (it compared the exact faction, so a
+  change inside the alliance expelled from a guild founded under the old faction). A party member
+  of another top-level faction (nation overlay, NATION-13; saved faction, NATION-14) is 320
+  (`EXPEDITION_CREATE_MEMBER_FACTION`; the C# sent 321). Party members
+  that are offline are skipped, neither joining nor counting towards `PartyMemberCount` (the C#
+  added them as members marked online).
+- **Disband.** An owned territory is 301 (`EXPEDITION_OWNER_DISMISS`; was a chat line), a
+  registered / running siege 469 (`EXPEDITION_DISMISS_IN_SIEGE`), a non-leader 807 as before. The
+  dismissed guild still stays in the list as `$deleted-guild-N` (as in the C#), but
+  `faction_chunks()` (`SCFactionList` at login) skips it.
+- **Faction change (`Character.SetFaction`).** The C# called `Kick(p, p)` / `MemberRemoveFromTeam(p,
+  p, Kick)`, which need the Expel right and a higher rank / the party owner, so an ordinary member
+  was never removed. Now a forced leave without any right check (`expedition::leave_forced`;
+  `SCUnitExpeditionChanged` with `expel = false`, same broadcasts and saves as a voluntary
+  leave) and the party leaves through `LEAVE` instead of `KICK` (looked up by membership, not
+  `in_party`, so the login infamy conversion is covered). The guild is left when the new faction
+  belongs to **another alliance** (`alliance_id` of the mother, so a change inside the alliance
+  stays). The guild **owner** follows the owner decision of 2026-11-03 (PIRATE-1): the leadership
+  first passes to the highest-`role` remaining member whose faction is still the guild mother
+  (ties: the lowest `character_id`, the stable stand-in for the longest membership; the join date
+  is not stored), the old owner is removed in the same write section, and the guild keeps its
+  castle and nation (the nation's king moves with the hand-over). Only an owner who is the last
+  eligible member dismisses the guild, then releasing its dominion / cancelling its siege. A
+  member with the leader role but a different recorded owner uses the upstream rule instead: the
+  guild goes to the highest-ranked member (ties: first in the member list) and the guild of a sole
+  member is dismissed even if it owns territory or is in a siege. The temporary battlefield / duel
+  factions (RPA-09) are untouched.
+- Not done (out of scope): the nation packets (0x015-0x019), the beginner expedition (CS 0x010 has
+  no opcode), guild chat `chat` flag enforcement, member memo, guild level / summon.
 
 ## Client skill cast authority (2026-10-20)
 
@@ -6250,6 +6439,50 @@ container accepts it (the same `can_accept` / `SplitOrMoveItem` path as `CSSwapI
 does the player equipping something else into the back slot. A pack lost while the character is
 dead keeps the record until `resurrect_character`. The explicit `SCUnitEquipmentsChangedPacket`
 broadcast in `put_down_backpack` is gone (the equipment events broadcast leave and re-equip).
+
+## Dropped trade packs, crop seeds, `zonestate` and request logging (2026-11-04)
+
+- **A put-down or dropped trade pack expires and takes the item with it.** The lifetime is data:
+  the backpack doodad of `PutDownBackpackEffect.BackpackDoodadId` has a `DoodadFuncFinal` whose
+  `After` is 518,400,000 ms (6 days) for 254 of the 335 doodads that put-down effects name (the
+  others 1 s to 1 day; templates 3059, 3304, 7000, 7001 and 7002 have none and never expire;
+  seven effects name templates that are not in the data and no item uses them). The final task
+  survives a restart (`phase_time` is saved and `override_phase_time_ms` restores the remaining
+  time, a pack that ran out while the server was down is deleted at startup). What did not work
+  was the cleanup afterwards: the "cargo" retention in `bridges::cleanup_doodad_escrow_item`
+  (kept for the escrow of cargo that is still in use) also kept the item of an expired put-down
+  pack, so every expired pack stayed in the owner's System container for good. The C#
+  (`Doodad.Delete`, "Delete associated item if expired") removed any item whose holding container
+  is none or System. Now a doodad whose template is a put-down backpack doodad
+  (`is_put_down_backpack_doodad`) is not retained, provided the existing escrow checks hold (the
+  item is the unique matching singleton in the owner's System container, not a rack or slave
+  item) and no other live doodad still references the item (`item_referenced_by_live_doodad`).
+  Picking the pack up again (`RECOVER_ITEM`) moves the item out of System first, so it is not
+  deleted. Packs that earlier sessions already orphaned in System containers are not
+  reconciled. If `spawn_backpack_doodad` fails, the pack stays in System, as in the C#.
+- **A crop harvest does not always return the seed (not a bug).** The loot packs of crops
+  (6452, 6453, 6472, ...) give the crop (2 to 4) in group 1 and put the seed and the "fine" crop
+  behind `loot_actability_groups` rows with `max_dice` 355 (seed) and 345 (fine) on a 0..9999
+  roll, so about 3.6 % of harvests return the seed and 3.5 % the fine crop (`LootRate` and
+  `actability_exp_multiplier` are 1.0). `loot::generate_pack_v2` is the C# `GeneratePackNewV2`
+  and agrees with the data; the unit tests pin both the algorithm and, against the real
+  `compact.sqlite3`, the rates.
+- **`zonestate` parses the state case-insensitively and rejects unknown input (deviation).** The
+  C# used `Enum.TryParse(args[0], out ZoneConflictType)`, which is case-sensitive, and an
+  unparsable argument silently left the state at Tension, so `zonestate war` set Tension. Now the
+  name (any case) or the number 0 to 7 is accepted and anything else answers
+  `Unknown zone state '<arg>'. Valid states: Tension (0), Danger (1), ...`.
+- **Routine request traces are `debug`, not `warn`.** The C# logged the receipt of many
+  packets with `Logger.Warn`, which the port copied. The ones for actions that normally succeed
+  are now `debug!`: planting and placing a doodad (`CreateDoodad, Id:`, `<name> is placing a
+  doodad`, so the blood stain of a death is quiet too), `ChangeDoodadData/Phase`,
+  `SaveDoodadUccString`, coffer requests, the auction requests (`Post` was labelled
+  `AuctionMyBidList` through a copy-paste, it is `AuctionPost` now), specialty / store /
+  `SetCraftingPay` / item secure / cash shop requests, `CancelTrade`, `StartInteraction`,
+  `SelectInteractionEx` and `TeleportEnded`. A refused request (not allowed, unknown template, no
+  auctioneer in range, invalid item id, ...) stays at `warn`. `test_support::capture_events` is the
+  capture helper of the regression tests for this.
+  The traces of the instance and quest packets are left to the owners of those areas.
 
 ## Glider deploy gate and the gliding error codes (2026-10-31)
 
@@ -6874,6 +7107,19 @@ replaces), so a cancellation cannot close another invitation of the same popup t
 
 INFERRED: that the original server sent this packet on these server-side timeouts (the client
 handler is EVIDENCED; the original send sites are not). Capture-pending: none assigned.
+
+## Stealth capture-pending (2026-11)
+
+* **STEALTH-C** `SCUnitState` character flag bit 5 (`0x0020`, GM invisible). The C#
+  `SCUnitStatePacket.Write` set bit 5 from `character.Invisible`, but the 1.2 client side is
+  unproven: `OnUnitState` (`FUN_391d4c30`) applies the parsed state through `FUN_391b90a0`,
+  which is a thunk in the x2game decompile, and no reader of the flags byte's bit 5 was located.
+  Bit 3 (force attack) is verified (`397c9480` -> `398a1f90` -> unit+0x3bbc); `SetInvisible`
+  writes unit+0x3bbb, but nothing in the decompile shows it coming from the state flags. The Rust
+  keeps writing only bit 3 (`world/unit_state.rs`), so a late observer of a GM who toggled
+  `/invisible` still sees the GM until the next `SCUnitInvisible` broadcast, and `unit.invisible`
+  is not persisted across a relog. Capture with the original client (GM `/invisible`, second
+  client enters view / relogs) before setting bit 5.
 
 ## Review findings (documented, not fixed)
 

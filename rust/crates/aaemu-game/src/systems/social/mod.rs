@@ -60,6 +60,8 @@ mod flow_tests;
 #[cfg(test)]
 mod friend_flow_tests;
 #[cfg(test)]
+mod guild_flow_tests;
+#[cfg(test)]
 mod manager_tests;
 #[cfg(test)]
 mod nation_stage4_tests;

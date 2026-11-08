@@ -1252,7 +1252,7 @@ impl ItemSkillHooks for EconomyForSkills {
         let inv = Inv::of(player);
         // The economy operation lock serialises item moves, so this count cannot change before
         // the debit below: a missing reagent consumes nothing.
-        if inv.items_count(template_id, -1) < amount {
+        if inv.items_count_unlocked(template_id, -1) < amount {
             return Some(false);
         }
         let consumed = inventory::consume_item(
@@ -1334,7 +1334,7 @@ impl ItemSkillHooks for EconomyForSkills {
         let mut txn = ItemTxn::begin(server);
         let inv = Inv::of(player);
         // Match both the availability check and Inventory.ConsumeItem's container set.
-        if inv.items_count(template_id, -1) < amount {
+        if inv.items_count_unlocked(template_id, -1) < amount {
             return None;
         }
         let snapshots: Vec<_> = [slot_type::INVENTORY, slot_type::EQUIPMENT, slot_type::BANK]
@@ -3312,12 +3312,46 @@ impl crate::systems::npcs::hooks::EconomyBridge for EconomyForNpcs {
     }
 }
 
+/// Whether `template_id` is the doodad a trade pack turns into when it is put down or dropped on
+/// death (`PutDownBackpackEffect.BackpackDoodadId`). Its item sits in the owner's System
+/// container only for as long as the doodad stands, and the doodad's expiry
+/// (`DoodadFuncFinal.After`, 6 days for most packs) is what ends the pack's life.
+fn is_put_down_backpack_doodad(server: &GameServer, template_id: u32) -> bool {
+    server
+        .game_data
+        .systems
+        .skills
+        .effects
+        .get(&EffectKind::PutDownBackpackEffect)
+        .is_some_and(|effects| {
+            effects.values().any(|e| {
+                matches!(e, EffectTemplate::PutDownBackpack { backpack_doodad_id, .. }
+                    if *backpack_doodad_id == template_id)
+            })
+        })
+}
+
+/// Another live doodad that still references `item_id` (a duplicate of the expired doodad).
+fn item_referenced_by_live_doodad(server: &GameServer, item_id: u64) -> bool {
+    server.world.worlds().iter().any(|world| {
+        world.all_doodads().iter().any(|d| {
+            let d = d.data();
+            !d.phase.deleted && d.item_id == item_id
+        })
+    })
+}
+
 /// Original rack references cannot authorize destruction after GUID reuse, regardless of the
 /// current item's class. Other doodads may remove only a unique, matching singleton in their
 /// original character owner's System escrow. Bag/equipment/bank, loose, foreign and mismatched
 /// items are retained. These checks establish escrow authority, not an allocation generation.
 /// Cargo/ambiguous item references and all saved container references still need reconciliation;
 /// these synchronous hooks do not prove absence of unloaded aliases or collect those orphans.
+///
+/// Exception: a put-down / dropped trade pack. Its doodad is the pack's only reference (the
+/// escrow check below still has to hold), so when it expires the pack goes with it, as in the C#
+/// (`Doodad.Delete`: "Delete associated item if expired"). Retaining it left every expired
+/// pack behind in its owner's System container for good.
 fn cleanup_doodad_escrow_item(
     txn: &mut ItemTxn<'_>,
     source: crate::systems::npcs::hooks::DoodadItemCleanup,
@@ -3346,8 +3380,12 @@ fn cleanup_doodad_escrow_item(
         ),
         _ => false,
     };
+    let dropped_pack = !rack
+        && source.owner_type != doodad_owner_type::SLAVE
+        && is_put_down_backpack_doodad(server, source.doodad_template_id)
+        && !item_referenced_by_live_doodad(server, source.item_id);
     if rack
-        || cargo
+        || (cargo && !dropped_pack)
         || source.owner_type == doodad_owner_type::SLAVE
         || !matches!(
             source.owner_type,
@@ -3734,7 +3772,7 @@ impl crate::systems::housing::hooks::HousingEconomyHooks for EconomyForHousing {
         let mut txn = ItemTxn::begin(server);
         let bag = Inv::of(player).bag();
         let mut bag = lock(&bag);
-        if count <= 0 || bag.items_by_template(certificate, -1).1 < count {
+        if count <= 0 || bag.items_by_template_unlocked(certificate, -1).1 < count {
             return false;
         }
         bag.consume_item(item_task::BUY_HOUSE, certificate, count, None, &mut txn.env) == count
@@ -3792,8 +3830,11 @@ impl crate::systems::housing::hooks::HousingEconomyHooks for EconomyForHousing {
             if item.has_flag(crate::models::item::ITEM_FLAG_SECURE) {
                 return Err(HouseConstructionError::ItemLocked);
             }
-            let bound = bag.items_by_template(BOUND_TAX_CERTIFICATE, -1).1.max(0);
-            let unbound = bag.items_by_template(TAX_CERTIFICATE, -1).1.max(0);
+            let bound = bag
+                .items_by_template_unlocked(BOUND_TAX_CERTIFICATE, -1)
+                .1
+                .max(0);
+            let unbound = bag.items_by_template_unlocked(TAX_CERTIFICATE, -1).1.max(0);
             (bound, unbound)
         };
         if total < 0 {
@@ -4540,3 +4581,7 @@ pub fn install(server: &GameServer) {
 #[cfg(test)]
 #[path = "cargo_flow_tests.rs"]
 mod cargo_flow_tests;
+
+#[cfg(test)]
+#[path = "pack_expiry_tests.rs"]
+mod pack_expiry_tests;

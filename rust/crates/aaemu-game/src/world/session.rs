@@ -989,6 +989,8 @@ pub fn notify_in_game(server: &GameServer, conn: &mut GameConnection) {
                 .guild_chat(e.faction.id, &e.faction.name, &server.ids.chat)
                 .join(&p);
         }
+        // A granted guild rename is still pending: show the leader the dialog again.
+        crate::systems::social::expedition::prompt_rename_if_allowed(server, &p);
     }
     // Connection.ActiveChar.UpdateGearBonuses(null, null)
     crate::systems::skills::stats::update_gear_bonuses(server, &p, None, None);
@@ -1486,46 +1488,9 @@ pub async fn leave_world_task(
             p,
             crate::systems::vehicles::slaves::attach_reason::PREFAB_CHANGED,
         );
-        server.chat.leave_all_channels(p);
-        // Handle Family
-        crate::systems::social::session::on_leave_world_family(server, p);
-        // A pending guild invitation does not outlive the invited character's session.
-        server
-            .expeditions
-            .invitations
-            .lock()
-            .expect("expedition invitations poisoned")
-            .remove(&p.character_id);
-        // A guild or nation rename offer dies with the session too.
-        server.expeditions.clear_rename_offer(p.character_id);
-        server
-            .systems
-            .social
-            .nations
-            .clear_rename_offer(p.character_id);
-        let (exp, id) = {
-            let c = p.data();
-            (c.unit.expedition_id, c.id)
-        };
-        if exp != 0 {
-            if let Some((member, members)) =
-                server
-                    .expeditions
-                    .logout_member(exp, id, Utc::now().timestamp())
-            {
-                send_to_expedition(
-                    server,
-                    &members,
-                    &SCExpeditionMemberStatusChangedPacket { member, flag: 0 },
-                );
-            }
-            if let Some(e) = server.expeditions.get(exp) {
-                server
-                    .chat
-                    .guild_chat(e.faction.id, &e.faction.name, &server.ids.chat)
-                    .leave(p);
-            }
-        }
+        // Chat channels, family and guild logout, pending guild invitation and rename
+        // offers (shared with a hard disconnect, `on_disconnect`).
+        crate::systems::social::session::on_leave_world(server, p);
         crate::systems::services::premium::remove_grade_buffs(server, p);
         delete(server, p);
         // BuyBackItems.Wipe (+ the economy's per-character state)
@@ -1684,6 +1649,19 @@ pub async fn on_disconnect(server: &GameServer, conn: &mut GameConnection) {
     crate::systems::services::premium::remove_grade_buffs(server, &p);
     crate::systems::economy::on_disconnect(server, &p);
     server.chat.leave_user_channels(&p, &server.ids.chat);
+    // A character that still is the live world entry has not been through `leave_world_task`
+    // (a connection keeps its `active_char` after a leave): its social logout is still to do.
+    let live_now = server
+        .world
+        .character_by_obj_id(p.obj_id)
+        .is_some_and(|live| Arc::ptr_eq(&live, &p));
+    if live_now {
+        // The same social logout as `leave_world_task` (the C# disconnect had none: guild and
+        // family members kept seeing the character online and its channels kept the dead
+        // session): chat channels, family, guild status + `last_leave_time`, invitations.
+        p.data().leave_time = Utc::now().timestamp();
+        crate::systems::social::session::on_leave_world(server, &p);
+    }
     if p.data().is_online {
         set_online(server, &p, false);
     }

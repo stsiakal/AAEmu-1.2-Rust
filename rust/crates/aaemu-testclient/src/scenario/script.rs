@@ -64,6 +64,7 @@
 //! rawcsend <opcode hex> <body hex>   send it without draining (the caller asserts the reply)
 //! rawcswait <opcode hex> <body hex> <PacketName> [secs]
 //!                                    send it and fail unless that packet answers (default 5 s)
+//! targetpeer [name]                 select the peer (GM commands that act on the target)
 //! pkill [name]                       `/kill` with the peer targeted (GM)
 //! await <Event> [secs]               wait (60 s default) for a party/guild event and consume it
 //! partyinvite <name>                 CSInviteToTeam (party) by character name
@@ -78,7 +79,7 @@
 //! ginvite [name]                     CSInviteToExpedition to the peer
 //! gaccept                            wait for the guild invitation and join
 //! greply <faction id> <0|1>          CSReplyExpeditionInvitation without waiting for an invite
-//! grename <name>                     CSRenameExpedition for our tracked guild id (is_expedition)
+//! grename <name>                     CSRenameExpedition for the bot's own guild (the `GUILD` id)
 //! gexpectrenamed <name>              fail unless SCFactionRenamed carries that name
 //! gexpectretry <error>               fail unless SCFactionRetryRename re-opens the expedition dialog
 //!                                    with that error code
@@ -91,6 +92,9 @@
 //! nhostile <faction>                 CSFactionDeclareHostile (nation king)
 //! nattack <skill> [name]             target the peer and cast at it; fail unless SCSkillStarted
 //!                                    arrives without SCErrorMsg
+//! hangup                            hard disconnect (socket closed, no CSLeaveWorld); ends the script
+//! expectseen <code> [secs]          fail unless an SCErrorMsg with that code arrived since the last
+//!                                   `expectseen` (also one an earlier command already drained)
 //! sync <token> [count]              suite barrier: wait until `count` bots (default: all) are here
 //! expectpkt <PacketName> [secs]     fail unless the packet arrives within `secs` (default 5)
 //! expectnopkt <PacketName> [secs]   fail if the packet arrives within `secs` (default 5)
@@ -940,6 +944,8 @@ async fn run_lines(
     let mut last_npc = 0u32;
     let mut last_death_seq = 0u64;
     let mut consumed: HashSet<usize> = HashSet::new();
+    // `expectseen`: the `game.state.events` index the next search starts at.
+    let mut errors_from = 0usize;
     let mut mate: Option<(u32, u16)> = None;
     for (n, raw) in text.lines().enumerate() {
         let line = raw.trim();
@@ -2130,6 +2136,12 @@ async fn run_lines(
                 let e = await_event(game, &mut consumed, kind, secs).await?;
                 println!("    awaited: {e:?}");
             }
+            "targetpeer" => {
+                let target = peer(game, parts.first().copied())?;
+                game.change_target(target.obj_id).await?;
+                game.drain(Duration::from_millis(300), Duration::from_secs(1))
+                    .await?;
+            }
             "pkill" => {
                 let target = peer(game, parts.first().copied())?;
                 clock += 1500;
@@ -2161,7 +2173,17 @@ async fn run_lines(
                 } else {
                     String::new()
                 };
+                // `GUILD` is the bot's guild id as a little-endian u32.
                 let mut hex = raw
+                    .replace(
+                        "GUILD",
+                        &game
+                            .state
+                            .guild_id
+                            .to_le_bytes()
+                            .map(|b| format!("{b:02x}"))
+                            .concat(),
+                    )
                     .replace("SELF", &bc(game.state.self_obj))
                     .replace("PEER", &peer_bc);
                 // `ITEM(<template>)` expands to the stack id remembered by
@@ -2204,6 +2226,36 @@ async fn run_lines(
                         .await?;
                     show(&got);
                 }
+            }
+            "expectseen" => {
+                let code: i16 = num(&parts, 0)?;
+                let secs: u64 = parts.get(1).and_then(|x| x.parse().ok()).unwrap_or(5);
+                let deadline = Instant::now() + Duration::from_secs(secs);
+                loop {
+                    let found = game.state.events[errors_from.min(game.state.events.len())..]
+                        .iter()
+                        .position(
+                            |e| matches!(e, crate::game::GameEvent::ErrorMsg(c) if *c == code),
+                        );
+                    if let Some(i) = found {
+                        errors_from = errors_from.min(game.state.events.len()) + i + 1;
+                        println!("    SCErrorMsg {code} seen");
+                        break;
+                    }
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        bail!("no SCErrorMsg {code} within {secs} s");
+                    }
+                    game.recv_within(left.min(Duration::from_millis(250)))
+                        .await?;
+                }
+            }
+            "hangup" => {
+                // A hard disconnect: the socket closes without `CSLeaveWorld` and the script
+                // ends here (the server runs its disconnect cleanup, not the 10 s leave).
+                game.hang_up().await;
+                r.end(s, "hung up");
+                return Ok(());
             }
             "partyinvite" => {
                 let target = parts.first().context("name")?;
@@ -2313,25 +2365,23 @@ async fn run_lines(
             }
 
             "grename" => {
-                let name = rest.trim();
-                ensure!(!name.is_empty(), "grename <name>");
-                let id = game.state.self_expedition;
-                ensure!(
-                    id != 0,
-                    "grename: no expedition id tracked (SCUnitExpeditionChangedPacket not seen)"
-                );
-                let (op, body) = social::rename_expedition(id, name);
-                // No drain: the caller asserts SCFactionRenamed / Retry / SCErrorMsg.
+                let id = game.state.guild_id;
+                if id == 0 {
+                    bail!("grename: the bot has not seen its guild yet");
+                }
+                let (op, body) = social::rename_expedition(id, rest.trim(), true);
                 game.send_cs(op, &body).await?;
+                game.drain(Duration::from_millis(800), Duration::from_secs(3))
+                    .await?;
             }
             "gexpectrenamed" => {
                 let name = rest.trim();
                 ensure!(!name.is_empty(), "gexpectrenamed <name>");
-                let SocialEvent::FactionRenamed {
+                let SocialEvent::GuildRenamed {
                     id,
                     name: got,
                     by_gm,
-                } = await_event(game, &mut consumed, "FactionRenamed", 60).await?
+                } = await_event(game, &mut consumed, "GuildRenamed", 60).await?
                 else {
                     bail!("not a faction rename");
                 };
@@ -2343,11 +2393,11 @@ async fn run_lines(
             }
             "gexpectretry" => {
                 let code: i16 = num(&parts, 0)?;
-                let SocialEvent::FactionRetryRename {
+                let SocialEvent::GuildRenameRetry {
                     is_expedition,
-                    error_message,
+                    error: error_message,
                     name,
-                } = await_event(game, &mut consumed, "FactionRetryRename", 60).await?
+                } = await_event(game, &mut consumed, "GuildRenameRetry", 60).await?
                 else {
                     bail!("not a faction rename retry");
                 };

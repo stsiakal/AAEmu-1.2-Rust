@@ -320,7 +320,7 @@ impl ClientPacket for CSChangeDoodadDataPacket {
         conn: &'a mut GameConnection,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            tracing::warn!(
+            tracing::debug!(
                 "ChangeDoodadData, ObjId: {}, Data: {}",
                 self.obj_id,
                 self.data
@@ -333,7 +333,7 @@ impl ClientPacket for CSChangeDoodadDataPacket {
             };
             if let Some(doodad) = world.doodad(self.obj_id) {
                 let template_id = doodad.data().template_id;
-                tracing::warn!("Doodad: ({template_id})");
+                tracing::debug!("Doodad: ({template_id})");
                 if !super::manager::change_doodad_data(server, &world, &me, &doodad, self.data) {
                     me.send(error_msg(error_message::INTERACTION_PERMISSION_DENY));
                 }
@@ -569,7 +569,7 @@ impl ClientPacket for CSSaveDoodadUccStringPacket {
         _conn: &'a mut GameConnection,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            tracing::warn!("SaveDoodadUccString, ObjId: {}", self.obj_id);
+            tracing::debug!("SaveDoodadUccString, ObjId: {}", self.obj_id);
             Ok(())
         })
     }

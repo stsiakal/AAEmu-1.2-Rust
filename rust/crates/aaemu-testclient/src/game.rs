@@ -593,6 +593,9 @@ pub struct GameState {
     pub self_obj: u32,
     /// The guild (`expedition`) id from our last `SCUnitExpeditionChangedPacket` (0 = none).
     pub self_expedition: u32,
+    /// Id of the guild the bot is in (from `SCFactionCreated` / `SCExpeditionMemberList`); 0 =
+    /// none seen.
+    pub guild_id: u32,
     pub self_pos: (f32, f32, f32),
     /// Last position actually received from the server, independent of local movement sends.
     pub observed_self_pos: Option<(f32, f32, f32)>,
@@ -643,6 +646,18 @@ impl GameState {
         self.observation_seq += 1;
         if let Some(ev) = crate::social::decode(p) {
             self.social.push(ev);
+        }
+        if p.level == LEVEL_GAME {
+            let mut g = p.stream();
+            if p.opcode == sc::SCFactionCreatedPacket {
+                if let Ok(id) = g.read_u32() {
+                    self.guild_id = id;
+                }
+            } else if p.opcode == sc::SCExpeditionMemberListPacket {
+                if let (Ok(_), Ok(_), Ok(id)) = (g.read_u32(), g.read_u8(), g.read_u32()) {
+                    self.guild_id = id;
+                }
+            }
         }
         let mut s = p.stream();
         let st = self;
@@ -987,6 +1002,12 @@ impl GameClient {
     /// Close both game socket halves, without sending `CSLeaveWorldPacket`.
     /// Awaiting the aborted reader confirms that its socket half was dropped.
     pub async fn disconnect_hard(mut self) {
+        self.hang_up().await;
+    }
+
+    /// [`Self::disconnect_hard`] on a client the caller keeps (the `hangup` script command): the
+    /// server sees the socket close without a `CSLeaveWorldPacket`.
+    pub async fn hang_up(&mut self) {
         drop(self.writer.take());
         self.reader.close().await;
         // Earlier accepted events are already flushed. Drain already-delivered evidence

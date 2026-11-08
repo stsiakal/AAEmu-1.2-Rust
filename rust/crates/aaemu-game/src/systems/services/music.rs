@@ -395,14 +395,21 @@ impl ClientPacket for CSSaveUserMusicNotesPacket {
                 return Ok(());
             };
             // The C# stored anything the client sent. Refuse what the 1.2 client cannot produce:
-            // a size that is not the string's UTF-16 length, a song longer than the player's
-            // `music_note_limits` row for the Artistry grade (the limit the client's SaveNotes
-            // enforces before sending, `FUN_39079640` / `FUN_39082130`), a song above the outer
-            // `Music.MaxSongChars` sanity bound, or a source item that is not an owned instrument
-            // from `instrument_sounds`. The song grammar stays unparsed (no evidenced
+            // a song longer than the player's `music_note_limits` row for the Artistry grade (the
+            // limit the client's SaveNotes enforces before sending, `FUN_39079640` /
+            // `FUN_39082130`), a song above the outer `Music.MaxSongChars` sanity bound, or a
+            // source item the player does not own. The song grammar stays unparsed (no evidenced
             // server-side format), so a grammar failure can only be refused by the client itself.
             let song_len = self.song.encode_utf16().count();
             let size_mismatch = u32::try_from(song_len) != Ok(self.song_size);
+            if size_mismatch {
+                // The client writer's size unit is not evidenced (no decompile hit), so a
+                // mismatch is logged and accepted instead of dropping the upload.
+                tracing::warn!(
+                    "CSSaveUserMusicNotesPacket: song_size {} does not match the {song_len} UTF-16 characters (accepted)",
+                    self.song_size
+                );
+            }
             let (artistry_step, composition_limit) = {
                 let c = p.data();
                 let step = c
@@ -419,12 +426,9 @@ impl ClientPacket for CSSaveUserMusicNotesPacket {
                     .limit(step);
                 (step, limit)
             };
-            let refusal = if size_mismatch {
-                Some(format!(
-                    "song_size {} does not match the {song_len} UTF-16 characters",
-                    self.song_size
-                ))
-            } else if let Some(limit) = composition_limit.filter(|&limit| song_len as u32 > limit) {
+            let refusal = if let Some(limit) =
+                composition_limit.filter(|&limit| song_len as u32 > limit)
+            {
                 Some(format!(
                     "song has {song_len} UTF-16 characters (Artistry grade {artistry_step} limit {limit})"
                 ))
@@ -435,21 +439,11 @@ impl ClientPacket for CSSaveUserMusicNotesPacket {
                 ))
             } else {
                 let inv = crate::systems::economy::inventory::Inv::of(&p);
+                // The client sends the id of a bag item it found by its 64-bit id
+                // (`sub_3961E9A0` in `sub_39079640` / `sub_390799E0`), which is the music paper
+                // the later item cast consumes, not an instrument: only ownership is checked.
                 match inv.item_by_id(self.item_id) {
                     None => Some(format!("item {} is not owned", self.item_id)),
-                    Some(item)
-                        if !server
-                            .game_data
-                            .systems
-                            .services
-                            .instrument_sounds
-                            .contains(item.template_id) =>
-                    {
-                        Some(format!(
-                            "item {} (template {}) is not in instrument_sounds",
-                            self.item_id, item.template_id
-                        ))
-                    }
                     Some(_) => None,
                 }
             };
