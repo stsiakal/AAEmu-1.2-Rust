@@ -169,11 +169,12 @@ async fn run() -> anyhow::Result<()> {
     // FormulaManager.Load, ItemManager.Load and the orchestrated ILoadable game data (a failing
     // loader is fatal, as in the 1.2 C#).
     tracing::info!(
-        "Server profile: {} (player level cap {}, player nations {}, sieges and Auroria claims {})",
+        "Server profile: {} (player level cap {}, player nations {}, siege calendar {}, Auroria claims {})",
         config.world.profile,
         config.world.profile.player_level_cap(),
         config.player_nations_enabled(),
-        config.siege_calendar_enabled()
+        config.siege_calendar_enabled(),
+        config.auroria_claims_enabled()
     );
     let mut game_data = GameData::load(
         &config.app_path,
@@ -187,7 +188,7 @@ async fn run() -> anyhow::Result<()> {
     // the era profile.
     game_data.features.apply_config(
         &config.feature_set,
-        config.siege_calendar_enabled(),
+        config.auroria_claims_enabled(),
         config.player_nations_enabled(),
     );
     tracing::info!("Client FeatureSet: {}", game_data.features);

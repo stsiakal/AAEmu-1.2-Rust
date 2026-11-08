@@ -32,9 +32,10 @@ pub struct HousingConfig {
     )]
     pub dominion_property_tax_base: DominionPropertyTaxBase,
     /// Drives the weekly siege periods from `siege_zones`/`siege_plans` instead of the
-    /// explicit GM schedule alone, and gates the Auroria territory claims: the era profile
-    /// decides when the key is missing (`World.Profile`: on for `EuAuroria` and `Kr12`, off
-    /// for `EuLaunch`), an explicit `true` / `false` wins. `Housing.SiegeCalendar`.
+    /// explicit GM schedule alone. It does **not** gate Auroria claims or the client
+    /// `FeatureSet.siege` bit: those follow the era profile. The era profile decides when the
+    /// key is missing (`World.Profile`: on for `EuAuroria` and `Kr12`, off for `EuLaunch`), an
+    /// explicit `true` / `false` wins. `Housing.SiegeCalendar`.
     #[serde(
         rename = "siegecalendar",
         default,

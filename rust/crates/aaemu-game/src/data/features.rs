@@ -204,7 +204,7 @@ impl FeatureSet {
     /// Applies [`FeatureSetConfig`] on top of [`FeatureSet::initialized`].
     ///
     /// Every named switch sets exactly its bit; an absent `siege` / `nations` key follows the
-    /// resolved server flags (`AppConfig::siege_calendar_enabled` /
+    /// resolved server flags (`AppConfig::auroria_claims_enabled` /
     /// `AppConfig::player_nations_enabled`, which default from the era profile). `extra_bits`
     /// is applied last, so it can also override a named bit or turn a default-on unnamed bit
     /// off.

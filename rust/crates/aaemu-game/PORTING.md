@@ -4456,27 +4456,48 @@ startup. Timeline and sources: `D:/aaemu-audits/gap-audit-2026-11-02/research/tr
 | Retail window | Trion EU Conquest of Auroria to the day before Secrets of Ayanad: **2014-11-04 (NA) / 2014-11-06 (EU) to 2015-03-09** (engadget 2014-11-04; mein-mmo 2014-11-06; Total ArcheAge 2015-03, "level cap 55" with Secrets of Ayanad on 2015-03-10) | Trion NA/EU launch: **2014-09-12 (head start) / 2014-09-16 (launch) to 2014-11-03**, before Auroria (gameinformer 2014-08-30; tentonhammer 2014-09-12) | XL KR 1.2 data our templates come from (`r208022`) |
 | Player level cap | 50 | 50 | 55 |
 | Player nations (`systems::social::nation`, NATION-1..17) | off | off | on |
-| Dominion sieges / Auroria claims (`Housing.SiegeCalendar`; `FeatureSet.siege`) | on | off | on |
-| Override keys | `Social.PlayerNations`, `Housing.SiegeCalendar`, `FeatureSet.siege`, `FeatureSet.nations` | same | same |
+| Weekly siege calendar (`Housing.SiegeCalendar`) | on | off | on |
+| Auroria claims / client `FeatureSet.siege` (profile; not the calendar key) | on | off | on |
+| Override keys | `Housing.SiegeCalendar` (calendar only), `FeatureSet.siege` (client bit), `Social.PlayerNations`, `FeatureSet.nations` | same | same |
 
 * **Level cap.** `ExperienceManager.PlayerLevelCap` is no longer a constant: `GameData::load`
   passes `ServerProfile::player_level_cap()` to `ExperienceTable::from_templates`. A character
   saved above a lowered cap keeps its level; a gain is trimmed at that character's level, the
   same as at the cap, and `level_from_exp` never returns a level above the cap even though the
-  `levels` table has 55 rows (the C# search range could run past the cap). The client
-  `FeatureSet` level limit (byte 1) follows the table. Mate cap stays `MATE_LEVEL_CAP = 50`.
+  1.2 `levels` table has **101 rows** (the C# search range could run past the cap; from level 1
+  it could return level 56 at cap 55). The client `FeatureSet` level limit (byte 1) follows the
+  table. Mate cap stays `MATE_LEVEL_CAP = 50`.
+* **Partial exp above the cap is trimmed.** On load (`Character.ValidateAndFixExpAndLevel` ->
+  `validate_and_fix`) and on save the character's partial progress beyond the cap is trimmed to
+  the current level's total; the level itself is never lowered. Switching the profile back to a
+  higher cap therefore does not restore the trimmed progress.
+* **Open risk (client level limit with an above-cap character).** How the 1.2 client renders the
+  exp bar, the level number and tooltips when its `FeatureSet` level limit is 50 and the
+  character's level is above 50 is **UNVERIFIED**; it needs a live original-client check. The
+  server keeps the level and trims the exp as described above, so the client does receive a
+  level above its configured limit.
 * **Nations.** No public Trion 1.2 source shows player-nation founding (research §1.4/§3);
   the research treats it as unavailable in 1.2. The server gate is
   `Social.PlayerNations` (profile default), and the client `FeatureSet.nations` bit follows the
   same value. A refused founding uses the existing precondition refusal (`FACTION_SEPARATE_RIGHTS`
   40 for the skill / GM path), not a new error id. Existing nations loaded from the database are
   not deleted by the switch (a profile change is not a migration).
-* **Sieges and claims.** `Housing.SiegeCalendar` drives the weekly siege calendar; when it is
-  off, the skill claim is refused with `DOMINION_CLOSED` 662 (the existing "not a claimable
-  region" refusal) and the client `FeatureSet.siege` bit is off. Trion's launch era had neither;
-  Auroria opened on 2014-11-04 (NA) / 2014-11-06 (EU) (research §2/§4). The Trion siege itself
-  was a Lodestone system; our KR dominion siege with camp lots is a **server policy
-  approximation** of it, not a claim that the two rules match.
+* **Sieges and claims are decoupled (2026-11-08 follow-up).** `Housing.SiegeCalendar` drives
+  only the inferred weekly siege calendar; its default follows the profile (on for `EuAuroria` /
+  `Kr12`, off for `EuLaunch`) and an explicit value wins. Auroria territory claims and the
+  client `FeatureSet.siege` bit follow the **profile** (`World.Profile`), not the calendar key:
+  an operator under `EuAuroria` with `Housing.SiegeCalendar=false` (GM-scheduled sieges only)
+  still claims territories and still shows the siege UI. An explicit `FeatureSet.siege` value
+  wins for the client bit; there is no separate claims key. A refused claim uses the existing
+  `DOMINION_CLOSED` 662 (the "not a claimable region" refusal). Trion's launch era had no
+  sieges or Auroria; Auroria opened on 2014-11-04 (NA) / 2014-11-06 (EU) (research §2/§4). The
+  Trion siege itself was a Lodestone system; our KR dominion siege with camp lots is a **server
+  policy approximation** of it, not a claim that the two rules match.
+* **UPGRADE (2026-11-08 follow-up).** A configuration without `Housing.SiegeCalendar` now gets
+  the weekly siege calendar from the default profile (`EuAuroria`: on). Before this change the
+  key defaulted to off (explicit GM schedules only). The calendar rules are INFERRED from the
+  1.2 tables with corroborated times; to keep the old calendar behaviour set
+  `Housing.SiegeCalendar=false`. That no longer disables Auroria claims or the client siege UI.
 * **Not modelled (owner decision):** Patron / free-player rules, APEX and labor potions are out
   of scope for the profile.
 

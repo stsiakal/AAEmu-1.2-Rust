@@ -949,10 +949,11 @@ pub fn declare_effect(server: &GameServer, args: &EffectArgs<'_>) {
     if !distance2.is_finite() || !range.is_finite() || range <= 0.0 || distance2 > range * range {
         return;
     }
-    // Auroria claims follow the era profile (`World.Profile`, overridden by
-    // `Housing.SiegeCalendar`): the Trion launch era has no northern continent. 662 is the
+    // Auroria claims follow the era profile (`World.Profile`), independently of
+    // `Housing.SiegeCalendar`: the Trion launch era has no northern continent, while a
+    // calendar-off Auroria server still allows claims for GM-scheduled sieges. 662 is the
     // existing "not yet a region where a territory can be proclaimed" refusal.
-    if !server.config.siege_calendar_enabled() {
+    if !server.config.auroria_claims_enabled() {
         super::util::send_error(
             player,
             crate::systems::economy::error_message::DOMINION_CLOSED,
@@ -2978,15 +2979,18 @@ mod authority_tests {
     }
 
     #[tokio::test]
-    async fn the_launch_profile_refuses_auroria_claims_until_an_explicit_flag() {
+    async fn auroria_claims_follow_the_profile_not_the_siege_calendar() {
         use crate::config::ServerProfile;
+        let object = SkillObject::None;
+
+        // The launch era has no Auroria claims: even an explicitly enabled calendar (the GM
+        // schedule switch) does not enable them.
         let mut f = fixture();
         give_pack(&f, 100, PURIFYING_ARCHEUM);
         f.server.config.update(|c| {
             c.world.profile = ServerProfile::EuLaunch;
-            c.housing.siege_calendar = None;
+            c.housing.siege_calendar = Some(true);
         });
-        let object = SkillObject::None;
         declare_effect(&f.server, &args(&f, &object));
         assert_eq!(
             errors(&mut f.client),
@@ -3001,10 +3005,13 @@ mod authority_tests {
             .get(ZONE)
             .is_none_or(|state| state.owner_expedition_id == 0));
 
-        // An explicit `Housing.SiegeCalendar=true` wins over the launch profile.
-        f.server
-            .config
-            .update(|c| c.housing.siege_calendar = Some(true));
+        // Auroria with the weekly calendar off (GM-scheduled sieges only) still claims.
+        let f = fixture();
+        give_pack(&f, 100, PURIFYING_ARCHEUM);
+        f.server.config.update(|c| {
+            c.world.profile = ServerProfile::EuAuroria;
+            c.housing.siege_calendar = Some(false);
+        });
         declare_effect(&f.server, &args(&f, &object));
         assert_eq!(
             f.server

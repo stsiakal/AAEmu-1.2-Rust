@@ -255,13 +255,21 @@ The profile only supplies **defaults**; explicit keys win:
 - `Social:PlayerNations` (client switch and server gate) defaults from the profile; set it to
   `true` or `false` to override. The same value drives the client `FeatureSet.nations` bit.
 - `Housing:SiegeCalendar` defaults from the profile; set it to `true` or `false` to override.
-  When it is off, the weekly siege calendar, Auroria claims and the client `FeatureSet.siege`
-  bit are off too.
+  It switches the inferred weekly siege calendar only. Auroria claims and the client
+  `FeatureSet.siege` bit follow the profile (`on` for `EuAuroria` / `Kr12`, `off` for
+  `EuLaunch`): under `EuAuroria`, `Housing:SiegeCalendar=false` (GM-scheduled sieges only)
+  still allows claims and shows the siege UI. An explicit `FeatureSet.siege` value still wins
+  for the client bit.
 - The player level limit (client `FeatureSet` byte 1) follows the profile cap. A character
   saved above a lowered cap keeps its level and gains no further levels; experience is trimmed
   at that character's level, exactly as it is at the cap today. Mates keep their own cap of 50.
 - A nation already stored in the database is not deleted when a profile without nations is
   selected; the nation features refuse new actions instead.
+- **Upgrade note:** before the era profile existed, `Housing:SiegeCalendar` defaulted to
+  `false`. A configuration without the key now gets the weekly calendar from the default
+  profile (`EuAuroria`: on). The calendar rules are inferred from the 1.2 tables with
+  corroborated times; set `Housing:SiegeCalendar=false` to keep the old explicit-GM-only
+  calendar behaviour. That does not disable Auroria claims or the client siege UI.
 
 Set the key in `Configurations/World.json`, `Config.Local.json`, with the environment variable
 `World__Profile`, or on the command line (`--World:Profile=Kr12`). The active profile is logged
@@ -759,7 +767,7 @@ form `FeatureSet__Siege=false`.
 
 | Key | Bit | Default | What the client uses it for |
 | --- | --- | --- | --- |
-| `siege` | 0 | `Housing:SiegeCalendar` (profile) | Siege / dominion UI. The exact window is INFERRED from the Lua key. The default is the resolved server flag (on for `EuAuroria` / `Kr12`, off for `EuLaunch`); an explicit value wins. |
+| `siege` | 0 | `World:Profile` | Siege / dominion UI. The exact window is INFERRED from the Lua key. The default follows the profile (on for `EuAuroria` / `Kr12`, off for `EuLaunch`), independently of `Housing:SiegeCalendar`; an explicit value wins. |
 | `nations` | 6 | `Social:PlayerNations` (profile) | Player-nation UI. The default is the resolved server flag (on for `Kr12`, off for the EU profiles); an explicit value wins. |
 | `premium` | 4 | `true` | Premium / Patron HUD and labor UI. |
 | `itemSecure` | 45 | `true` | Item-secure / lock handling and UI. |

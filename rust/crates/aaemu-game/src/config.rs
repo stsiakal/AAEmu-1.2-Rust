@@ -1065,12 +1065,22 @@ impl AppConfig {
             .unwrap_or_else(|| self.world.profile.player_nations())
     }
 
-    /// Sieges and Auroria claims: the explicit `Housing.SiegeCalendar` value wins, otherwise
-    /// the era profile decides (`World.Profile`).
+    /// The inferred weekly siege calendar: the explicit `Housing.SiegeCalendar` value wins,
+    /// otherwise the era profile decides (`World.Profile`). This key drives the calendar only;
+    /// Auroria claims and the client siege bit follow [`Self::auroria_claims_enabled`].
     pub fn siege_calendar_enabled(&self) -> bool {
         self.housing
             .siege_calendar
             .unwrap_or_else(|| self.world.profile.sieges())
+    }
+
+    /// Auroria territory claims and the client `FeatureSet.siege` bit: they follow the era
+    /// profile (`World.Profile`) and are not switched by `Housing.SiegeCalendar`, so an
+    /// operator can run GM-scheduled sieges only while claims stay enabled. An explicit
+    /// `FeatureSet.siege` value still overrides the client bit in
+    /// [`crate::data::FeatureSet::apply_config`].
+    pub fn auroria_claims_enabled(&self) -> bool {
+        self.world.profile.sieges()
     }
 }
 
@@ -1794,7 +1804,7 @@ mod tests {
         );
         fset.apply_config(
             &cfg.feature_set,
-            cfg.siege_calendar_enabled(),
+            cfg.auroria_claims_enabled(),
             cfg.player_nations_enabled(),
         );
         assert_eq!(
@@ -1927,6 +1937,7 @@ mod tests {
         assert_eq!(cfg.world.profile.player_level_cap(), 50);
         assert!(!cfg.player_nations_enabled());
         assert!(cfg.siege_calendar_enabled());
+        assert!(cfg.auroria_claims_enabled());
         assert_eq!(format!("{}", cfg.world.profile), "EuAuroria");
 
         let cfg = AppConfig::from_value(json!({ "World": { "Profile": "EuLaunch" } })).unwrap();
@@ -1934,12 +1945,14 @@ mod tests {
         assert_eq!(cfg.world.profile.player_level_cap(), 50);
         assert!(!cfg.player_nations_enabled());
         assert!(!cfg.siege_calendar_enabled());
+        assert!(!cfg.auroria_claims_enabled());
 
         let cfg = AppConfig::from_value(json!({ "World": { "Profile": "Kr12" } })).unwrap();
         assert_eq!(cfg.world.profile, ServerProfile::Kr12);
         assert_eq!(cfg.world.profile.player_level_cap(), 55);
         assert!(cfg.player_nations_enabled());
         assert!(cfg.siege_calendar_enabled());
+        assert!(cfg.auroria_claims_enabled());
 
         // An explicit flag wins over the profile in both directions.
         let cfg = AppConfig::from_value(json!({
@@ -1950,6 +1963,8 @@ mod tests {
         .unwrap();
         assert!(cfg.player_nations_enabled());
         assert!(cfg.siege_calendar_enabled());
+        // Claims follow the launch profile; the explicit calendar does not enable them.
+        assert!(!cfg.auroria_claims_enabled());
         let cfg = AppConfig::from_value(json!({
             "World": { "Profile": "Kr12" },
             "Social": { "PlayerNations": "false" },
@@ -1958,6 +1973,8 @@ mod tests {
         .unwrap();
         assert!(!cfg.player_nations_enabled());
         assert!(!cfg.siege_calendar_enabled());
+        // Claims follow the KR profile; the explicit calendar does not disable them.
+        assert!(cfg.auroria_claims_enabled());
         assert_eq!(cfg.world.profile.player_level_cap(), 55);
 
         // The key binds through the environment (`World__Profile`) and the command line.
@@ -1973,6 +1990,62 @@ mod tests {
         let cfg = AppConfig::from_value(value).unwrap();
         assert_eq!(cfg.world.profile, ServerProfile::EuLaunch);
         assert!(AppConfig::from_value(json!({ "World": { "Profile": "Nope" } })).is_err());
+    }
+
+    #[test]
+    fn siege_calendar_is_independent_of_claims_and_the_client_bit() {
+        use crate::data::experience::MATE_LEVEL_CAP;
+        use crate::data::{Feature, FeatureSet};
+
+        let client_siege = |cfg: &AppConfig| {
+            let mut f =
+                FeatureSet::initialized(cfg.world.profile.player_level_cap(), MATE_LEVEL_CAP);
+            f.apply_config(
+                &cfg.feature_set,
+                cfg.auroria_claims_enabled(),
+                cfg.player_nations_enabled(),
+            );
+            f.check(Feature::Siege)
+        };
+
+        // Auroria + calendar off (GM schedules only): claims and the client bit stay on.
+        let cfg = AppConfig::from_value(json!({
+            "World": { "Profile": "EuAuroria" },
+            "Housing": { "SiegeCalendar": false }
+        }))
+        .unwrap();
+        assert!(!cfg.siege_calendar_enabled());
+        assert!(cfg.auroria_claims_enabled());
+        assert!(client_siege(&cfg));
+
+        // Launch: claims and the client bit are off even with the calendar forced on.
+        let cfg = AppConfig::from_value(json!({
+            "World": { "Profile": "EuLaunch" },
+            "Housing": { "SiegeCalendar": true }
+        }))
+        .unwrap();
+        assert!(cfg.siege_calendar_enabled());
+        assert!(!cfg.auroria_claims_enabled());
+        assert!(!client_siege(&cfg));
+
+        // Kr12: claims stay on with the calendar off.
+        let cfg = AppConfig::from_value(json!({
+            "World": { "Profile": "Kr12" },
+            "Housing": { "SiegeCalendar": "false" }
+        }))
+        .unwrap();
+        assert!(!cfg.siege_calendar_enabled());
+        assert!(cfg.auroria_claims_enabled());
+        assert!(client_siege(&cfg));
+
+        // An explicit FeatureSet.siege value wins over the profile under Auroria.
+        let cfg = AppConfig::from_value(json!({
+            "World": { "Profile": "EuAuroria" },
+            "FeatureSet": { "Siege": false }
+        }))
+        .unwrap();
+        assert!(cfg.auroria_claims_enabled());
+        assert!(!client_siege(&cfg));
     }
 
     #[test]

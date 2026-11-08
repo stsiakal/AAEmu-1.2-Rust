@@ -202,7 +202,9 @@ impl ExperienceTable {
     }
 
     /// `Character.ValidateAndFixExpAndLevel()` on `(level, experience)`; returns the fixed pair.
-    /// The level-up side effect (`Expedition?.OnCharacterRefresh`) is a later phase.
+    /// A level above the cap is kept (never lowered); partial exp beyond that level's total is
+    /// trimmed to it. The level-up side effect (`Expedition?.OnCharacterRefresh`) is a later
+    /// phase.
     pub fn validate_and_fix(
         &self,
         level: u8,
@@ -312,7 +314,7 @@ mod tests {
     }
 
     #[test]
-    fn profile_cap_of_50_holds_even_though_the_table_has_55_rows() {
+    fn profile_cap_of_50_holds_when_the_table_has_more_rows() {
         let t = table(55, 50);
         assert_eq!((t.max_player_level(), t.max_mate_level()), (50, 50));
         // A huge gain stops at the cap instead of reading the rows above it (the C# search
@@ -323,6 +325,24 @@ mod tests {
             (50, 9999 - 4900)
         );
         assert_eq!(t.validate_and_fix(50, 6000).unwrap(), (50, 4900));
+    }
+
+    #[test]
+    fn kr12_cap_of_55_holds_with_the_real_101_row_table() {
+        let t = table(101, 55);
+        assert_eq!((t.max_player_level(), t.max_mate_level()), (55, 50));
+        // The requested case: a big gain from level 54 stops at 55, never at a row above it.
+        assert_eq!(
+            t.level_from_exp(999_999, 54, false).unwrap(),
+            (55, 999_999 - 5400)
+        );
+        // The C# search range also ran past the cap from lower levels. With the real 101-row
+        // table the past-the-end guard did not catch it, so the old code returned level 56
+        // from level 1; the clamped count is what keeps this at 55.
+        assert_eq!(
+            t.level_from_exp(999_999, 1, false).unwrap(),
+            (55, 999_999 - 5400)
+        );
     }
 
     #[test]
