@@ -4468,8 +4468,8 @@ startup. Timeline and sources: `D:/aaemu-audits/gap-audit-2026-11-02/research/tr
   it could return level 56 at cap 55). The client `FeatureSet` level limit (byte 1) follows the
   table. Mate cap stays `MATE_LEVEL_CAP = 50`.
 * **Partial exp above the cap is trimmed.** On load (`Character.ValidateAndFixExpAndLevel` ->
-  `validate_and_fix`) and on save the character's partial progress beyond the cap is trimmed to
-  the current level's total; the level itself is never lowered. Switching the profile back to a
+  `validate_and_fix`) and on every exp gain the character's partial progress beyond the cap is
+  trimmed to the current level's total (save stores that result); the level itself is never lowered. Switching the profile back to a
   higher cap therefore does not restore the trimmed progress.
 * **Open risk (client level limit with an above-cap character).** How the 1.2 client renders the
   exp bar, the level number and tooltips when its `FeatureSet` level limit is 50 and the
