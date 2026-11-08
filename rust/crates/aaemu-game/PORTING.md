@@ -497,6 +497,7 @@ buff unchanged, absolute-value inference, real-compact loader for the three colu
 | `NpcManager.Load` (customs, body parts, templates, equip packs, postures, unit modifiers, initial buffs, merchants / goods) | `npc/data.rs` | done | 13 382 templates on the real DB. Every `merchants` row of an NPC is kept (`merchant_pack_ids`), as the 1.2 client unions the packs; the C# kept only the last one. Creatures.xml names, `LoadAiParams` not ported. Also loads `aggro_links` / `npc_aggro_links` (130 groups, 643 rows, 572 NPC templates, rows with a missing NPC / group skipped) into `NpcData::aggro_links`; the rule that reads them is `systems::ai` (see below). |
 | `NpcManager.Create`, `LoadCustom` (.NET `Random(123456789)` parity), `Npc` stats (Str..KillExp from the unit formulas + template bonuses), `InitializeSpawnBuffs`, `AnimActionId` | `npc/manager.rs`, `npc/stats.rs` | done | Every real template creates without error. The AI is created through `server.systems.hooks.ai` (`systems::ai`). |
 | `Npc.DoDie` | `npc/death.rs` | done | Kill exp (team eligibility, `PlayerExpModifier`, mate exp, TagShare contributors), quest kill events, loot (`LootManager.GenerateLoot` through the economy), aggro / tagger clean-up, spawner despawn, `Ai.GoToDead()` (`systems::ai`). |
+| `KillNpcWithoutCorpseEffect` scripted removal | `npcs/bridges.rs` (`kill_npc_without_corpse`, `remove_effects_and_delete`), `npc/death.rs` (`claim_scripted_removal`, `credit_scripted_kill`), `skills/skill.rs` (`nearest_kill_npc`) | added (C# PR #1792) | The removal without a corpse (832 `kill_npc_without_corpse_effects` rows) now raises the same monster-hunt quest events a normal death raises (MonsterHunt, MonsterGroupHunt, ZoneKill) for the players a normal death credits (tag / loot-rights holders and their party, Tag Share contributors; the skill caster when nobody holds tagging rights), with no exp, loot or honor. C# #1792 calls only `DoOnMonsterHuntEvents`, so the KILL_NPC achievement, the attacker's `OnKill`, the instance `OnUnitKilled` and `GuardNpcDied` are not raised; `Vanish` gives no credit. The removal is real: a spawner-owned NPC goes through `DoDespawn` / `DespawnWithRespawn` (C# parity) and a spawner-less NPC is deleted from the world (deviation: the C#/PR only removed spawner-owned NPCs, leaving a credited summon alive). `UnitBase::scripted_removed` claims the life before the removal under the NPC data lock; damage does not clear it (unlike `death_processed`), so a damage hit between the claim and the removal, or on a stale handle after it, cannot run the death path or credit again; a direct `DoDie` on it is a quiet no-op. A respawned NPC is a new object with a fresh life. Player-cast retreats (Rust-only: the C# effect is a no-op for a character caster) remove the matching-template NPC nearest the caster, restricted to the effect radius when it has one, and none when none qualifies. **Open issue:** the Nymph Queen encounter reset script is 10.x content (1.2 has no Nepheroda NPC and no skill uses effect 33617); the ordinary world spawner already respawns Lympheroda 9385 after its 15 s `RespawnTime` (`despawn_with_respawn` + `reconcile_deleted_npc`), so it is not ported. |
 | NPC interaction packets (CSStartInteraction, CSInteractNPC(End), CSSelectInteractionEx; SCNpcInteractionSkillList, SCNpcInteractionStatusChanged, SCNpcInteractionEndedByZone, SCAiAggro, SCNpcChatMessage, SCUnitModelPostureChanged, SCAggroTargetChanged) | `npc/packets.rs` | done | Byte-exact tests (the two interaction-state layouts from the 1.2 readers `FUN_397b4b00` / `FUN_397b4aa0`). `CSStartInteractionPacket` is refused silently for an NPC whose `interactable` flag is off (see the WP-5b note under "systems::ai") and for one farther than the 1.2 client's 3.0 m interaction-window reach plus `Interaction.NpcReachToleranceMeters` (default 2.0, INFERRED slack; `Interaction.NpcReachCheck`, default true); the C# had neither guard. Merchant / bank / auction UIs are economy's. **Deviation:** `CSStartInteractionPacket` also answers a slave with one seat skill, because the 1.2 client acts on the first list entry (`FUN_393be850` / `FUN_393be280`): 12076 (occupy) while the driver seat is free, else 13863 (passenger seat, `special_effects` 2378 value1 2) while point 2 is free, the slave's model declares point 2 in `model_bindings` and the slave is not a cannon; a slave with both seats taken keeps 12076; the bind then ignores the taken seat silently (C# behaviour). The C# answered only NPCs and mates (12077). `CSSelectInteractionExPacket` (0x06b) is the client world-interaction-window selection (`FUN_393b3120` logs `Interaction Ex Selected`); the doodad interaction effects run through the skill `Interaction` effect, so it stays a debug log. Whether the server must also act on the selected id / `var1` is capture-pending (`INTERACTION-EX-1`). |
 | `NpcGameData` (npc_spawners, npc_spawner_npcs, member index, generated spawners) | `npc/spawner_data.rs` | done | |
 | `NpcGroupGameData` (`npc_groups`, `npc_group_members`) | `npc/group_data.rs` | done | 158 groups / 571 member rows on the real DB; every one of the 147 `NpcGroup` spawner rows resolves to a group whose 531 member NPC templates exist. A `"NpcGroup"` spawner member expands into all group members at the spawner position plus `formation_offset_*` (see deviations). |
@@ -550,7 +551,7 @@ connected by `systems::economy::wiring`).
 | `Inventory` (SplitOrMoveItem(Ex), 2H weapon handling, backpacks, ExpandSlot, coffers, ConsumeItem, counts), `Character` money / game points / labor / `ItemUse` / `SendErrorMessage`, `ErrorMessageType` | `systems/economy/inventory.rs`, `error_message.rs` | done | `ChangeLabor`'s `AddExp` is a hook (`ProgressionHooks`). Equip and item use apply `items.actability_requirement` (error 508, see "Item use gates from data"). |
 | Core item C2G (`CSSwapItems`, `CSSplitBagItem`, `CSDestroyItem`, `CSExpandSlots`, `CSDeposit/WithdrawMoney`, `CSSplit/SwapCofferItem(s)`, `CSItem(Un)Secure`, `CSEquipments(Un)Secure`, `CSThisTimeUnpackItem`) | `systems/economy/{item_handlers,item_security}.rs` | done | Deposit / withdraw require a positive amount and a banker NPC (the `banker` template flag) within 5 m of the current interaction object (the C# did neither). The four secure packets are implemented from the 1.2 client (the C# only logged them); see the item-lock deviation. |
 | `ItemManager` (all templates / tables, user items, `Create`, timers, `UnwrapItem`, auction search helpers, loot convert fish), `ItemGameData`, `ItemConversionGameData`, `FishDetailsGameData`, item model stats (durability, repair cost, attributes, DPS, armor), procs | `data/items.rs`, `managers/item.rs`, `models/item.rs`, `systems/economy/{items_data,item_timers,procs}.rs` | done | `ItemManager` lists are leaf locks (snapshot before locking containers). Procs are a new feature (the C# never fired one; see the item-procs deviation). |
-| `LootGameData`, `Models/Game/Items/Loots/**`, `LootingContainer`, loot packets | `systems/economy/{loot_data,loot,looting,loot_packets}.rs` | done | NPC death / despawn / team rules through `LootNpcHooks`, `LootTeamHooks`, `LootQuestHooks`. |
+| `LootGameData`, `Models/Game/Items/Loots/**`, `LootingContainer`, loot packets | `systems/economy/{loot_data,loot,looting,loot_packets}.rs` | done | NPC death / despawn / team rules through `LootNpcHooks`, `LootTeamHooks`, `LootQuestHooks`. **C# PR #1488 (2026-11-08):** a loot row whose item template is missing (185 of the 13 823 1.2 `loots` rows) is skipped at debug level instead of aborting the pack, on the corpse path (`generate_pack_v2` -> `retain_known_items`), the shared player-pack path (`generate_pack_for_player`: item use, `DoodadFuncLootPack`, fishing) and `give_loot_pack`; a quest reward item without a template (282 `quest_act_supply_items` rows) is filtered out of the reward pool once in `distribute_rewards` so it no longer counts against the free-slot check (the rest of the items, exp and copper still pay out), and the fish conversion lottery filters such rows before its roll instead of building an `Item` with an unknown template. |
 | Repair (`Character.DoRepair`, `CSRepairSingleEquipment`, `CSRepairAllEquipments`), durability loss | `systems/economy/repair.rs` | done | Combat calls `on_damage_taken` / `on_death`. |
 | `CraftManager`, `Models/Game/Crafts`, `CharacterCraft`, `CraftTask`, `CSExecuteCraft`, `SCCraftFailed`, recipe learning (`item_recipes`, `train_craft_effects`) | `systems/economy/{craft,craft_data,craft_learning}.rs` | done | Cast through `CraftHooks::start_craft_cast`; skills call `craft::end_craft`. `TrainCraftEffect` teaches `item_recipes[source item]` (or the effect's craft without a source item), persisted in `character_crafts`; `Crafting.RequireLearnedRecipes` (default off) gates execution. |
 | Stores (`CSBuyItems`, `CSSellItems`, buy-back, `CSListSoldItem`, `CSBuyPriestBuff`, `CSBuyCoinItem`, `CSSellBackpackGoods`), `SpecialtyManager`, `TaxationsManager`, `ExpandExpert`, item look conversion | `systems/economy/{store,store_data,specialty}.rs` | done | Merchant packs / NPC flags through `NpcEconomyHooks`; a multi-pack NPC sells the union of all its packs. Checkout validates currency, checked totals and each balance, then stages complete goods / buy-back delivery before committing payment. Vocation charges the configured price displayed by the 1.2 shop, without earnings bonuses. Rejected checkout preserves items and balances. Purchases need an NPC merchant pack, a doodad `DoodadFuncStoreUi` pack, or the money form of the doodad's current-phase `DoodadFuncPurchase` (`CSBuyItems.unkId`, the `doodad_funcs` row id the 1.2 client writes there), and filter the goods by it; selling needs a merchant within 3 m, lists each item once and pays only for items moved to buy-back. Specialty: the empty `CSListSpecialtyGoods` answer, the dropped records packet and the corrected sale values are detailed in the specialty protocol note. |
@@ -2542,6 +2543,30 @@ is no longer mirrored (see "Known deviations", dead NPC returned and healed).
   unbid system lot and deletes its item (the lot-id argument and the refusal of player lots /
   lots with a bid are assumed). `client_id = 0` rows load normally on restart. The C# had
   neither command and no system-lot path.
+* systems::economy (expired auction items, 2026-11-08): the item timer only visits the
+  equipment / bag / bank containers of online characters, so a timed item on the auction house
+  never expires while it sits in escrow (a re-listed camp lot, or any timed item, could be sold
+  and delivered after its lifetime ended). Rules: an already expired item cannot be posted
+  (refused with the client's existing invalid-item code 240, ui_texts 241 "cannot put up the
+  item", item kept); a bid or buyout is refused with the same code before any money moves, so
+  a buyout can neither lose the buyer's debit nor refund an already-refunded old bidder a
+  second time; a lot whose escrow item expires before settlement is not delivered -- the
+  winner is refunded in full by the normal bid-fail mail and the item is deleted, with no
+  seller share and no `AUCTION_BUY`/`AUCTION_SOLD` credit (the refund mail is delivered before
+  any state change, so a refused mail leaves the lot for the next tick; a winner that no
+  longer resolves to a character is released with an error instead of retrying forever); and a
+  delivery taken from the mail after its item expired is deleted instead of entering the bag
+  and reported to the client like an expired bag item (`SCSyncItemLifespanPacket`, `added =
+  false`); this covers mails persisted before this fix and items that expire while the mail
+  waits (the delivery mail carries no price, so no refund is minted there). Timed items are
+  otherwise still accepted: only an already expired one is refused (no 1.2 evidence for a
+  general timed-item rule). The shared `item_timers::expired_at` matches the container timer's
+  definition. Tests: `an_expired_item_cannot_be_posted_and_reports_the_invalid_item_code`,
+  `an_expired_lot_refuses_bids_and_buyouts_before_any_money_moves`,
+  `an_item_that_expires_in_escrow_refunds_the_winner_and_is_deleted`,
+  `a_failed_expired_lot_refund_keeps_the_lot_and_retries_once`,
+  `an_unresolvable_expired_lot_winner_deletes_the_item_once_and_removes_the_lot`,
+  `an_expired_auction_delivery_is_deleted_instead_of_taken`.
 * systems::economy (mail leftovers, WP-I4): `/mail admin <receiver> <title> <text> [money]
   [[itemId count] ...]` is a Rust-only GM command (the C# had no such command); `ADMIN` (5) is
   one of the mail types the 1.2 client lists (`mail/common.alb`). It stores a sender-id-0 system
@@ -4455,7 +4480,8 @@ config is the baseline.
 
 | Key | Bit | Default | What the client uses it for |
 | --- | --- | --- | --- |
-| `siege` | 0 | on | Siege / dominion UI (`FUN_39496b20:956485`). The Lua key is read by the siege UI; the exact window is INFERRED. |
+| `siege` | 0 | `Housing.SiegeCalendar` (profile) | Siege / dominion UI (`FUN_39496b20:956485`). The Lua key is read by the siege UI; the exact window is INFERRED. The default is the resolved server flag (on for `EuAuroria` / `Kr12`, off for `EuLaunch`); an explicit value wins. |
+| `nations` | 6 | `Social.PlayerNations` (profile) | Player-nation UI (C# `Feature.Nations`, not in the `GetFeatureSet()` Lua table). The default is the resolved server flag (on for `Kr12`, off for the EU profiles); an explicit value wins. |
 | `premium` | 4 | on | Premium / Patron HUD and labor UI (C++ reads at `x2game.dll.c:703203`, `708636`). |
 | `itemSecure` | 45 | on | Item-secure / lock handling (`FUN_397cc350`, item byte flag `0x4`). |
 | `secondpass` | 46 | off | Second-password entry and its opcode path (`x2game.dll.c:45293`, `617228`, `108647`). The second password is not supported; keep it off. |
@@ -4478,8 +4504,66 @@ config is the baseline.
 | `ExtraBits` | any | `{}` | Override map for the unnamed `flag_x_y` bits, `0..=87`. The C++ reads unnamed bits 32, 34, 41, 42, 47, 60 and 73 (purpose unresolved); 78 is the mate equipment whitelist (`PORTING.md`, mate equipment). Defaults: 32 on (plus inherited 16-19, 24-27, 35, 37, 49); 34, 41, 42, 47, 60, 73 and 78 off. |
 
 The C#-named bits that have no `GetFeatureSet()` Lua key (`allowFamilyChanges` 1, `houseSale` 3,
-`nations` 6, `customUiButton` 39, `freeLpRaise` 53, `houseTaxPrepay` 84) have no named config
-switch; they keep their current defaults and `ExtraBits` can override them like any other bit.
+`customUiButton` 39, `freeLpRaise` 53, `houseTaxPrepay` 84) have no named config switch; they
+keep their current defaults and `ExtraBits` can override them like any other bit. `nations` (6)
+now has the named key below because it follows the era profile.
+
+## Server era profile (Rust only, 2026-11-08)
+
+Trion's "Version 1.2" was a label over several builds; the owner decided on 2026-11-08 to
+emulate the EU **Auroria** era by default. `World.Profile` selects the era; its derived values
+are defaults, so every explicit key still wins. The server logs the active profile once at
+startup. Timeline and sources: `D:/aaemu-audits/gap-audit-2026-11-02/research/trion-1.2-eu-na.md`.
+
+| Area | `EuAuroria` (default) | `EuLaunch` | `Kr12` |
+|---|---|---|---|
+| Retail window | Trion EU Conquest of Auroria to the day before Secrets of Ayanad: **2014-11-04 (NA) / 2014-11-06 (EU) to 2015-03-09** (engadget 2014-11-04; mein-mmo 2014-11-06; Total ArcheAge 2015-03, "level cap 55" with Secrets of Ayanad on 2015-03-10) | Trion NA/EU launch: **2014-09-12 (head start) / 2014-09-16 (launch) to 2014-11-03**, before Auroria (gameinformer 2014-08-30; tentonhammer 2014-09-12) | XL KR 1.2 data our templates come from (`r208022`) |
+| Player level cap | 50 | 50 | 55 |
+| Player nations (`systems::social::nation`, NATION-1..17) | off | off | on |
+| Weekly siege calendar (`Housing.SiegeCalendar`) | on | off | on |
+| Auroria claims / client `FeatureSet.siege` (profile; not the calendar key) | on | off | on |
+| Override keys | `Housing.SiegeCalendar` (calendar only), `FeatureSet.siege` (client bit), `Social.PlayerNations`, `FeatureSet.nations` | same | same |
+
+* **Level cap.** `ExperienceManager.PlayerLevelCap` is no longer a constant: `GameData::load`
+  passes `ServerProfile::player_level_cap()` to `ExperienceTable::from_templates`. A character
+  saved above a lowered cap keeps its level; a gain is trimmed at that character's level, the
+  same as at the cap, and `level_from_exp` never returns a level above the cap even though the
+  1.2 `levels` table has **101 rows** (the C# search range could run past the cap; from level 1
+  it could return level 56 at cap 55). The client `FeatureSet` level limit (byte 1) follows the
+  table. Mate cap stays `MATE_LEVEL_CAP = 50`.
+* **Partial exp above the cap is trimmed.** On load (`Character.ValidateAndFixExpAndLevel` ->
+  `validate_and_fix`) and on every exp gain the character's partial progress beyond the cap is
+  trimmed to the current level's total (save stores that result); the level itself is never lowered. Switching the profile back to a
+  higher cap therefore does not restore the trimmed progress.
+* **Open risk (client level limit with an above-cap character).** How the 1.2 client renders the
+  exp bar, the level number and tooltips when its `FeatureSet` level limit is 50 and the
+  character's level is above 50 is **UNVERIFIED**; it needs a live original-client check. The
+  server keeps the level and trims the exp as described above, so the client does receive a
+  level above its configured limit.
+* **Nations.** No public Trion 1.2 source shows player-nation founding (research §1.4/§3);
+  the research treats it as unavailable in 1.2. The server gate is
+  `Social.PlayerNations` (profile default), and the client `FeatureSet.nations` bit follows the
+  same value. A refused founding uses the existing precondition refusal (`FACTION_SEPARATE_RIGHTS`
+  40 for the skill / GM path), not a new error id. Existing nations loaded from the database are
+  not deleted by the switch (a profile change is not a migration).
+* **Sieges and claims are decoupled (2026-11-08 follow-up).** `Housing.SiegeCalendar` drives
+  only the inferred weekly siege calendar; its default follows the profile (on for `EuAuroria` /
+  `Kr12`, off for `EuLaunch`) and an explicit value wins. Auroria territory claims and the
+  client `FeatureSet.siege` bit follow the **profile** (`World.Profile`), not the calendar key:
+  an operator under `EuAuroria` with `Housing.SiegeCalendar=false` (GM-scheduled sieges only)
+  still claims territories and still shows the siege UI. An explicit `FeatureSet.siege` value
+  wins for the client bit; there is no separate claims key. A refused claim uses the existing
+  `DOMINION_CLOSED` 662 (the "not a claimable region" refusal). Trion's launch era had no
+  sieges or Auroria; Auroria opened on 2014-11-04 (NA) / 2014-11-06 (EU) (research §2/§4). The
+  Trion siege itself was a Lodestone system; our KR dominion siege with camp lots is a **server
+  policy approximation** of it, not a claim that the two rules match.
+* **UPGRADE (2026-11-08 follow-up).** A configuration without `Housing.SiegeCalendar` now gets
+  the weekly siege calendar from the default profile (`EuAuroria`: on). Before this change the
+  key defaulted to off (explicit GM schedules only). The calendar rules are INFERRED from the
+  1.2 tables with corroborated times; to keep the old calendar behaviour set
+  `Housing.SiegeCalendar=false`. That no longer disables Auroria claims or the client siege UI.
+* **Not modelled (owner decision):** Patron / free-player rules, APEX and labor potions are out
+  of scope for the profile.
 
 ## Live testing (phase 5): fixes and deliberate deviations
 
@@ -4785,11 +4869,14 @@ and in NPC wandering / buff remaining times.
   character or change the schedule; leaving also cancels the caller's engraving.
   `systems/housing/dominion/calendar.rs` adds the weekly period calendar from the 1.2 tables
   behind `Housing.SiegeCalendar` (default off, so the explicit GM path and its tests are
-  unchanged) and `Housing.SiegeCalendarTimezone` (empty/`local` = server local; the retail
-  timezone is UNKNOWN, INFERRED). Period ids/order, boundary arithmetic, the five wire
-  durations and the peace `started` = next auction start are EVIDENCED by the client
-  (`FUN_3956fc70`, `FUN_3946ba60`, `FUN_39838ff0`/`FUN_39839040`, `FUN_39839740`,
-  `FUN_3946be90`); weekday 0 = Sunday is INFERRED from the Sunday `siege_plans` weeks. The
+  unchanged) and `Housing.SiegeCalendarTimezone` (empty/`utc` = UTC, the default; `local` =
+  server local; the default is UTC because the Western launch-era schedule lists the same
+  wall-clock times as GMT, `round6-siege.md` 1, grade C). Period ids/order, boundary
+  arithmetic, the five wire durations and the peace `started` = next auction start are
+  EVIDENCED by the client (`FUN_3956fc70`, `FUN_3946ba60`, `FUN_39838ff0`/`FUN_39839040`,
+  `FUN_39839740`, `FUN_3946be90`); weekday 0 = Sunday is INFERRED from the Sunday
+  `siege_plans` weeks and corroborated (grade C) by the November 2014 Western schedule's
+  Sunday sieges at the table's times (`round6-siege.md` 1). The
   plan-week -> siege-Sunday mapping is also INFERRED: a plan week starts on Sunday and the
   authored warmup/siege weekday 0 is the Sunday that ends that week (a lower weekday rolls
   forward), the only reading that keeps the authored order auction Wed -> declare Fri ->
@@ -4798,16 +4885,40 @@ and in NPC wandering / buff remaining times.
   declare -> peace
   (client "unearned_win", `FUN_392f7db0`); a declared siege follows 2 -> 3 -> 4 -> 5. Only
   the week's rotating zone pair gets a cycle; other weeks stay in peace with the next cycle's
-  auction start. The plan rotation is deduplicated from `siege_plans` and, after the 2014
-  table, extended by the three-week modulo policy measured from 2014-01-05 (INFERRED server
-  policy; the retail recurrence is UNKNOWN). Explicit GM schedules keep their own timers and
+  auction start. The three-week pair rotation is corroborated (grade C) by the November 2014
+  Western schedule, whose consecutive weeks siege different pairs (`round6-siege.md` 1); the
+  plan rotation is deduplicated from `siege_plans` and, after the 2014 table, extended by the
+  three-week modulo policy measured from 2014-01-05 (the extrapolation stays an INFERRED
+  server policy; the retail recurrence beyond the table is UNKNOWN). Explicit GM schedules
+  keep their own timers and
   override the calendar for that territory. `/dominion clock <unixSeconds|off>` sets a
   non-persistent test clock for live verification of every period; it only drives the weekly
   calendar view. Explicit siege deadlines/tick transitions and the persisted state always use
   the real clock, and the command is refused while `Housing.SiegeCalendar` is disabled.
   GM scheduling with player registration is the chosen server policy for actually running a
-  siege; the camps can be posted as system lots with the GM `auction_post_siege_items` command
-  (WP-SD1b), but automatic posting at the auction period (WP-SD1c) remains unimplemented.
+  siege; the camps can also be posted as system lots with the GM `auction_post_siege_items`
+  command (WP-SD1b). Automatic posting at the auction period (WP-SD1c) is implemented by
+  `systems/housing/dominion/auction_post.rs`: on the first tick of a zone's auction period it
+  posts that zone's `siege_zones.declare_item_id` as a system lot. The lot count and item ids
+  come from the data (one per zone in the running rotation week; the six distinct camps in the
+  shipped table), the lot is anchored at the cycle's `auction_start` with the 48 h duration
+  class (the authored auction -> declare gap), the start bid is the item template's `price`
+  (5,000,000 copper), there is no buyout and the seller is the system (`client_id = 0`).
+  **INFERRED, capture-pending:** one lot per zone in the running pair (the six distinct camp
+  items cover the three pairs), the 48 h class rather than a lot that could be cut short, the start bid and
+  no-buyout choice, and that no siege-specific bid rule exists (increment, tie-break, outbid
+  refund and bid eligibility stay the normal auction engine's). Posting is idempotent per
+  cycle through the persisted `dominions.auction_posted_cycle` marker (a restart inside the
+  auction period posts nothing twice; a failed item creation releases the marker so the next
+  tick retries). The won camp item expires when the declare period ends (the cycle's
+  `warmup_start`) through the item's own `expiration_time` timer. Tests:
+  `auction_start_posts_one_system_lot_per_running_zone_from_the_authored_data`,
+  `posting_is_idempotent_on_a_repeated_tick_and_across_a_restart`,
+  `a_later_rotation_week_posts_its_own_zones_lots`,
+  `a_won_camp_item_expires_when_the_declare_period_ends_and_the_timer_removes_it`,
+  `a_disabled_calendar_posts_nothing`, `a_zone_without_a_camp_item_posts_nothing`, the gated
+  `auction_post_real_compact_db_prices_and_auction_gap` and
+  `dominion_auction_post_marker_round_trips_through_its_row` (MySQL).
   The rest of the dominion / siege work from the round-2 research (`siege-social-2.md`) is
   open: the offense ticket purchase WP-SD5 (CAPTURE-BLOCKED:
   `doodad_func_purchase_siege_tickets` has no rows) and siege hostility WP-SD7 (decision-blocked:
@@ -4820,6 +4931,19 @@ and in NPC wandering / buff remaining times.
   20:30..22:30 times never hit one); `view_at` returns None for the whole zone when its next
   rotation cycle cannot be built; and without WP-S2 (declaration) the calendar never enters
   warmup/siege on its own, so periods 3/4 exist only through an explicit GM schedule.
+* systems::housing (2026-11-08, calendar timezone default): `Housing.SiegeCalendarTimezone`
+  now defaults to **UTC** instead of the server's local offset (`""`/`utc`/`z` = UTC;
+  `local` and explicit `+HH:MM` offsets are still accepted). This is a **behaviour change**
+  for servers that never set the value: the territory claim window moves too, because
+  `claim_window_at` uses the same offset regardless of `Housing.SiegeCalendar` (the switch
+  only gates the weekly periods; the authored `open_weekday/open_hour/open_duration_hours`
+  claim window always follows the configured offset). The resolved offset and whether it came
+  from the configuration or the default are logged once at startup
+  (`systems/housing/mod.rs::System::start`). Evidence: `round6-siege.md` 1 (grade C, Total
+  ArcheAge 2014-11-20/25 lists the same wall-clock times as GMT); the original data's zone is
+  not proven, so `local` remains for servers that want it. Tests:
+  `timezone_parses_offsets_and_defaults_to_utc`,
+  `timezone_display_and_the_config_source_are_loggable`.
 * systems::housing / systems::social (WP-SD2a, 2026-11-06): the siege declaration is now
   persistent state, and the weekly calendar hands it over to the explicit siege record at the
   cycle's warmup start. `DominionState.declaration` holds the attacker expedition, the
@@ -4877,15 +5001,22 @@ and in NPC wandering / buff remaining times.
   cancels the effect. Cancelling is `dominion undeclare [zone]` (the GM command), which clears
   the declaration and broadcasts the zero offense team; the in-game trigger is UNKNOWN
   (destroying/removing the camp is the candidate), so it is capture-pending.
-  **Capture-pending assumptions:** 459 is used for the missing policy although 581 is the
-  other candidate text; the placement thresholds behind 625 (resurrection point), 633
-  (house), 661 (another zone) and 741 (obstacle), and the "siege too imminent" window behind
-  760, are UNKNOWN and are NOT enforced (no refusal today); the cancellation trigger's UI is
-  UNKNOWN. The check order is this server's policy. Tests:
+  The error split is now decided from the 1.2 texts and policy labels: 459
+  `SIEGE_MASTER_ONLY` (ui 2613 "only the siege commander") is the declaration's
+  `siege_master` refusal, and 581 `SIEGE_NO_RIGHTS_IN_EXPEDITION` (ui 4661 "you have no
+  siege-participation rights in the expedition") is the roster join's `join_siege` refusal
+  (ui 4656 "can join siege"); both player and GM roster-registration paths use
+  `dominion::rights::join_policy_allows` (`/joinsiege` and `/dominion register`), so no path
+  can add a member whose rank forbids joining. **Capture-pending assumptions:** the placement
+  thresholds behind 625 (resurrection point), 633 (house), 661 (another zone) and 741
+  (obstacle), and the "siege too imminent" window behind 760, are UNKNOWN and are NOT
+  enforced (no refusal today); the cancellation trigger's UI is UNKNOWN. The check order is
+  this server's policy. Tests:
   `camp_use_records_a_declaration_consumes_the_item_and_announces_the_team` (real
   `CSStartSkillPacket` item cast, item consumed once, cancel zero team),
   `camp_use_refusals_use_the_client_ids_and_keep_the_item` (342/343/344/386/345/459/444/639/
-  442/443, item kept each time).
+  442/443, item kept each time), `unrelated_stale_or_rank_ineligible_members_cannot_join`
+  (581 on the join path), `the_gm_register_path_also_applies_the_join_policy`.
 * systems::housing (WP-SD2c, 2026-11-06): the headquarters follow the declaration. The camp
   doodad bound by SD2b is the offense HQ from acceptance: `Headquarters::bind_declaration`
   stores it against the declaration (no siege record yet) and `bind_materialised` stamps it
@@ -4964,7 +5095,7 @@ and in NPC wandering / buff remaining times.
   are zone groups 54/56); outside the recurring `open_weekday/open_hour/open_duration_hours`
   window it is `DOMINION_NOT_DECLARE_TIME` 582 (case `0x246`; ui_texts 4662, whose `$2 weekday
   $3 o'clock $4 hours` parameters are exactly those columns). The window is computed by
-  `dominion::calendar::claim_window_at` (weekday 0 = Sunday INFERRED as everywhere else) and
+  `dominion::calendar::claim_window_at` (weekday 0 = Sunday, as corroborated above) and
   applies **regardless of `Housing.SiegeCalendar`**: that switch drives the inferred weekly
   cycle, not the authored claim columns. It uses the **real wall clock**; the GM
   `/dominion clock` is restricted to the calendar view. `open_duration_hours >= 168` covers the
