@@ -13,21 +13,21 @@ use crate::systems::social::team::{risky_action, INVITATION_TIMEOUT_MS};
 use crate::test_support::{spawn_player, test_character, test_server, TestClient};
 use crate::world::PlayerRef;
 
-struct Pc {
-    c: TestClient,
-    p: PlayerRef,
+pub(super) struct Pc {
+    pub(super) c: TestClient,
+    pub(super) p: PlayerRef,
 }
 
 impl Pc {
-    fn ops(&mut self) -> Vec<u16> {
+    pub(super) fn ops(&mut self) -> Vec<u16> {
         self.c.drain_ops()
     }
 
-    fn frames(&mut self) -> Vec<(u16, Vec<u8>)> {
+    pub(super) fn frames(&mut self) -> Vec<(u16, Vec<u8>)> {
         self.c.drain()
     }
 
-    async fn send(&mut self, server: &GameServer, opcode: u16, body: PacketStream) {
+    pub(super) async fn send(&mut self, server: &GameServer, opcode: u16, body: PacketStream) {
         server
             .handle_frame(&mut self.c.conn, &encode_raw(1, opcode, body.as_bytes()))
             .await
@@ -35,10 +35,13 @@ impl Pc {
     }
 }
 
-fn pc(server: &GameServer, id: u32, name: &str, x: f32, y: f32) -> Pc {
+pub(super) fn pc(server: &GameServer, id: u32, name: &str, x: f32, y: f32) -> Pc {
     let c = TestClient::new(server, id, 1000 + id);
     let p = spawn_player(server, &c, test_character(id, name, x, y), 0x100 + id);
     p.data().is_online = true;
+    // Alive (a guild invitation to a dead character is refused).
+    p.data().unit.hp = 100;
+    p.data().unit.max_hp = 100;
     let mut c = c;
     c.conn.active_char = Some(p.clone());
     c.drain();
@@ -46,13 +49,13 @@ fn pc(server: &GameServer, id: u32, name: &str, x: f32, y: f32) -> Pc {
 }
 
 /// Drops the frames produced by spawning (players seeing each other).
-fn settle(pcs: &mut [&mut Pc]) {
+pub(super) fn settle(pcs: &mut [&mut Pc]) {
     for p in pcs.iter_mut() {
         p.c.drain();
     }
 }
 
-fn find(frames: &[(u16, Vec<u8>)], op: u16) -> Vec<Vec<u8>> {
+pub(super) fn find(frames: &[(u16, Vec<u8>)], op: u16) -> Vec<Vec<u8>> {
     frames
         .iter()
         .filter(|(o, _)| *o == op)
@@ -93,24 +96,6 @@ fn risky(team_id: u32, target: u32, action: u8) -> PacketStream {
     s
 }
 
-fn direct_leave(team_id: u32) -> PacketStream {
-    let mut s = PacketStream::new();
-    s.write_u32(team_id);
-    s
-}
-
-fn direct_kick(team_id: u32, member_id: u32) -> PacketStream {
-    let mut s = PacketStream::new();
-    s.write_u32(team_id).write_u32(member_id);
-    s
-}
-
-fn direct_dismiss(team_id: u32) -> PacketStream {
-    let mut s = PacketStream::new();
-    s.write_u32(team_id);
-    s
-}
-
 fn chat(t: i16, msg: &str) -> PacketStream {
     let mut s = PacketStream::new();
     s.write_i16(t)
@@ -135,7 +120,7 @@ fn whisper(target: &str, msg: &str) -> PacketStream {
     s
 }
 
-fn name_body(name: &str) -> PacketStream {
+pub(super) fn name_body(name: &str) -> PacketStream {
     let mut s = PacketStream::new();
     s.write_str(name);
     s
@@ -163,6 +148,24 @@ fn user_chat(identity: i64, message: &str) -> PacketStream {
     s
 }
 
+fn direct_leave(team_id: u32) -> PacketStream {
+    let mut s = PacketStream::new();
+    s.write_u32(team_id);
+    s
+}
+
+fn direct_kick(team_id: u32, member_id: u32) -> PacketStream {
+    let mut s = PacketStream::new();
+    s.write_u32(team_id).write_u32(member_id);
+    s
+}
+
+fn direct_dismiss(team_id: u32) -> PacketStream {
+    let mut s = PacketStream::new();
+    s.write_u32(team_id);
+    s
+}
+
 fn expect_chat_error(p: &mut Pc, error: i16) {
     use crate::packets::world::SCErrorMsgPacket;
     assert_eq!(
@@ -172,37 +175,6 @@ fn expect_chat_error(p: &mut Pc, error: i16) {
             body(&SCErrorMsgPacket::new(error, 0, true))
         )]
     );
-}
-
-fn expect_chat_failed(p: &mut Pc, error: i16, channel: &str) {
-    use crate::systems::social::packets::chat::SCChatFailedPacket;
-    assert_eq!(
-        p.frames(),
-        vec![(
-            sc::SCChatFailedPacket,
-            body(&SCChatFailedPacket::new(error, channel))
-        )]
-    );
-}
-
-/// The `SCRestrictInfoPacket` a muted sender gets: `chname`, `index` 0, `code` 0 (chat),
-/// `duration` = remaining seconds of the persisted mute, `end` = the persisted end and
-/// `start` = `end - duration` (the notice time; the client ignores both dates).
-fn expect_restrict_info(p: &mut Pc, chname: &str, until: i64) {
-    let frames = p.frames();
-    assert_eq!(frames.len(), 1, "one refusal, nothing else");
-    assert_eq!(frames[0].0, sc::SCRestrictInfoPacket);
-    let mut s = PacketStream::from_bytes(frames[0].1.clone());
-    assert_eq!(s.read_string().unwrap(), chname);
-    assert_eq!(s.read_i32().unwrap(), 0, "index");
-    assert_eq!(s.read_u8().unwrap(), 0, "restrictCode (chat)");
-    let duration = s.read_u32().unwrap();
-    let start = s.read_i64().unwrap();
-    let end = s.read_i64().unwrap();
-    assert_eq!(end, until);
-    assert_eq!(start, until - i64::from(duration));
-    assert!((595..=600).contains(&duration), "{duration}");
-    assert_eq!(s.remaining(), 0);
 }
 
 /// The full expected `SCChatMessagePacket` body: literal identity bytes, then the sender block
@@ -565,97 +537,9 @@ async fn user_chat_create_join_password_message_and_leave_flow() {
 }
 
 #[tokio::test]
-async fn channel_bound_chat_failures_use_scc_chat_failed_only_when_enabled() {
-    use crate::packets::world::error_message;
-    use crate::systems::social::chat::user_channel_identity;
-    use crate::systems::social::util::error;
-    let server = test_server();
-    let mut a = pc(&server, 1, "Al", 100.0, 100.0);
-    let mut b = pc(&server, 2, "Bob", 110.0, 100.0);
-    settle(&mut [&mut a, &mut b]);
-
-    // Default (flag off): exactly the pre-flag toast.
-    a.send(
-        &server,
-        cs::CSSendChatMessagePacket,
-        chat(chat_type::PARTY, "x"),
-    )
-    .await;
-    expect_chat_error(&mut a, error::CHAT_NOT_IN_PARTY);
-
-    server.config.update(|c| c.chat.chat_failed_packet = true);
-
-    // Party / raid / expedition / family: the channel label travels with the error.
-    for (kind, code, channel) in [
-        (chat_type::PARTY, error::CHAT_NOT_IN_PARTY, "Party"),
-        (chat_type::RAID, error::CHAT_NOT_IN_RAID, "Raid"),
-        (chat_type::CLAN, error::CHAT_NOT_IN_EXPEDITION, "Expedition"),
-        (chat_type::FAMILY, error::CHAT_NOT_IN_FAMILY, "Family"),
-    ] {
-        a.send(&server, cs::CSSendChatMessagePacket, chat(kind, "x"))
-            .await;
-        expect_chat_failed(&mut a, code, channel);
-    }
-
-    // User channels: a non-member message and a leave answer with the channel's own name.
-    b.send(
-        &server,
-        cs::CSJoinUserChatChannelPacket,
-        user_join("Public", "", true),
-    )
-    .await;
-    assert_eq!(b.ops(), vec![sc::SCJoinedChatChannelPacket]);
-    let channel = server
-        .chat
-        .list_all_channels()
-        .into_iter()
-        .find(|c| c.chat_type == chat_type::USER)
-        .unwrap();
-    let identity = user_channel_identity(&channel);
-    a.send(
-        &server,
-        cs::CSSendChatMessagePacket,
-        user_chat(identity, "x"),
-    )
-    .await;
-    expect_chat_failed(&mut a, error::CHAT_NOT_JOINED_CHANNEL, "Public");
-    a.send(&server, cs::CSLeaveChatChannelPacket, user_leave(identity))
-        .await;
-    expect_chat_failed(&mut a, error::CHAT_NOT_JOINED_CHANNEL, "Public");
-    // A channel that does not exist has no name to show.
-    a.send(
-        &server,
-        cs::CSSendChatMessagePacket,
-        user_chat(identity | (1i64 << 16), "x"),
-    )
-    .await;
-    expect_chat_failed(&mut a, error::CHAT_NO_CHANNEL, "");
-    // Join failures answer with the requested name.
-    a.send(
-        &server,
-        cs::CSJoinUserChatChannelPacket,
-        user_join("Missing", "", false),
-    )
-    .await;
-    expect_chat_failed(&mut a, error::CHAT_NO_CHANNEL, "Missing");
-    a.send(
-        &server,
-        cs::CSJoinUserChatChannelPacket,
-        user_join("Public", "", true),
-    )
-    .await;
-    expect_chat_failed(&mut a, error::CHAT_CHANNEL_ALREADY_EXISTS, "Public");
-
-    // A whisper to a missing player is not channel-bound: the toast stays.
-    a.send(&server, cs::CSSendChatMessagePacket, whisper("Nobody", "x"))
-        .await;
-    expect_chat_error(&mut a, error_message::WHISPER_NO_TARGET);
-}
-
-#[tokio::test]
 async fn user_chat_requires_active_session_and_cleans_departing_members() {
     use crate::systems::social::chat::user_channel_identity;
-    use crate::systems::social::util::{error, ChatFailure};
+    use crate::systems::social::util::error;
     let server = test_server();
     let mut a = pc(&server, 1, "Al", 100.0, 100.0);
     let mut b = pc(&server, 2, "Bob", 110.0, 100.0);
@@ -722,7 +606,10 @@ async fn user_chat_requires_active_session_and_cleans_departing_members() {
                 language_type: 0
             }
         ),
-        Err(ChatFailure::new(error::CHAT_NOT_JOINED_CHANNEL, "Public"))
+        Err(crate::systems::social::util::ChatFailure::new(
+            error::CHAT_NOT_JOINED_CHANNEL,
+            channel.internal_name()
+        ))
     );
     assert!(!channel.contains(&stale));
     // The disconnect edge must also clean an already-offline active character, for which
@@ -908,161 +795,6 @@ async fn risky_team_actions_require_member_owner_and_known_action() {
         assert!(!member.p.data().in_party);
     }
     assert!(server.systems.social.teams.active_team(team_id).is_none());
-}
-
-/// Runs one team action on a fresh party of three (A owner, B, C): the direct packet
-/// (0x7d / 0x7e / 0x84) and the `CSAskRiskyTeamAction` it is the confirmation of. Returns
-/// every member's frames so the two paths can be compared byte for byte.
-async fn team_action_frames(action: u8, direct: bool) -> [Vec<(u16, Vec<u8>)>; 3] {
-    let server = test_server();
-    let mut a = pc(&server, 1, "Al", 100.0, 100.0);
-    let mut b = pc(&server, 2, "Bob", 110.0, 100.0);
-    let mut c = pc(&server, 3, "Cy", 120.0, 100.0);
-    let team_id = form_party(&server, &mut a, &mut b).await;
-    a.send(&server, cs::CSInviteToTeamPacket, invite(team_id, "Cy"))
-        .await;
-    c.send(
-        &server,
-        cs::CSReplyToJoinTeamPacket,
-        reply(team_id, a.p.character_id, false),
-    )
-    .await;
-    settle(&mut [&mut a, &mut b, &mut c]);
-
-    let target = match action {
-        risky_action::LEAVE => b.p.character_id,
-        risky_action::KICK => c.p.character_id,
-        risky_action::DISMISS => a.p.character_id,
-        _ => unreachable!(),
-    };
-    if direct {
-        match action {
-            risky_action::LEAVE => {
-                b.send(&server, cs::CSLeaveTeamPacket, direct_leave(team_id))
-                    .await
-            }
-            risky_action::KICK => {
-                a.send(
-                    &server,
-                    cs::CSKickTeamMemberPacket,
-                    direct_kick(team_id, target),
-                )
-                .await
-            }
-            _ => {
-                a.send(&server, cs::CSDismissTeamPacket, direct_dismiss(team_id))
-                    .await
-            }
-        }
-    } else {
-        let actor = if action == risky_action::LEAVE {
-            &mut b
-        } else {
-            &mut a
-        };
-        actor
-            .send(
-                &server,
-                cs::CSAskRiskyTeamActionPacket,
-                risky(team_id, target, action),
-            )
-            .await;
-    }
-    [a.frames(), b.frames(), c.frames()]
-}
-
-/// The 1.2 client's confirmation callback sends `CSLeaveTeam` / `CSKickTeamMember` /
-/// `CSDismissTeam` (`FUN_39309670` -> `FUN_393095c0`); each must perform the same action,
-/// with the same frames, as the `CSAskRiskyTeamAction` it confirms.
-#[tokio::test]
-async fn direct_team_packets_match_risky_action_frames() {
-    for action in [
-        risky_action::LEAVE,
-        risky_action::KICK,
-        risky_action::DISMISS,
-    ] {
-        let direct = team_action_frames(action, true).await;
-        let risky = team_action_frames(action, false).await;
-        assert_eq!(direct, risky, "action {action}");
-    }
-}
-
-/// The direct packets keep the risky path's permission checks: only the owner may kick or
-/// dismiss, and a kick target must be a team member.
-#[tokio::test]
-async fn direct_team_kick_and_dismiss_require_owner() {
-    let server = test_server();
-    let mut a = pc(&server, 1, "Al", 100.0, 100.0);
-    let mut b = pc(&server, 2, "Bob", 110.0, 100.0);
-    let mut c = pc(&server, 3, "Cy", 120.0, 100.0);
-    let team_id = form_party(&server, &mut a, &mut b).await;
-    a.send(&server, cs::CSInviteToTeamPacket, invite(team_id, "Cy"))
-        .await;
-    c.send(
-        &server,
-        cs::CSReplyToJoinTeamPacket,
-        reply(team_id, a.p.character_id, false),
-    )
-    .await;
-    settle(&mut [&mut a, &mut b, &mut c]);
-
-    // B is not the owner: neither kick nor dismiss has any effect.
-    b.send(
-        &server,
-        cs::CSKickTeamMemberPacket,
-        direct_kick(team_id, c.p.character_id),
-    )
-    .await;
-    b.send(&server, cs::CSDismissTeamPacket, direct_dismiss(team_id))
-        .await;
-    assert!(a.ops().is_empty() && b.ops().is_empty() && c.ops().is_empty());
-    // The owner cannot kick a non-member.
-    a.send(
-        &server,
-        cs::CSKickTeamMemberPacket,
-        direct_kick(team_id, 99),
-    )
-    .await;
-    assert!(a.ops().is_empty() && b.ops().is_empty() && c.ops().is_empty());
-    let team = server
-        .systems
-        .social
-        .teams
-        .active_team(team_id)
-        .expect("team preserved");
-    assert_eq!(team.owner_id, a.p.character_id);
-    assert_eq!(team.members_count(), 3);
-    assert!(a.p.data().in_party && b.p.data().in_party && c.p.data().in_party);
-
-    // The owner's direct kick still works.
-    a.send(
-        &server,
-        cs::CSKickTeamMemberPacket,
-        direct_kick(team_id, c.p.character_id),
-    )
-    .await;
-    assert_eq!(
-        c.frames(),
-        vec![(
-            sc::SCLeavedTeamPacket,
-            body(&SCLeavedTeamPacket {
-                team_id,
-                kicked: true,
-                dismissed: false
-            })
-        )]
-    );
-    assert!(!c.p.data().in_party);
-    assert_eq!(
-        server
-            .systems
-            .social
-            .teams
-            .active_team(team_id)
-            .expect("team")
-            .members_count(),
-        2
-    );
 }
 
 #[tokio::test]
@@ -1262,11 +994,13 @@ async fn team_invite_accept_chat_owner_kick_leave() {
         reply(team_id, a.p.character_id, false),
     )
     .await;
+    // The late joiner joins the party chat channel too (the C# forgot to).
     assert_eq!(
         c.ops(),
         vec![
             sc::SCJoinedTeamPacket,
             sc::SCTeamPingPosPacket,
+            sc::SCJoinedChatChannelPacket,
             sc::SCRefreshTeamMemberPacket,
             sc::SCRefreshTeamMemberPacket
         ]
@@ -1279,17 +1013,25 @@ async fn team_invite_accept_chat_owner_kick_leave() {
         b.ops(),
         vec![sc::SCTeamMemberJoinedPacket, sc::SCRefreshTeamMemberPacket]
     );
-    // Note (C#): a member joining an existing team does not join the party chat channel, but
-    // can still talk into it.
+    // ... so it hears the party as well as talks into it.
     c.send(
         &server,
         cs::CSSendChatMessagePacket,
         chat(chat_type::PARTY, "x"),
     )
     .await;
-    assert!(c.ops().is_empty());
+    assert_eq!(c.ops(), vec![sc::SCChatMessagePacket]);
     assert_eq!(a.ops(), vec![sc::SCChatMessagePacket]);
     assert_eq!(b.ops(), vec![sc::SCChatMessagePacket]);
+    b.send(
+        &server,
+        cs::CSSendChatMessagePacket,
+        chat(chat_type::PARTY, "y"),
+    )
+    .await;
+    assert_eq!(c.ops(), vec![sc::SCChatMessagePacket]);
+    a.ops();
+    b.ops();
 
     // Owner change A -> B.
     let mut s = PacketStream::new();
@@ -1304,6 +1046,11 @@ async fn team_invite_accept_chat_owner_kick_leave() {
     }
 
     // A (no longer owner) cannot kick; B kicks C.
+    let c_channel_left = body(&crate::packets::world::SCLeavedChatChannelPacket {
+        chat_type: chat_type::PARTY,
+        sub_type: (team_id << 6) as i16,
+        faction_id: 0,
+    });
     a.send(
         &server,
         cs::CSAskRiskyTeamActionPacket,
@@ -1317,26 +1064,26 @@ async fn team_invite_accept_chat_owner_kick_leave() {
         risky(team_id, 3, risky_action::KICK),
     )
     .await;
-    // The kicked member is removed first, so it only gets SCLeavedTeamPacket.
+    // The kicked member leaves its party chat channel (the C# made the kicker leave its own
+    // instead), is removed from the team first, so it only gets SCLeavedTeamPacket after that.
     assert_eq!(
         c.frames(),
-        vec![(
-            sc::SCLeavedTeamPacket,
-            body(&SCLeavedTeamPacket {
-                team_id,
-                kicked: true,
-                dismissed: false
-            })
-        )]
+        vec![
+            (sc::SCLeavedChatChannelPacket, c_channel_left.clone(),),
+            (
+                sc::SCLeavedTeamPacket,
+                body(&SCLeavedTeamPacket {
+                    team_id,
+                    kicked: true,
+                    dismissed: false
+                })
+            )
+        ]
     );
-    // Note (C#): the kicker (B) leaves its own party chat channel.
+    // The kicker (B) keeps its party chat channel.
     assert_eq!(
         b.ops(),
-        vec![
-            sc::SCLeavedChatChannelPacket,
-            sc::SCTeamMemberLeavedPacket,
-            sc::SCTeamAckRiskyActionPacket
-        ]
+        vec![sc::SCTeamMemberLeavedPacket, sc::SCTeamAckRiskyActionPacket]
     );
     assert_eq!(
         a.ops(),
@@ -1363,6 +1110,7 @@ async fn team_invite_accept_chat_owner_kick_leave() {
             sc::SCTeamMemberLeavedPacket,
             sc::SCTeamAckRiskyActionPacket,
             sc::SCTeamDismissedPacket,
+            sc::SCLeavedChatChannelPacket,
             sc::SCLeavedTeamPacket
         ]
     );
@@ -1713,8 +1461,21 @@ async fn guild_create_invite_kick_roles_and_disband() {
     }
     let before_transfer = server.expeditions.get(id).unwrap();
     // An outsider, an ordinary member, and a self-transfer cannot change the owner snapshot
-    // or downgrade the current owner's role. Invalid requests send no transition packets.
-    for (actor, target) in [(9, 2), (3, 2), (1, 1)] {
+    // or downgrade the current owner's role. Invalid requests send no transition packets, only
+    // the caller's error.
+    for (actor, target, refused) in [
+        (
+            9,
+            2,
+            crate::systems::social::util::error::ONLY_EXPEDITION_MEMBER,
+        ),
+        (3, 2, crate::systems::social::util::error::FACTION_RIGHTS),
+        (
+            1,
+            1,
+            crate::systems::social::util::error::EXPEDITION_CHANGE_OWNER_SELF,
+        ),
+    ] {
         let mut request = PacketStream::new();
         request.write_u32(target);
         if actor == 9 {
@@ -1727,10 +1488,17 @@ async fn guild_create_invite_kick_roles_and_disband() {
                 .await;
         }
         assert_eq!(server.expeditions.get(id).unwrap(), before_transfer);
-        assert!(outsider.ops().is_empty());
-        for member in pcs.iter_mut() {
-            assert!(member.ops().is_empty());
+        if actor == 9 {
+            assert_eq!(outsider.frames(), vec![error_frame(refused)]);
         }
+        for (i, member) in pcs.iter_mut().enumerate() {
+            if i + 1 == actor as usize {
+                assert_eq!(member.frames(), vec![error_frame(refused)]);
+            } else {
+                assert!(member.ops().is_empty());
+            }
+        }
+        outsider.ops();
     }
     let mut s = PacketStream::new();
     s.write_u32(2);
@@ -1788,12 +1556,14 @@ async fn guild_create_invite_kick_roles_and_disband() {
 
 /// The role-policy packet carries nine permission flags. The 1.2 client only lets the owner
 /// (role 255) edit a lower role (`SET_POLICY = role == 255` in its role-policy tab), so a
-/// Commander's `Expel` right must not help. Every field must reach the stored policy and the
-/// broadcast packet the members receive.
+/// Commander's `Expel` right must not help. The dialog edits the name and the invite / expel /
+/// promote / siege-join flags only; the other four keep their stored value, and the stored
+/// policy is what the members receive.
 #[tokio::test]
-async fn guild_role_policy_change_copies_every_field() {
+async fn guild_role_policy_change_matches_the_dialog_fields() {
     use crate::data::world_data::SystemFaction;
     use crate::systems::social::expedition::{Expedition, ExpeditionMember, ExpeditionRolePolicy};
+    use crate::systems::social::util::error;
 
     let server = test_server();
     let mut owner = pc(&server, 1, "Owner", 100.0, 100.0);
@@ -1868,7 +1638,7 @@ async fn guild_role_policy_change_copies_every_field() {
     };
 
     // Role 3 carries the C# Expel right, but the 1.2 client only enables the check boxes for
-    // the owner: the change must not be stored and nothing is broadcast.
+    // the owner: the change must not be stored, and the officer is told why.
     officer
         .send(
             &server,
@@ -1886,7 +1656,15 @@ async fn guild_role_policy_change_copies_every_field() {
             .name,
         "Apprentice"
     );
-    assert!(officer.ops().is_empty());
+    let frames = officer.frames();
+    assert_eq!(
+        find(&frames, sc::SCErrorMsgPacket),
+        vec![body(&crate::packets::world::SCErrorMsgPacket::new(
+            error::FACTION_CHANGE_MEMBER_ROLE_RIGHTS,
+            0,
+            true
+        ))]
+    );
 
     // The owner cannot edit their own (role 255) policy either.
     owner
@@ -1906,10 +1684,19 @@ async fn guild_role_policy_change_copies_every_field() {
             .name,
         "General"
     );
-    assert!(owner.ops().is_empty());
+    let frames = owner.frames();
+    assert_eq!(
+        find(&frames, sc::SCErrorMsgPacket),
+        vec![body(&crate::packets::world::SCErrorMsgPacket::new(
+            error::FACTION_CHANGE_MEMBER_ROLE_RIGHTS,
+            0,
+            true
+        ))]
+    );
 
-    // The owner edits role 0 with every flag set: all nine fields must be kept in the stored
-    // policy and in the packet broadcast to both members.
+    // The owner edits role 0 with every flag set: the name and the five dialog fields must be
+    // kept in the stored policy and in the packet broadcast to both members; the four flags
+    // the dialog does not edit keep their stored value.
     owner
         .send(
             &server,
@@ -1917,7 +1704,11 @@ async fn guild_role_policy_change_copies_every_field() {
             request(0, "Recruit", true),
         )
         .await;
-    let expected = policy(0, "Recruit", [true; 9]);
+    let expected = policy(
+        0,
+        "Recruit",
+        [false, true, true, true, false, false, false, false, true],
+    );
     assert_eq!(
         server
             .expeditions
@@ -2006,7 +1797,7 @@ async fn private_mysql_expedition_owner_transition_persists_consistent_snapshot(
             name: "Knights".into(),
             owner_id: 1,
             owner_name: "Al".into(),
-            mother_id: 148,
+            mother_id: 101,
             ..Default::default()
         },
         members: vec![
@@ -2080,7 +1871,7 @@ async fn private_mysql_expedition_owner_transition_persists_consistent_snapshot(
 
 #[tokio::test]
 #[ignore = "requires private MySQL3317 via AAEMU_TEST_MYSQL; uses connection-local temporary expedition tables"]
-async fn private_mysql_expedition_role_policy_persists_every_field() {
+async fn private_mysql_expedition_role_policy_persists_the_dialog_fields() {
     use crate::data::world_data::SystemFaction;
     use crate::systems::social::expedition::{self, Expedition, ExpeditionRolePolicy};
     use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
@@ -2174,8 +1965,8 @@ async fn private_mysql_expedition_role_policy_persists_every_field() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(saved, (1, 1, 1, 1, 1, 1, 1, 1, 1, "Recruit".into()));
-    // Reload from the temporary tables: the whole policy round-trips.
+    assert_eq!(saved, (0, 1, 1, 1, 0, 0, 0, 0, 1, "Recruit".into()));
+    // Reload from the temporary tables: the stored policy round-trips.
     server.expeditions.load(&pool).await.unwrap();
     assert_eq!(
         server
@@ -2184,7 +1975,11 @@ async fn private_mysql_expedition_role_policy_persists_every_field() {
             .unwrap()
             .policy_by_role(0)
             .unwrap(),
-        &policy(0, "Recruit", [true; 9])
+        &policy(
+            0,
+            "Recruit",
+            [false, true, true, true, false, false, false, false, true],
+        )
     );
     for table in [
         "expedition_role_policies",
@@ -2467,10 +2262,11 @@ async fn blocked_sender_is_silently_dropped_on_every_direct_path() {
         .await;
     assert!(a.frames().is_empty() && b.frames().is_empty());
 
-    // Friend add.
+    // Friend add: the adder gets the unknown-user failure (551), the blocker nothing.
     b.send(&server, cs::CSAddFriendPacket, name_body("Al"))
         .await;
-    assert!(a.frames().is_empty() && b.frames().is_empty());
+    assert!(a.frames().is_empty());
+    assert_eq!(b.frames().len(), 1);
     assert!(b.p.data().friends.is_empty());
 
     // Trade request.
@@ -2758,14 +2554,14 @@ async fn team_invite_errors_follow_the_client_codes() {
     expect_chat_error(&mut b, error::TEAM_NO_RIGHTS);
     assert!(c.ops().is_empty());
 
-    // An accept or a reject with no pending invitation is silent (no team error fits it).
+    // An accept without a pending invitation reports TEAM_JOIN; a reject stays silent.
     c.send(
         &server,
         cs::CSReplyToJoinTeamPacket,
         reply_area(team_id, 1, false),
     )
     .await;
-    assert!(c.ops().is_empty());
+    expect_chat_error(&mut c, error::TEAM_JOIN);
     c.send(
         &server,
         cs::CSReplyToJoinTeamPacket,
@@ -2836,6 +2632,7 @@ async fn team_invite_errors_follow_the_client_codes() {
     )
     .await;
     expect_chat_error(&mut c, error::TEAM_JOIN_ALONE);
+    expect_chat_error(&mut a, error::TEAM_INVITEE_IN_TEAM);
 
     // Inviting a target who is already in a team: TEAM_INVITEE_IN_TEAM (77) to the inviter.
     a.send(&server, cs::CSInviteToTeamPacket, invite(team_id, "Cy"))
@@ -2862,16 +2659,21 @@ async fn team_owner_logout_drops_pending_invitations() {
         .await;
     assert_eq!(b.ops(), vec![sc::SCAskToJoinTeamPacket]);
     crate::world::session::set_online(&server, &a.p, false);
+    // The logout drops the invitation, tells the invitee that the inviter is gone and closes
+    // its popup; a late accept without a pending invitation gets TEAM_JOIN.
     assert_eq!(
         b.frames(),
-        vec![(
-            sc::SCInvitationCanceledPacket,
-            vec![invitation_canceled_kind::TEAM]
-        )]
+        vec![
+            error_frame(crate::systems::social::util::error::TEAM_INVITOR_OFFLINE),
+            (
+                sc::SCInvitationCanceledPacket,
+                vec![invitation_canceled_kind::TEAM]
+            )
+        ]
     );
     b.send(&server, cs::CSReplyToJoinTeamPacket, reply(0, 1, false))
         .await;
-    assert!(b.ops().is_empty(), "no invitation, no reply");
+    expect_chat_error(&mut b, crate::systems::social::util::error::TEAM_JOIN);
     crate::world::session::set_online(&server, &a.p, true);
     a.send(&server, cs::CSInviteToTeamPacket, invite(0, "Bob"))
         .await;
@@ -3171,10 +2973,10 @@ async fn expired_team_invitations_are_swept() {
         .await;
     assert_eq!(b.ops(), vec![sc::SCAskToJoinTeamPacket]);
 
-    // After 60 s the 500 ms tick drops the pending invitation and closes the popup (kind 1
-    // for a named invitation), so a new one is accepted.
+    // After 60 s the 500 ms tick drops the pending invitation, so a new one is accepted.
     let expired_at = crate::systems::social::util::now_ms() + INVITATION_TIMEOUT_MS + 1;
     teams.update_all_teams(&server, expired_at);
+    // The sweep also closes the invitee's popup (`SCInvitationCanceled`).
     assert_eq!(
         b.frames(),
         vec![(
@@ -3186,11 +2988,12 @@ async fn expired_team_invitations_are_swept() {
         .await;
     assert_eq!(b.ops(), vec![sc::SCAskToJoinTeamPacket]);
 
-    // A reply once the invitation has been swept is silent (no pending invitation). The
-    // second invitation was issued after `expired_at` was computed, so sweep past its own
-    // deadline.
+    // A reply once the invitation has been swept has no pending invitation any more, so the
+    // accept gets TEAM_JOIN. The second invitation was issued after `expired_at` was computed,
+    // so sweep past its own deadline.
     let expired_at = crate::systems::social::util::now_ms() + INVITATION_TIMEOUT_MS + 1;
     teams.update_all_teams(&server, expired_at);
+    // The second sweep closes the second invitation's popup too.
     assert_eq!(
         b.frames(),
         vec![(
@@ -3200,171 +3003,7 @@ async fn expired_team_invitations_are_swept() {
     );
     b.send(&server, cs::CSReplyToJoinTeamPacket, reply(0, 1, false))
         .await;
-    assert!(b.ops().is_empty());
-}
-
-/// An expired area invitation closes the same popup type with kind 2 (the 1-vs-2 split is
-/// INFERRED; the client closes popup type 2 for both).
-#[tokio::test]
-async fn expired_area_team_invitation_sends_kind_two() {
-    let server = test_server();
-    let mut a = pc(&server, 1, "Al", 100.0, 100.0);
-    let mut b = pc(&server, 2, "Bob", 110.0, 100.0);
-    settle(&mut [&mut a, &mut b]);
-
-    let mut s = PacketStream::new();
-    s.write_u32(0).write_bool(true);
-    a.send(&server, cs::CSInviteAreaToTeamPacket, s).await;
-    assert_eq!(b.ops(), vec![sc::SCAskToJoinTeamAreaPacket]);
-    a.ops();
-
-    let expired_at = crate::systems::social::util::now_ms() + INVITATION_TIMEOUT_MS + 1;
-    server
-        .systems
-        .social
-        .teams
-        .update_all_teams(&server, expired_at);
-    assert_eq!(
-        b.frames(),
-        vec![(
-            sc::SCInvitationCanceledPacket,
-            vec![invitation_canceled_kind::TEAM_AREA]
-        )]
-    );
-}
-
-/// An invitation issued by a character that goes offline is dropped and its invitee's popup is
-/// closed.
-#[tokio::test]
-async fn team_invitation_is_canceled_when_the_inviter_goes_offline() {
-    let server = test_server();
-    let mut a = pc(&server, 1, "Al", 100.0, 100.0);
-    let mut b = pc(&server, 2, "Bob", 110.0, 100.0);
-    settle(&mut [&mut a, &mut b]);
-
-    a.send(&server, cs::CSInviteToTeamPacket, invite(0, "Bob"))
-        .await;
-    assert_eq!(b.ops(), vec![sc::SCAskToJoinTeamPacket]);
-
-    crate::world::session::set_online(&server, &a.p, false);
-    assert_eq!(
-        b.frames(),
-        vec![(
-            sc::SCInvitationCanceledPacket,
-            vec![invitation_canceled_kind::TEAM]
-        )]
-    );
-}
-
-/// An accepted invitation consumes the pending one, so the later sweep sends nothing.
-#[tokio::test]
-async fn accepted_team_invitation_sends_no_cancellation() {
-    let server = test_server();
-    let mut a = pc(&server, 1, "Al", 100.0, 100.0);
-    let mut b = pc(&server, 2, "Bob", 110.0, 100.0);
-    settle(&mut [&mut a, &mut b]);
-
-    a.send(&server, cs::CSInviteToTeamPacket, invite(0, "Bob"))
-        .await;
-    b.ops();
-    b.send(
-        &server,
-        cs::CSReplyToJoinTeamPacket,
-        reply(0, a.p.character_id, false),
-    )
-    .await;
-    assert!(find(&b.frames(), sc::SCInvitationCanceledPacket).is_empty());
-
-    let expired_at = crate::systems::social::util::now_ms() + INVITATION_TIMEOUT_MS + 1;
-    server
-        .systems
-        .social
-        .teams
-        .update_all_teams(&server, expired_at);
-    assert!(find(&b.frames(), sc::SCInvitationCanceledPacket).is_empty());
-}
-
-/// A second invitation to the same invitee is refused while one is pending; nothing closes the
-/// pending popup until that invitation ends.
-#[tokio::test]
-async fn a_second_team_invitation_does_not_cancel_the_pending_one() {
-    let server = test_server();
-    let mut a = pc(&server, 1, "Al", 100.0, 100.0);
-    let mut b = pc(&server, 2, "Bob", 110.0, 100.0);
-    let mut c = pc(&server, 3, "Cy", 120.0, 100.0);
-    settle(&mut [&mut a, &mut b, &mut c]);
-
-    a.send(&server, cs::CSInviteToTeamPacket, invite(0, "Bob"))
-        .await;
-    b.ops();
-    c.send(&server, cs::CSInviteToTeamPacket, invite(0, "Bob"))
-        .await;
-    assert_eq!(c.ops(), vec![sc::SCRejectedTeamPacket]);
-    assert!(
-        b.frames().is_empty(),
-        "the second invitation must not touch the pending popup"
-    );
-
-    let expired_at = crate::systems::social::util::now_ms() + INVITATION_TIMEOUT_MS + 1;
-    server
-        .systems
-        .social
-        .teams
-        .update_all_teams(&server, expired_at);
-    assert_eq!(
-        b.frames(),
-        vec![(
-            sc::SCInvitationCanceledPacket,
-            vec![invitation_canceled_kind::TEAM]
-        )],
-        "exactly one cancellation when the last pending invitation ends"
-    );
-}
-
-/// An unanswered guild invitation is swept after 60 s and closes the invitee's popup with
-/// kind 4 (`SCExpeditionInvitation`, popup type 3).
-#[tokio::test]
-async fn expired_expedition_invitation_sends_kind_four() {
-    use crate::data::world_data::SystemFaction;
-    use crate::systems::social::expedition::{self, Expedition};
-
-    let server = test_server();
-    let mut leader = pc(&server, 1, "Lead", 100.0, 100.0);
-    let mut invitee = pc(&server, 2, "Bob", 110.0, 100.0);
-    settle(&mut [&mut leader, &mut invitee]);
-    leader.p.data().unit.expedition_id = 77;
-    let member = expedition::member_from_character(&server, 77, &leader.p, true);
-    server.expeditions.add(Expedition {
-        faction: SystemFaction {
-            id: 77,
-            name: "Knights".into(),
-            owner_id: leader.p.character_id,
-            owner_name: "Lead".into(),
-            mother_id: 148,
-            ..Default::default()
-        },
-        members: vec![member],
-        policies: expedition::default_policies(&server, 77),
-        removed_members: Vec::new(),
-        is_disbanded: false,
-    });
-
-    let mut s = PacketStream::new();
-    s.write_str("Bob");
-    leader
-        .send(&server, cs::CSInviteToExpeditionPacket, s)
-        .await;
-    assert_eq!(invitee.ops(), vec![sc::SCExpeditionInvitationPacket]);
-
-    let expired_at = crate::systems::social::util::now_ms() + expedition::INVITATION_TIMEOUT_MS + 1;
-    server.expeditions.expire_invitations(&server, expired_at);
-    assert_eq!(
-        invitee.frames(),
-        vec![(
-            sc::SCInvitationCanceledPacket,
-            vec![invitation_canceled_kind::EXPEDITION]
-        )]
-    );
+    expect_chat_error(&mut b, crate::systems::social::util::error::TEAM_JOIN);
 }
 
 /// Guild invitations must be pending and unexpired, a member cannot join a second guild, and
@@ -3411,7 +3050,7 @@ async fn guild_invite_and_rank_guards() {
                 name: name.into(),
                 owner_id: 1,
                 owner_name: "Lead".into(),
-                mother_id: 148,
+                mother_id: 101,
                 ..Default::default()
             },
             members,
@@ -3516,7 +3155,7 @@ async fn guild_invite_and_rank_guards() {
     assert_eq!(server.expeditions.get(77).unwrap().members.len(), 4);
 
     // The leader cannot kick itself through the client packet either: the strict-rank guard is
-    // only lifted for the server-side faction change (`remove_member_for_faction_change`).
+    // only lifted for the server-side faction change (`leave_forced`).
     leader
         .send(&server, cs::CSKickFromExpeditionPacket, kick(1))
         .await;
@@ -3677,7 +3316,7 @@ async fn private_mysql_pirate_owner_transfer_persists_the_new_owner_and_nation_k
     .await
     .unwrap();
 
-    expedition::remove_member_for_faction_change(&server, &a.p).await;
+    expedition::leave_forced(&server, &a.p).await;
 
     let saved: (i64, String) =
         sqlx::query_as("SELECT CAST(owner AS SIGNED),owner_name FROM expeditions WHERE id=77")
@@ -3856,7 +3495,7 @@ async fn private_mysql_pirate_last_member_dismissal_persists_nation_and_dominion
         }])
         .expect("test dominion");
 
-    expedition::remove_member_for_faction_change(&server, &a.p).await;
+    expedition::leave_forced(&server, &a.p).await;
 
     let guilds: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM expeditions")
         .fetch_one(&pool)
@@ -3905,6 +3544,1160 @@ async fn private_mysql_pirate_last_member_dismissal_persists_nation_and_dominion
             .unwrap();
     }
     pool.close().await;
+}
+
+#[tokio::test]
+async fn chat_spam_delay_refuses_messages_inside_the_channel_window() {
+    use crate::packets::world::SCErrorMsgPacket;
+    use crate::systems::social::chat::CHAT_SPAM_DELAY_ERROR;
+    let server = test_server();
+    // Say is limited to one message per minute; shout and trade keep their own groups.
+    server.config.update(|c| {
+        c.chat.chat_type_groups = (0..15).collect();
+        let mut delays = vec![0u32; 15];
+        delays[chat_type::WHITE as usize] = 60_000;
+        c.chat.chat_group_delays_ms = delays;
+    });
+    let mut a = pc(&server, 1, "Al", 100.0, 100.0);
+    a.c.drain();
+
+    a.send(
+        &server,
+        cs::CSSendChatMessagePacket,
+        chat(chat_type::WHITE, "one"),
+    )
+    .await;
+    assert_eq!(a.ops(), vec![sc::SCChatMessagePacket]);
+
+    a.send(
+        &server,
+        cs::CSSendChatMessagePacket,
+        chat(chat_type::WHITE, "two"),
+    )
+    .await;
+    assert_eq!(
+        a.frames(),
+        vec![(
+            sc::SCErrorMsgPacket,
+            crate::systems::social::packets::body(&SCErrorMsgPacket::new(
+                CHAT_SPAM_DELAY_ERROR,
+                0,
+                true,
+            ))
+        )]
+    );
+
+    // Whisper (-3) is outside the client's limited `0..=14` range and still reaches its normal
+    // error path.
+    a.send(
+        &server,
+        cs::CSSendChatMessagePacket,
+        whisper("Nobody", "hi"),
+    )
+    .await;
+    assert_eq!(
+        a.frames(),
+        vec![(
+            sc::SCErrorMsgPacket,
+            crate::systems::social::packets::body(&SCErrorMsgPacket::new(
+                crate::packets::world::error_message::WHISPER_NO_TARGET,
+                0,
+                true,
+            ))
+        )]
+    );
+}
+
+#[tokio::test]
+async fn invite_area_skips_party_members_and_hostiles() {
+    let server = test_server();
+    let mut a = pc(&server, 1, "Al", 100.0, 100.0);
+    let mut b = pc(&server, 2, "Bob", 150.0, 100.0);
+    let mut far = pc(&server, 3, "Far", 300.0, 100.0);
+    settle(&mut [&mut a, &mut b, &mut far]);
+    let mut s = PacketStream::new();
+    s.write_u32(0).write_bool(true);
+    a.send(&server, cs::CSInviteAreaToTeamPacket, s).await;
+    // The merged area path sends `SCAskToJoinTeamArea` (not the named invitation) ...
+    assert_eq!(b.ops(), vec![sc::SCAskToJoinTeamAreaPacket]);
+    // 200 m away: outside the 100 m radius.
+    assert!(far.ops().is_empty());
+    // ... and the inviter gets the success reply, no "invite yourself" error.
+    assert_eq!(
+        a.frames(),
+        vec![(
+            sc::SCTeamAreaInvitedPacket,
+            body(&SCTeamAreaInvitedPacket { r: 0, s: true })
+        )]
+    );
+}
+
+/// `SCErrorMsgPacket(error, 0, true)` as the frames of one connection carry it.
+pub(super) fn error_frame(error: i16) -> (u16, Vec<u8>) {
+    use crate::packets::world::SCErrorMsgPacket;
+    (
+        sc::SCErrorMsgPacket,
+        body(&SCErrorMsgPacket::new(error, 0, true)),
+    )
+}
+
+/// Registers the guild `id` with `members` (character, role); the characters are marked as
+/// members and join the guild chat like a login would.
+pub(super) fn add_guild(server: &GameServer, id: u32, name: &str, members: &[(&Pc, u8)]) {
+    use crate::data::world_data::SystemFaction;
+    use crate::systems::social::expedition::{self, Expedition};
+    let owner = members
+        .iter()
+        .find(|(_, role)| *role == 255)
+        .map(|(m, _)| m.p.character_id)
+        .unwrap_or(0);
+    let list = members
+        .iter()
+        .map(|(m, role)| {
+            m.p.data().unit.expedition_id = id;
+            let mut x = expedition::member_from_character(server, id, &m.p, false);
+            x.role = *role;
+            expedition::guild_chat(server, id, name).join(&m.p);
+            x
+        })
+        .collect();
+    server.expeditions.add(Expedition {
+        faction: SystemFaction {
+            id,
+            name: name.into(),
+            owner_id: owner,
+            owner_name: "Lead".into(),
+            mother_id: 101,
+            ..Default::default()
+        },
+        members: list,
+        policies: expedition::default_policies(server, id),
+        removed_members: Vec::new(),
+        is_disbanded: false,
+    });
+}
+
+/// `owner` invites the player called `name` into its (new or existing) team and they accept.
+pub(super) async fn join_party(
+    server: &GameServer,
+    owner: &mut Pc,
+    target: &mut Pc,
+    name: &str,
+) -> u32 {
+    let team_id = server
+        .systems
+        .social
+        .teams
+        .active_team_by_unit(owner.p.character_id)
+        .map_or(0, |t| t.id);
+    owner
+        .send(server, cs::CSInviteToTeamPacket, invite(team_id, name))
+        .await;
+    target
+        .send(
+            server,
+            cs::CSReplyToJoinTeamPacket,
+            reply(team_id, owner.p.character_id, false),
+        )
+        .await;
+    server
+        .systems
+        .social
+        .teams
+        .active_team_by_unit(target.p.character_id)
+        .expect("joined")
+        .id
+}
+
+/// A hard disconnect (also a kick or a server-side drop) logs the character out of its guild,
+/// family, chat channels, party and friends' lists exactly like the clean leave does: the old
+/// disconnect left guild members seeing it online (and its `last_leave_time` at its login time).
+#[tokio::test]
+async fn hard_disconnect_runs_the_same_social_logout_as_a_clean_leave() {
+    use crate::packets::world::SCExpeditionMemberStatusChangedPacket;
+    use crate::systems::social::family::{Family, FamilyMember};
+    use crate::systems::social::packets::family::SCFamilyMemberOnlinePacket;
+    let server = test_server();
+    let mut lead = pc(&server, 1, "Lead", 100.0, 100.0);
+    let mut dropped = pc(&server, 2, "Dropped", 101.0, 100.0);
+    let mut left = pc(&server, 3, "Left", 102.0, 100.0);
+    settle(&mut [&mut lead, &mut dropped, &mut left]);
+    add_guild(
+        &server,
+        77,
+        "Knights",
+        &[(&lead, 255), (&dropped, 0), (&left, 0)],
+    );
+    server.expeditions.with_mut(77, |e| {
+        for m in &mut e.members {
+            m.last_world_leave_time = 1000; // the login time the bots saw staying forever
+        }
+    });
+    let member = |p: &PlayerRef, role| FamilyMember {
+        character: Some(p.clone()),
+        id: p.character_id,
+        name: p.data().unit.name.clone(),
+        role,
+        title: String::new(),
+    };
+    server.systems.social.families.insert(Family {
+        id: 11,
+        members: vec![member(&lead.p, 1), member(&dropped.p, 0)],
+        removed_members: Vec::new(),
+    });
+    lead.p.data().family = 11;
+    dropped.p.data().family = 11;
+    // Party, friend.
+    let teams = &server.systems.social.teams;
+    teams.ask_to_join(&server, &lead.p, "Dropped", 0, true, None);
+    teams.reply_to_join_team(&server, &dropped.p, 0, true, 1, false, "", false);
+    let team_id = teams.active_team_by_unit(1).expect("party").id;
+    lead.send(&server, cs::CSAddFriendPacket, name_body("Dropped"))
+        .await;
+    settle(&mut [&mut lead, &mut dropped, &mut left]);
+
+    // The hard disconnect of one member ...
+    crate::world::session::on_disconnect(&server, &mut dropped.c.conn).await;
+    let e = server.expeditions.get(77).unwrap();
+    let m = e.member(2).unwrap();
+    assert!(!m.is_online);
+    assert!(m.last_world_leave_time > 1000, "last_leave_time moved");
+    assert!(dropped.p.data().leave_time > 0);
+    let frames = lead.frames();
+    assert_eq!(
+        find(&frames, sc::SCExpeditionMemberStatusChangedPacket),
+        vec![body(&SCExpeditionMemberStatusChangedPacket {
+            member: m.clone(),
+            flag: 0
+        })]
+    );
+    // ... the family and the party (as before) and the friend list ...
+    assert_eq!(
+        find(&frames, sc::SCFamilyMemberOnlinePacket),
+        vec![body(&SCFamilyMemberOnlinePacket {
+            family_id: 11,
+            member_id: 2,
+            online: false
+        })]
+    );
+    assert!(server
+        .systems
+        .social
+        .families
+        .family(11)
+        .unwrap()
+        .member(2)
+        .unwrap()
+        .character
+        .is_none());
+    assert_eq!(find(&frames, sc::SCTeamMemberDisconnectedPacket).len(), 1);
+    assert_eq!(find(&frames, sc::SCFriendStatusChangedPacket).len(), 1);
+    assert!(!teams
+        .active_team(team_id)
+        .unwrap()
+        .members
+        .iter()
+        .flatten()
+        .any(|m| m.character.character_id == 2 && m.character.data().is_online));
+    // ... and no chat channel keeps the dead session (guild, party).
+    assert!(server
+        .chat
+        .list_all_channels()
+        .iter()
+        .all(|c| !c.contains(&dropped.p)));
+
+    // A clean leave of another member gives the same guild state and notification.
+    crate::world::session::leave_world_task(
+        &server,
+        None,
+        crate::world::session::leave_target::CHARACTER_SELECT,
+        Some(left.p.clone()),
+    )
+    .await;
+    let e = server.expeditions.get(77).unwrap();
+    assert!(!e.member(3).unwrap().is_online);
+    assert!(e.member(3).unwrap().last_world_leave_time > 1000);
+    assert_eq!(
+        find(&lead.frames(), sc::SCExpeditionMemberStatusChangedPacket),
+        vec![body(&SCExpeditionMemberStatusChangedPacket {
+            member: e.member(3).unwrap().clone(),
+            flag: 0
+        })]
+    );
+    assert!(e.member(1).unwrap().is_online, "the leader is untouched");
+}
+
+/// A connection keeps its `active_char` after a leave. Its later disconnect must not log the
+/// character out of the guild again: the character may be online on a newer session by then.
+#[tokio::test]
+async fn disconnect_of_a_session_that_already_left_keeps_the_new_session_online() {
+    let server = test_server();
+    let mut lead = pc(&server, 1, "Lead", 100.0, 100.0);
+    let mut old = pc(&server, 2, "Old", 101.0, 100.0);
+    settle(&mut [&mut lead, &mut old]);
+    add_guild(&server, 77, "Knights", &[(&lead, 255), (&old, 0)]);
+    // The old session left (it is no longer the live world entry) and the character is online
+    // again on a new session: the guild record says online.
+    old.p.data().is_online = false;
+    server.world.try_remove_character(old.p.obj_id);
+    settle(&mut [&mut lead, &mut old]);
+    crate::world::session::on_disconnect(&server, &mut old.c.conn).await;
+    let e = server.expeditions.get(77).unwrap();
+    assert!(e.member(2).unwrap().is_online);
+    assert!(lead.ops().is_empty());
+}
+
+/// The guild leader can neither leave nor be left leaderless: the 1.2 client's text says "you
+/// can leave after delegating the leader position".
+#[tokio::test]
+async fn guild_leader_cannot_leave_without_handing_over() {
+    use crate::systems::social::util::error;
+    let server = test_server();
+    let mut lead = pc(&server, 1, "Lead", 100.0, 100.0);
+    let mut two = pc(&server, 2, "Two", 101.0, 100.0);
+    settle(&mut [&mut lead, &mut two]);
+    add_guild(&server, 77, "Knights", &[(&lead, 255), (&two, 0)]);
+    settle(&mut [&mut lead, &mut two]);
+    let leave = PacketStream::new;
+    let owner_to = |id: u32| {
+        let mut s = PacketStream::new();
+        s.write_u32(id);
+        s
+    };
+
+    lead.send(&server, cs::CSLeaveExpeditionPacket, leave())
+        .await;
+    assert_eq!(
+        lead.frames(),
+        vec![error_frame(error::EXPEDITION_OWNER_CANNOT_LEAVE)]
+    );
+    assert!(two.ops().is_empty());
+    let e = server.expeditions.get(77).unwrap();
+    assert_eq!(e.members.len(), 2);
+    assert_eq!(e.member(1).unwrap().role, 255);
+    assert_eq!(lead.p.data().unit.expedition_id, 77);
+
+    // An ordinary member still can leave, and the leader stays (and still cannot leave).
+    two.send(&server, cs::CSLeaveExpeditionPacket, leave())
+        .await;
+    assert_eq!(two.p.data().unit.expedition_id, 0);
+    assert_eq!(server.expeditions.get(77).unwrap().members.len(), 1);
+    lead.ops();
+    two.ops();
+    lead.send(&server, cs::CSLeaveExpeditionPacket, leave())
+        .await;
+    assert_eq!(
+        lead.frames(),
+        vec![error_frame(error::EXPEDITION_OWNER_CANNOT_LEAVE)]
+    );
+
+    // Invite the other one back, hand the guild over: now the old leader can leave and the guild
+    // keeps a leader.
+    lead.send(&server, cs::CSInviteToExpeditionPacket, name_body("Two"))
+        .await;
+    let mut accept = PacketStream::new();
+    accept.write_u32(77).write_u32(1).write_bool(true);
+    two.send(&server, cs::CSReplyExpeditionInvitationPacket, accept)
+        .await;
+    assert_eq!(two.p.data().unit.expedition_id, 77);
+    lead.send(&server, cs::CSChangeExpeditionOwnerPacket, owner_to(2))
+        .await;
+    lead.ops();
+    two.ops();
+    lead.send(&server, cs::CSLeaveExpeditionPacket, leave())
+        .await;
+    assert_eq!(lead.p.data().unit.expedition_id, 0);
+    let e = server.expeditions.get(77).unwrap();
+    assert_eq!(e.members.len(), 1);
+    assert_eq!(e.member(2).unwrap().role, 255);
+    assert_eq!(e.faction.owner_id, 2);
+}
+
+/// Party invitations expire after a minute, die with either session, and a late answer is told
+/// why it fails (the old invitation blocked every later invite of the target forever).
+#[tokio::test]
+async fn party_invitations_expire_and_die_with_either_session() {
+    use crate::systems::social::util::{error, now_ms};
+    let server = test_server();
+    let mut a = pc(&server, 1, "Al", 100.0, 100.0);
+    let mut b = pc(&server, 2, "Bob", 110.0, 100.0);
+    settle(&mut [&mut a, &mut b]);
+    let teams = &server.systems.social.teams;
+
+    // Pending: blocks, until the sweep expires it and tells the inviter.
+    a.send(&server, cs::CSInviteToTeamPacket, invite(0, "Bob"))
+        .await;
+    assert_eq!(b.ops(), vec![sc::SCAskToJoinTeamPacket]);
+    a.send(&server, cs::CSInviteToTeamPacket, invite(0, "Bob"))
+        .await;
+    assert_eq!(a.ops(), vec![sc::SCRejectedTeamPacket]);
+    teams.expire_invitations(now_ms() + 30_000);
+    assert!(a.ops().is_empty() && teams.invitation_count() == 1);
+    teams.expire_invitations(now_ms() + 61_000);
+    assert_eq!(
+        a.frames(),
+        vec![error_frame(error::INVITATION_CANCELED_TIMEOUT)]
+    );
+    assert_eq!(
+        b.frames(),
+        vec![(
+            sc::SCInvitationCanceledPacket,
+            vec![invitation_canceled_kind::TEAM]
+        )]
+    );
+    assert_eq!(teams.invitation_count(), 0);
+    a.send(&server, cs::CSInviteToTeamPacket, invite(0, "Bob"))
+        .await;
+    assert_eq!(b.ops(), vec![sc::SCAskToJoinTeamPacket]);
+
+    // An expired invitation that was not swept yet no longer blocks a new one either ...
+    teams.age_invitations(61_000);
+    a.send(&server, cs::CSInviteToTeamPacket, invite(0, "Bob"))
+        .await;
+    assert_eq!(b.ops(), vec![sc::SCAskToJoinTeamPacket]);
+    assert!(a.ops().is_empty());
+    // ... and answering it late fails: the inviter is told about the refusal, the invitee why.
+    teams.age_invitations(61_000);
+    b.send(&server, cs::CSReplyToJoinTeamPacket, reply(0, 1, false))
+        .await;
+    assert_eq!(a.ops(), vec![sc::SCRejectedTeamPacket]);
+    assert_eq!(
+        b.frames(),
+        vec![error_frame(error::INVITATION_CANCELED_TIMEOUT)]
+    );
+    assert!(teams.active_team_by_unit(1).is_none());
+
+    // The invitee logs out and in again (reconnect): the invitation is gone.
+    a.send(&server, cs::CSInviteToTeamPacket, invite(0, "Bob"))
+        .await;
+    b.ops();
+    crate::world::session::set_online(&server, &b.p, false);
+    crate::world::session::set_online(&server, &b.p, true);
+    assert_eq!(teams.invitation_count(), 0);
+    a.send(&server, cs::CSInviteToTeamPacket, invite(0, "Bob"))
+        .await;
+    assert_eq!(b.ops(), vec![sc::SCAskToJoinTeamPacket]);
+    assert!(a.ops().is_empty());
+
+    // The inviter goes away: the invitee is told, and accepting afterwards fails.
+    a.send(&server, cs::CSInviteToTeamPacket, invite(0, "Bob"))
+        .await;
+    b.ops();
+    crate::world::session::set_online(&server, &a.p, false);
+    assert_eq!(
+        b.frames(),
+        vec![
+            error_frame(error::TEAM_INVITOR_OFFLINE),
+            (
+                sc::SCInvitationCanceledPacket,
+                vec![invitation_canceled_kind::TEAM]
+            )
+        ]
+    );
+    assert_eq!(teams.invitation_count(), 0);
+    b.send(&server, cs::CSReplyToJoinTeamPacket, reply(0, 1, false))
+        .await;
+    assert_eq!(b.frames(), vec![error_frame(error::TEAM_JOIN)]);
+    assert!(teams.active_team_by_unit(2).is_none());
+    // A decline of something that no longer exists is silent.
+    b.send(&server, cs::CSReplyToJoinTeamPacket, reply(0, 1, true))
+        .await;
+    assert!(b.ops().is_empty());
+
+    // A hard disconnect of the invitee drops its invitation as well.
+    crate::world::session::set_online(&server, &a.p, true);
+    a.send(&server, cs::CSInviteToTeamPacket, invite(0, "Bob"))
+        .await;
+    assert_eq!(b.ops(), vec![sc::SCAskToJoinTeamPacket]);
+    assert_eq!(teams.invitation_count(), 1);
+    crate::world::session::on_disconnect(&server, &mut b.c.conn).await;
+    assert_eq!(teams.invitation_count(), 0);
+}
+
+/// A member that joins an existing party / raid joins its chat channels, and a member that
+/// leaves or is kicked leaves them (the late joiner could talk but never hear before).
+#[tokio::test]
+async fn late_party_members_hear_the_team_and_leavers_stop_hearing_it() {
+    let server = test_server();
+    let mut a = pc(&server, 1, "Al", 100.0, 100.0);
+    let mut b = pc(&server, 2, "Bob", 110.0, 100.0);
+    let mut c = pc(&server, 3, "Cy", 120.0, 100.0);
+    let mut d = pc(&server, 4, "Di", 130.0, 100.0);
+    settle(&mut [&mut a, &mut b, &mut c, &mut d]);
+    let team_id = form_party(&server, &mut a, &mut b).await;
+    assert_eq!(join_party(&server, &mut a, &mut c, "Cy").await, team_id);
+    settle(&mut [&mut a, &mut b, &mut c, &mut d]);
+
+    // Everybody hears everybody, in both directions.
+    c.send(
+        &server,
+        cs::CSSendChatMessagePacket,
+        chat(chat_type::PARTY, "from the late joiner"),
+    )
+    .await;
+    for x in [&mut a, &mut b, &mut c] {
+        assert_eq!(x.ops(), vec![sc::SCChatMessagePacket]);
+    }
+    a.send(
+        &server,
+        cs::CSSendChatMessagePacket,
+        chat(chat_type::PARTY, "to the late joiner"),
+    )
+    .await;
+    for x in [&mut a, &mut b, &mut c] {
+        assert_eq!(x.ops(), vec![sc::SCChatMessagePacket]);
+    }
+
+    // Leaving stops it.
+    c.send(
+        &server,
+        cs::CSAskRiskyTeamActionPacket,
+        risky(team_id, 3, risky_action::LEAVE),
+    )
+    .await;
+    assert!(c.ops().contains(&sc::SCLeavedChatChannelPacket));
+    settle(&mut [&mut a, &mut b, &mut c]);
+    a.send(
+        &server,
+        cs::CSSendChatMessagePacket,
+        chat(chat_type::PARTY, "bye"),
+    )
+    .await;
+    assert_eq!(a.ops(), vec![sc::SCChatMessagePacket]);
+    assert_eq!(b.ops(), vec![sc::SCChatMessagePacket]);
+    assert!(c.ops().is_empty());
+
+    // A raid: the late joiner joins the raid channel as well as its party's.
+    let mut s = PacketStream::new();
+    s.write_u32(team_id);
+    a.send(&server, cs::CSConvertToRaidTeamPacket, s).await;
+    assert_eq!(join_party(&server, &mut a, &mut d, "Di").await, team_id);
+    let joined = d.ops();
+    assert_eq!(
+        joined
+            .iter()
+            .filter(|op| **op == sc::SCJoinedChatChannelPacket)
+            .count(),
+        2,
+        "raid and party channel: {joined:x?}"
+    );
+    settle(&mut [&mut a, &mut b, &mut c, &mut d]);
+    a.send(
+        &server,
+        cs::CSSendChatMessagePacket,
+        chat(chat_type::RAID, "raid"),
+    )
+    .await;
+    assert_eq!(a.ops(), vec![sc::SCChatMessagePacket]);
+    assert_eq!(b.ops(), vec![sc::SCChatMessagePacket]);
+    assert_eq!(d.ops(), vec![sc::SCChatMessagePacket]);
+    // Kicked: the raid owner keeps both channels, the kicked member leaves both.
+    a.send(
+        &server,
+        cs::CSAskRiskyTeamActionPacket,
+        risky(team_id, 4, risky_action::KICK),
+    )
+    .await;
+    let kicked = d.ops();
+    assert_eq!(
+        kicked
+            .iter()
+            .filter(|op| **op == sc::SCLeavedChatChannelPacket)
+            .count(),
+        2,
+        "{kicked:x?}"
+    );
+    assert!(!a.ops().contains(&sc::SCLeavedChatChannelPacket));
+    b.ops();
+    a.send(
+        &server,
+        cs::CSSendChatMessagePacket,
+        chat(chat_type::RAID, "raid again"),
+    )
+    .await;
+    assert_eq!(a.ops(), vec![sc::SCChatMessagePacket]);
+    assert_eq!(b.ops(), vec![sc::SCChatMessagePacket]);
+    assert!(d.ops().is_empty());
+}
+
+/// Accepting an invitation while in another team is refused (a character ended up in two).
+#[tokio::test]
+async fn accepting_a_party_invitation_while_in_another_team_is_refused() {
+    use crate::systems::social::util::error;
+    let server = test_server();
+    let mut a = pc(&server, 1, "Al", 100.0, 100.0);
+    let mut b = pc(&server, 2, "Bob", 110.0, 100.0);
+    let mut c = pc(&server, 3, "Cy", 120.0, 100.0);
+    let mut d = pc(&server, 4, "Di", 130.0, 100.0);
+    settle(&mut [&mut a, &mut b, &mut c, &mut d]);
+    let teams = &server.systems.social.teams;
+    let first = form_party(&server, &mut a, &mut b).await;
+    // Al invites Cy, who does not answer yet but founds a party with Di meanwhile.
+    a.send(&server, cs::CSInviteToTeamPacket, invite(first, "Cy"))
+        .await;
+    let second = join_party(&server, &mut c, &mut d, "Di").await;
+    assert_ne!(first, second);
+    settle(&mut [&mut a, &mut b, &mut c, &mut d]);
+    c.send(
+        &server,
+        cs::CSReplyToJoinTeamPacket,
+        reply(first, a.p.character_id, false),
+    )
+    .await;
+    assert_eq!(c.frames(), vec![error_frame(error::TEAM_JOIN_ALONE)]);
+    assert_eq!(a.frames(), vec![error_frame(error::TEAM_INVITEE_IN_TEAM)]);
+    assert!(b.ops().is_empty() && d.ops().is_empty());
+    assert_eq!(teams.active_team_by_unit(3).unwrap().id, second);
+    assert_eq!(teams.active_team(first).unwrap().members_count(), 2);
+    assert_eq!(teams.active_team(second).unwrap().members_count(), 2);
+    assert_eq!(teams.invitation_count(), 0);
+    assert!(c.p.data().in_party);
+}
+
+/// The inviter hears why a party invitation does not happen.
+#[tokio::test]
+async fn party_invitation_failures_are_reported() {
+    use crate::systems::social::util::error;
+    let server = test_server();
+    let mut a = pc(&server, 1, "Al", 100.0, 100.0);
+    let mut b = pc(&server, 2, "Bob", 110.0, 100.0);
+    let mut c = pc(&server, 3, "Cy", 120.0, 100.0);
+    let mut d = pc(&server, 4, "Di", 130.0, 100.0);
+    let mut e = pc(&server, 5, "Ed", 140.0, 100.0);
+    let mut f = pc(&server, 6, "Flo", 150.0, 100.0);
+    settle(&mut [&mut a, &mut b, &mut c, &mut d, &mut e, &mut f]);
+
+    // An offline / unknown invitee, and yourself.
+    a.send(&server, cs::CSInviteToTeamPacket, invite(0, "Nobody"))
+        .await;
+    assert_eq!(a.frames(), vec![error_frame(error::TEAM_INVITEE_OFFLINE)]);
+    a.send(&server, cs::CSInviteToTeamPacket, invite(0, "Al"))
+        .await;
+    assert_eq!(a.frames(), vec![error_frame(error::TEAM_YOURSELF)]);
+
+    // Replying without an invitation says so; declining one is silent.
+    c.send(&server, cs::CSReplyToJoinTeamPacket, reply(0, 1, false))
+        .await;
+    assert_eq!(c.frames(), vec![error_frame(error::TEAM_JOIN)]);
+    c.send(&server, cs::CSReplyToJoinTeamPacket, reply(0, 1, true))
+        .await;
+    assert!(c.ops().is_empty());
+
+    // A member of a team can be invited neither by its own team nor by another one.
+    let team_id = form_party(&server, &mut a, &mut b).await;
+    settle(&mut [&mut a, &mut b]);
+    a.send(&server, cs::CSInviteToTeamPacket, invite(team_id, "Bob"))
+        .await;
+    assert_eq!(a.frames(), vec![error_frame(error::TEAM_INVITEE_MEMBER)]);
+    join_party(&server, &mut c, &mut d, "Di").await;
+    settle(&mut [&mut a, &mut b, &mut c, &mut d]);
+    a.send(&server, cs::CSInviteToTeamPacket, invite(team_id, "Cy"))
+        .await;
+    assert_eq!(a.frames(), vec![error_frame(error::TEAM_INVITEE_IN_TEAM)]);
+    assert!(c.ops().is_empty());
+
+    // Only the owner of a party invites, whatever team id the client names (0 included).
+    for named in [0, team_id, 0x7777] {
+        b.send(&server, cs::CSInviteToTeamPacket, invite(named, "Ed"))
+            .await;
+        assert_eq!(b.frames(), vec![error_frame(error::TEAM_NO_RIGHTS)]);
+    }
+    assert!(e.ops().is_empty());
+
+    // A full party (5) refuses the invitation at once, not just at the answer.
+    assert_eq!(join_party(&server, &mut a, &mut e, "Ed").await, team_id);
+    assert_eq!(join_party(&server, &mut a, &mut f, "Flo").await, team_id);
+    let teams = &server.systems.social.teams;
+    assert_eq!(teams.active_team(team_id).unwrap().members_count(), 4);
+    let mut g = pc(&server, 7, "Gus", 160.0, 100.0);
+    let mut h = pc(&server, 8, "Hal", 170.0, 100.0);
+    settle(&mut [&mut a, &mut g, &mut h]);
+    assert_eq!(join_party(&server, &mut a, &mut g, "Gus").await, team_id);
+    assert_eq!(teams.active_team(team_id).unwrap().members_count(), 5);
+    a.ops();
+    a.send(&server, cs::CSInviteToTeamPacket, invite(team_id, "Hal"))
+        .await;
+    assert_eq!(a.frames(), vec![error_frame(error::TEAM_FULL)]);
+    assert!(h.ops().is_empty());
+    let mut s = PacketStream::new();
+    s.write_u32(team_id).write_bool(true);
+    a.send(&server, cs::CSInviteAreaToTeamPacket, s).await;
+    assert_eq!(a.frames(), vec![error_frame(error::TEAM_FULL)]);
+    assert!(h.ops().is_empty());
+}
+
+/// The party that fills up between an invitation and its answer: both sides are told.
+#[tokio::test]
+async fn a_party_that_fills_up_before_the_answer_tells_both_sides() {
+    use crate::systems::social::util::error;
+    let server = test_server();
+    let mut pcs: Vec<Pc> = (1..=6)
+        .map(|i| pc(&server, i, &format!("M{i}"), 100.0 + i as f32, 100.0))
+        .collect();
+    for x in pcs.iter_mut() {
+        x.c.drain();
+    }
+    let teams = &server.systems.social.teams;
+    for i in 1..4 {
+        let name = format!("M{}", i + 1);
+        teams.ask_to_join(&server, &pcs[0].p, &name, 0, true, None);
+        teams.reply_to_join_team(&server, &pcs[i].p, 0, true, 1, false, "", false);
+    }
+    assert_eq!(teams.active_team_by_unit(1).unwrap().members_count(), 4);
+    // One seat, two invitations (M5 and M6).
+    teams.ask_to_join(&server, &pcs[0].p, "M5", 0, true, None);
+    teams.ask_to_join(&server, &pcs[0].p, "M6", 0, true, None);
+    for x in pcs.iter_mut() {
+        x.c.drain();
+    }
+    teams.reply_to_join_team(&server, &pcs[4].p, 0, true, 1, false, "", false);
+    teams.reply_to_join_team(&server, &pcs[5].p, 0, true, 1, false, "", false);
+    assert_eq!(teams.active_team_by_unit(1).unwrap().members_count(), 5);
+    assert!(!pcs[5].p.data().in_party);
+    assert_eq!(pcs[5].c.drain(), vec![error_frame(error::TEAM_FULL)]);
+    let owner = pcs[0].c.drain();
+    assert_eq!(
+        owner
+            .iter()
+            .filter(|f| **f == error_frame(error::TEAM_FULL))
+            .count(),
+        1
+    );
+}
+
+/// Failed guild invitations, answers and expulsions are reported to the character.
+#[tokio::test]
+async fn guild_invitation_reply_and_kick_failures_are_reported() {
+    use crate::systems::social::util::error;
+    let server = test_server();
+    let mut lead = pc(&server, 1, "Lead", 100.0, 100.0);
+    let mut cmdr = pc(&server, 2, "Cmdr", 101.0, 100.0);
+    let mut off = pc(&server, 3, "Off", 102.0, 100.0);
+    let mut rookie = pc(&server, 4, "Rookie", 103.0, 100.0);
+    let mut out = pc(&server, 9, "Out", 104.0, 100.0);
+    let mut other = pc(&server, 10, "Other", 105.0, 100.0);
+    settle(&mut [
+        &mut lead,
+        &mut cmdr,
+        &mut off,
+        &mut rookie,
+        &mut out,
+        &mut other,
+    ]);
+    add_guild(
+        &server,
+        77,
+        "Knights",
+        &[(&lead, 255), (&cmdr, 3), (&off, 2), (&rookie, 0)],
+    );
+    add_guild(&server, 88, "Rivals", &[(&other, 255)]);
+    for x in [&mut lead, &mut cmdr, &mut off, &mut rookie, &mut other] {
+        x.c.drain();
+    }
+    let reply_to = |id: u32, join: bool| {
+        let mut s = PacketStream::new();
+        s.write_u32(id).write_u32(1).write_bool(join);
+        s
+    };
+    let kick = |id: u32| {
+        let mut s = PacketStream::new();
+        s.write_u32(id);
+        s
+    };
+
+    // --- invite ---
+    // Not in a guild.
+    out.send(&server, cs::CSInviteToExpeditionPacket, name_body("Rookie"))
+        .await;
+    assert_eq!(
+        out.frames(),
+        vec![error_frame(error::ONLY_EXPEDITION_MEMBER)]
+    );
+    // No right to invite (role 0).
+    rookie
+        .send(&server, cs::CSInviteToExpeditionPacket, name_body("Out"))
+        .await;
+    assert_eq!(
+        rookie.frames(),
+        vec![error_frame(error::FACTION_INVITE_RIGHTS)]
+    );
+    // Unknown / offline name, yourself, a member of the same / another guild.
+    lead.send(&server, cs::CSInviteToExpeditionPacket, name_body("Ghost"))
+        .await;
+    assert_eq!(
+        lead.frames(),
+        vec![error_frame(error::FACTION_INVITE_OFFLINE)]
+    );
+    lead.send(&server, cs::CSInviteToExpeditionPacket, name_body("Lead"))
+        .await;
+    assert_eq!(lead.frames(), vec![error_frame(error::FACTION_INVITE_SELF)]);
+    lead.send(&server, cs::CSInviteToExpeditionPacket, name_body("Off"))
+        .await;
+    assert_eq!(lead.frames(), vec![error_frame(error::FACTION_INVITE_SAME)]);
+    lead.send(&server, cs::CSInviteToExpeditionPacket, name_body("Other"))
+        .await;
+    assert_eq!(
+        lead.frames(),
+        vec![error_frame(error::EXPEDITION_OTHER_EXPEDITION)]
+    );
+    // Somebody who is deciding on another invitation cannot be invited again.
+    lead.send(&server, cs::CSInviteToExpeditionPacket, name_body("Out"))
+        .await;
+    assert_eq!(out.ops(), vec![sc::SCExpeditionInvitationPacket]);
+    off.send(&server, cs::CSInviteToExpeditionPacket, name_body("Out"))
+        .await;
+    assert_eq!(
+        off.frames(),
+        vec![error_frame(error::EXPEDITION_OTHER_INVITATION)]
+    );
+    assert!(out.ops().is_empty());
+
+    // --- reply ---
+    // A refusal reaches the inviter.
+    out.send(
+        &server,
+        cs::CSReplyExpeditionInvitationPacket,
+        reply_to(77, false),
+    )
+    .await;
+    assert_eq!(
+        lead.frames(),
+        vec![error_frame(error::FACTION_INVITE_REJECTED)]
+    );
+    assert!(out.ops().is_empty());
+    // No invitation / one for another guild.
+    out.send(
+        &server,
+        cs::CSReplyExpeditionInvitationPacket,
+        reply_to(77, true),
+    )
+    .await;
+    assert_eq!(
+        out.frames(),
+        vec![error_frame(error::FACTION_JOIN_NO_INVITOR)]
+    );
+    lead.send(&server, cs::CSInviteToExpeditionPacket, name_body("Out"))
+        .await;
+    out.ops();
+    out.send(
+        &server,
+        cs::CSReplyExpeditionInvitationPacket,
+        reply_to(88, true),
+    )
+    .await;
+    assert_eq!(
+        out.frames(),
+        vec![error_frame(error::FACTION_JOIN_NO_INVITOR)]
+    );
+    // Expired.
+    lead.send(&server, cs::CSInviteToExpeditionPacket, name_body("Out"))
+        .await;
+    out.ops();
+    server
+        .expeditions
+        .invitations
+        .lock()
+        .unwrap()
+        .get_mut(&9)
+        .unwrap()
+        .time_ms -= 61_000;
+    out.send(
+        &server,
+        cs::CSReplyExpeditionInvitationPacket,
+        reply_to(77, true),
+    )
+    .await;
+    assert_eq!(
+        out.frames(),
+        vec![error_frame(error::INVITATION_CANCELED_TIMEOUT)]
+    );
+    // Already in a guild (invited before it joined another one).
+    lead.send(&server, cs::CSInviteToExpeditionPacket, name_body("Out"))
+        .await;
+    out.ops();
+    out.p.data().unit.expedition_id = 88;
+    out.send(
+        &server,
+        cs::CSReplyExpeditionInvitationPacket,
+        reply_to(77, true),
+    )
+    .await;
+    assert_eq!(
+        out.frames(),
+        vec![error_frame(error::EXPEDITION_ALREADY_MEMBER)]
+    );
+    out.p.data().unit.expedition_id = 0;
+    // A guild that was dismissed meanwhile cannot be joined.
+    lead.send(&server, cs::CSInviteToExpeditionPacket, name_body("Out"))
+        .await;
+    out.ops();
+    server.expeditions.with_mut(77, |e| e.is_disbanded = true);
+    out.send(
+        &server,
+        cs::CSReplyExpeditionInvitationPacket,
+        reply_to(77, true),
+    )
+    .await;
+    assert_eq!(out.frames(), vec![error_frame(error::FACTION_JOIN)]);
+    assert_eq!(out.p.data().unit.expedition_id, 0);
+    server.expeditions.with_mut(77, |e| e.is_disbanded = false);
+    for x in [&mut lead, &mut cmdr, &mut off, &mut rookie, &mut other] {
+        x.ops();
+    }
+
+    // --- kick ---
+    // Not in a guild; no right to expel; unknown target; the leader.
+    out.send(&server, cs::CSKickFromExpeditionPacket, kick(4))
+        .await;
+    assert_eq!(
+        out.frames(),
+        vec![error_frame(error::ONLY_EXPEDITION_MEMBER)]
+    );
+    off.send(&server, cs::CSKickFromExpeditionPacket, kick(4))
+        .await;
+    assert_eq!(off.frames(), vec![error_frame(error::FACTION_KICK_RIGHTS)]);
+    cmdr.send(&server, cs::CSKickFromExpeditionPacket, kick(99))
+        .await;
+    assert_eq!(
+        cmdr.frames(),
+        vec![error_frame(error::EXPEDITION_NO_TARGET)]
+    );
+    cmdr.send(&server, cs::CSKickFromExpeditionPacket, kick(1))
+        .await;
+    assert_eq!(cmdr.frames(), vec![error_frame(error::FACTION_KICK_RIGHTS)]);
+    // A real kick still works and sends no error.
+    lead.send(&server, cs::CSKickFromExpeditionPacket, kick(4))
+        .await;
+    assert_eq!(rookie.p.data().unit.expedition_id, 0);
+    assert!(!lead
+        .frames()
+        .contains(&error_frame(error::FACTION_KICK_RIGHTS)));
+}
+
+fn expect_chat_failed(p: &mut Pc, error: i16, channel: &str) {
+    use crate::systems::social::packets::chat::SCChatFailedPacket;
+    assert_eq!(
+        p.frames(),
+        vec![(
+            sc::SCChatFailedPacket,
+            body(&SCChatFailedPacket::new(error, channel))
+        )]
+    );
+}
+
+/// The `SCRestrictInfoPacket` a muted sender gets: `chname`, `index` 0, `code` 0 (chat),
+/// `duration` = remaining seconds of the persisted mute, `end` = the persisted end and
+/// `start` = `end - duration` (the notice time; the client ignores both dates).
+fn expect_restrict_info(p: &mut Pc, chname: &str, until: i64) {
+    let frames = p.frames();
+    assert_eq!(frames.len(), 1, "one refusal, nothing else");
+    assert_eq!(frames[0].0, sc::SCRestrictInfoPacket);
+    let mut s = PacketStream::from_bytes(frames[0].1.clone());
+    assert_eq!(s.read_string().unwrap(), chname);
+    assert_eq!(s.read_i32().unwrap(), 0, "index");
+    assert_eq!(s.read_u8().unwrap(), 0, "restrictCode (chat)");
+    let duration = s.read_u32().unwrap();
+    let start = s.read_i64().unwrap();
+    let end = s.read_i64().unwrap();
+    assert_eq!(end, until);
+    assert_eq!(start, until - i64::from(duration));
+    assert!((595..=600).contains(&duration), "{duration}");
+    assert_eq!(s.remaining(), 0);
+}
+
+#[tokio::test]
+async fn a_muted_sender_cannot_bypass_the_mute_in_a_user_channel() {
+    use crate::systems::social::chat::user_channel_identity;
+
+    let server = test_server();
+    let mut a = pc(&server, 1, "Al", 100.0, 100.0);
+    let mut b = pc(&server, 2, "Bob", 110.0, 100.0);
+    settle(&mut [&mut a, &mut b]);
+    a.send(
+        &server,
+        cs::CSJoinUserChatChannelPacket,
+        user_join("Friends", "", true),
+    )
+    .await;
+    let channel = server
+        .chat
+        .list_all_channels()
+        .into_iter()
+        .find(|c| c.chat_type == chat_type::USER)
+        .unwrap();
+    let identity = user_channel_identity(&channel);
+    b.send(
+        &server,
+        cs::CSJoinUserChatChannelPacket,
+        user_join("Friends", "", false),
+    )
+    .await;
+    a.frames();
+    b.frames();
+
+    let until = chrono::Utc::now().timestamp() + 600;
+    a.p.data().chat_restricted_until = until;
+    a.send(
+        &server,
+        cs::CSSendChatMessagePacket,
+        user_chat(identity, "hidden"),
+    )
+    .await;
+    expect_restrict_info(&mut a, "Al", until);
+    assert!(b.frames().is_empty(), "the user-channel copy was routed");
+}
+
+/// A second invitation to the same invitee is refused while one is pending; nothing closes the
+/// pending popup until that invitation ends.
+#[tokio::test]
+async fn a_second_team_invitation_does_not_cancel_the_pending_one() {
+    let server = test_server();
+    let mut a = pc(&server, 1, "Al", 100.0, 100.0);
+    let mut b = pc(&server, 2, "Bob", 110.0, 100.0);
+    let mut c = pc(&server, 3, "Cy", 120.0, 100.0);
+    settle(&mut [&mut a, &mut b, &mut c]);
+
+    a.send(&server, cs::CSInviteToTeamPacket, invite(0, "Bob"))
+        .await;
+    b.ops();
+    c.send(&server, cs::CSInviteToTeamPacket, invite(0, "Bob"))
+        .await;
+    assert_eq!(c.ops(), vec![sc::SCRejectedTeamPacket]);
+    assert!(
+        b.frames().is_empty(),
+        "the second invitation must not touch the pending popup"
+    );
+
+    let expired_at = crate::systems::social::util::now_ms() + INVITATION_TIMEOUT_MS + 1;
+    server
+        .systems
+        .social
+        .teams
+        .update_all_teams(&server, expired_at);
+    assert_eq!(
+        b.frames(),
+        vec![(
+            sc::SCInvitationCanceledPacket,
+            vec![invitation_canceled_kind::TEAM]
+        )],
+        "exactly one cancellation when the last pending invitation ends"
+    );
+}
+
+/// An accepted invitation consumes the pending one, so the later sweep sends nothing.
+#[tokio::test]
+async fn accepted_team_invitation_sends_no_cancellation() {
+    let server = test_server();
+    let mut a = pc(&server, 1, "Al", 100.0, 100.0);
+    let mut b = pc(&server, 2, "Bob", 110.0, 100.0);
+    settle(&mut [&mut a, &mut b]);
+
+    a.send(&server, cs::CSInviteToTeamPacket, invite(0, "Bob"))
+        .await;
+    b.ops();
+    b.send(
+        &server,
+        cs::CSReplyToJoinTeamPacket,
+        reply(0, a.p.character_id, false),
+    )
+    .await;
+    assert!(find(&b.frames(), sc::SCInvitationCanceledPacket).is_empty());
+
+    let expired_at = crate::systems::social::util::now_ms() + INVITATION_TIMEOUT_MS + 1;
+    server
+        .systems
+        .social
+        .teams
+        .update_all_teams(&server, expired_at);
+    assert!(find(&b.frames(), sc::SCInvitationCanceledPacket).is_empty());
+}
+
+#[tokio::test]
+async fn channel_bound_chat_failures_use_scc_chat_failed_only_when_enabled() {
+    use crate::packets::world::error_message;
+    use crate::systems::social::chat::user_channel_identity;
+    use crate::systems::social::util::error;
+    let server = test_server();
+    let mut a = pc(&server, 1, "Al", 100.0, 100.0);
+    let mut b = pc(&server, 2, "Bob", 110.0, 100.0);
+    settle(&mut [&mut a, &mut b]);
+
+    // Default (flag off): exactly the pre-flag toast.
+    a.send(
+        &server,
+        cs::CSSendChatMessagePacket,
+        chat(chat_type::PARTY, "x"),
+    )
+    .await;
+    expect_chat_error(&mut a, error::CHAT_NOT_IN_PARTY);
+
+    server.config.update(|c| c.chat.chat_failed_packet = true);
+
+    // Party / raid / expedition / family: the channel label travels with the error.
+    for (kind, code, channel) in [
+        (chat_type::PARTY, error::CHAT_NOT_IN_PARTY, "Party"),
+        (chat_type::RAID, error::CHAT_NOT_IN_RAID, "Raid"),
+        (chat_type::CLAN, error::CHAT_NOT_IN_EXPEDITION, "Expedition"),
+        (chat_type::FAMILY, error::CHAT_NOT_IN_FAMILY, "Family"),
+    ] {
+        a.send(&server, cs::CSSendChatMessagePacket, chat(kind, "x"))
+            .await;
+        expect_chat_failed(&mut a, code, channel);
+    }
+
+    // User channels: a non-member message and a leave answer with the channel's own name.
+    b.send(
+        &server,
+        cs::CSJoinUserChatChannelPacket,
+        user_join("Public", "", true),
+    )
+    .await;
+    assert_eq!(b.ops(), vec![sc::SCJoinedChatChannelPacket]);
+    let channel = server
+        .chat
+        .list_all_channels()
+        .into_iter()
+        .find(|c| c.chat_type == chat_type::USER)
+        .unwrap();
+    let identity = user_channel_identity(&channel);
+    a.send(
+        &server,
+        cs::CSSendChatMessagePacket,
+        user_chat(identity, "x"),
+    )
+    .await;
+    expect_chat_failed(&mut a, error::CHAT_NOT_JOINED_CHANNEL, "Public");
+    a.send(&server, cs::CSLeaveChatChannelPacket, user_leave(identity))
+        .await;
+    expect_chat_failed(&mut a, error::CHAT_NOT_JOINED_CHANNEL, "Public");
+    // A channel that does not exist has no name to show.
+    a.send(
+        &server,
+        cs::CSSendChatMessagePacket,
+        user_chat(identity | (1i64 << 16), "x"),
+    )
+    .await;
+    expect_chat_failed(&mut a, error::CHAT_NO_CHANNEL, "");
+    // Join failures answer with the requested name.
+    a.send(
+        &server,
+        cs::CSJoinUserChatChannelPacket,
+        user_join("Missing", "", false),
+    )
+    .await;
+    expect_chat_failed(&mut a, error::CHAT_NO_CHANNEL, "Missing");
+    a.send(
+        &server,
+        cs::CSJoinUserChatChannelPacket,
+        user_join("Public", "", true),
+    )
+    .await;
+    expect_chat_failed(&mut a, error::CHAT_CHANNEL_ALREADY_EXISTS, "Public");
+
+    // A whisper to a missing player is not channel-bound: the toast stays.
+    a.send(&server, cs::CSSendChatMessagePacket, whisper("Nobody", "x"))
+        .await;
+    expect_chat_error(&mut a, error_message::WHISPER_NO_TARGET);
 }
 
 #[tokio::test]
@@ -4005,106 +4798,259 @@ async fn chat_mute_refuses_the_message_and_expires_automatically() {
     assert_eq!(find(&b.frames(), sc::SCChatMessagePacket).len(), 1);
 }
 
+/// The direct packets keep the risky path's permission checks: only the owner may kick or
+/// dismiss, and a kick target must be a team member.
 #[tokio::test]
-async fn a_muted_sender_cannot_bypass_the_mute_in_a_user_channel() {
-    use crate::systems::social::chat::user_channel_identity;
+async fn direct_team_kick_and_dismiss_require_owner() {
+    let server = test_server();
+    let mut a = pc(&server, 1, "Al", 100.0, 100.0);
+    let mut b = pc(&server, 2, "Bob", 110.0, 100.0);
+    let mut c = pc(&server, 3, "Cy", 120.0, 100.0);
+    let team_id = form_party(&server, &mut a, &mut b).await;
+    a.send(&server, cs::CSInviteToTeamPacket, invite(team_id, "Cy"))
+        .await;
+    c.send(
+        &server,
+        cs::CSReplyToJoinTeamPacket,
+        reply(team_id, a.p.character_id, false),
+    )
+    .await;
+    settle(&mut [&mut a, &mut b, &mut c]);
 
+    // B is not the owner: neither kick nor dismiss has any effect.
+    b.send(
+        &server,
+        cs::CSKickTeamMemberPacket,
+        direct_kick(team_id, c.p.character_id),
+    )
+    .await;
+    b.send(&server, cs::CSDismissTeamPacket, direct_dismiss(team_id))
+        .await;
+    assert!(a.ops().is_empty() && b.ops().is_empty() && c.ops().is_empty());
+    // The owner cannot kick a non-member.
+    a.send(
+        &server,
+        cs::CSKickTeamMemberPacket,
+        direct_kick(team_id, 99),
+    )
+    .await;
+    assert!(a.ops().is_empty() && b.ops().is_empty() && c.ops().is_empty());
+    let team = server
+        .systems
+        .social
+        .teams
+        .active_team(team_id)
+        .expect("team preserved");
+    assert_eq!(team.owner_id, a.p.character_id);
+    assert_eq!(team.members_count(), 3);
+    assert!(a.p.data().in_party && b.p.data().in_party && c.p.data().in_party);
+
+    // The owner's direct kick still works.
+    a.send(
+        &server,
+        cs::CSKickTeamMemberPacket,
+        direct_kick(team_id, c.p.character_id),
+    )
+    .await;
+    // The kicked member also leaves its party chat channel (the chat-leave frame).
+    assert_eq!(
+        find(&c.frames(), sc::SCLeavedTeamPacket),
+        vec![body(&SCLeavedTeamPacket {
+            team_id,
+            kicked: true,
+            dismissed: false
+        })]
+    );
+    assert!(!c.p.data().in_party);
+    assert_eq!(
+        server
+            .systems
+            .social
+            .teams
+            .active_team(team_id)
+            .expect("team")
+            .members_count(),
+        2
+    );
+}
+
+/// The 1.2 client's confirmation callback sends `CSLeaveTeam` / `CSKickTeamMember` /
+/// `CSDismissTeam` (`FUN_39309670` -> `FUN_393095c0`); each must perform the same action,
+/// with the same frames, as the `CSAskRiskyTeamAction` it confirms.
+#[tokio::test]
+async fn direct_team_packets_match_risky_action_frames() {
+    for action in [
+        risky_action::LEAVE,
+        risky_action::KICK,
+        risky_action::DISMISS,
+    ] {
+        let direct = team_action_frames(action, true).await;
+        let risky = team_action_frames(action, false).await;
+        assert_eq!(direct, risky, "action {action}");
+    }
+}
+
+/// An expired area invitation closes the same popup type with kind 2 (the 1-vs-2 split is
+/// INFERRED; the client closes popup type 2 for both).
+#[tokio::test]
+async fn expired_area_team_invitation_sends_kind_two() {
     let server = test_server();
     let mut a = pc(&server, 1, "Al", 100.0, 100.0);
     let mut b = pc(&server, 2, "Bob", 110.0, 100.0);
     settle(&mut [&mut a, &mut b]);
-    a.send(
-        &server,
-        cs::CSJoinUserChatChannelPacket,
-        user_join("Friends", "", true),
-    )
-    .await;
-    let channel = server
-        .chat
-        .list_all_channels()
-        .into_iter()
-        .find(|c| c.chat_type == chat_type::USER)
-        .unwrap();
-    let identity = user_channel_identity(&channel);
-    b.send(
-        &server,
-        cs::CSJoinUserChatChannelPacket,
-        user_join("Friends", "", false),
-    )
-    .await;
-    a.frames();
-    b.frames();
 
-    let until = chrono::Utc::now().timestamp() + 600;
-    a.p.data().chat_restricted_until = until;
-    a.send(
-        &server,
-        cs::CSSendChatMessagePacket,
-        user_chat(identity, "hidden"),
-    )
-    .await;
-    expect_restrict_info(&mut a, "Al", until);
-    assert!(b.frames().is_empty(), "the user-channel copy was routed");
-}
+    let mut s = PacketStream::new();
+    s.write_u32(0).write_bool(true);
+    a.send(&server, cs::CSInviteAreaToTeamPacket, s).await;
+    assert_eq!(b.ops(), vec![sc::SCAskToJoinTeamAreaPacket]);
+    a.ops();
 
-#[tokio::test]
-async fn chat_spam_delay_refuses_messages_inside_the_channel_window() {
-    use crate::packets::world::SCErrorMsgPacket;
-    use crate::systems::social::chat::CHAT_SPAM_DELAY_ERROR;
-    let server = test_server();
-    // Say is limited to one message per minute; shout and trade keep their own groups.
-    server.config.update(|c| {
-        c.chat.chat_type_groups = (0..15).collect();
-        let mut delays = vec![0u32; 15];
-        delays[chat_type::WHITE as usize] = 60_000;
-        c.chat.chat_group_delays_ms = delays;
-    });
-    let mut a = pc(&server, 1, "Al", 100.0, 100.0);
-    a.c.drain();
-
-    a.send(
-        &server,
-        cs::CSSendChatMessagePacket,
-        chat(chat_type::WHITE, "one"),
-    )
-    .await;
-    assert_eq!(a.ops(), vec![sc::SCChatMessagePacket]);
-
-    a.send(
-        &server,
-        cs::CSSendChatMessagePacket,
-        chat(chat_type::WHITE, "two"),
-    )
-    .await;
+    let expired_at = crate::systems::social::util::now_ms() + INVITATION_TIMEOUT_MS + 1;
+    server
+        .systems
+        .social
+        .teams
+        .update_all_teams(&server, expired_at);
     assert_eq!(
-        a.frames(),
+        b.frames(),
         vec![(
-            sc::SCErrorMsgPacket,
-            crate::systems::social::packets::body(&SCErrorMsgPacket::new(
-                CHAT_SPAM_DELAY_ERROR,
-                0,
-                true,
-            ))
+            sc::SCInvitationCanceledPacket,
+            vec![invitation_canceled_kind::TEAM_AREA]
         )]
     );
+}
 
-    // Whisper (-3) is outside the client's limited `0..=14` range and still reaches its normal
-    // error path.
-    a.send(
+/// An unanswered guild invitation is swept after 60 s and closes the invitee's popup with
+/// kind 4 (`SCExpeditionInvitation`, popup type 3).
+#[tokio::test]
+async fn expired_expedition_invitation_sends_kind_four() {
+    use crate::data::world_data::SystemFaction;
+    use crate::systems::social::expedition::{self, Expedition};
+
+    let server = test_server();
+    let mut leader = pc(&server, 1, "Lead", 100.0, 100.0);
+    let mut invitee = pc(&server, 2, "Bob", 110.0, 100.0);
+    settle(&mut [&mut leader, &mut invitee]);
+    leader.p.data().unit.expedition_id = 77;
+    let member = expedition::member_from_character(&server, 77, &leader.p, true);
+    server.expeditions.add(Expedition {
+        faction: SystemFaction {
+            id: 77,
+            name: "Knights".into(),
+            owner_id: leader.p.character_id,
+            owner_name: "Lead".into(),
+            // The empty test game data has no faction rows, so the alliance fallback is the
+            // faction id itself: use the inviter's faction as the guild mother.
+            mother_id: 101,
+            ..Default::default()
+        },
+        members: vec![member],
+        policies: expedition::default_policies(&server, 77),
+        removed_members: Vec::new(),
+        is_disbanded: false,
+    });
+
+    let mut s = PacketStream::new();
+    s.write_str("Bob");
+    leader
+        .send(&server, cs::CSInviteToExpeditionPacket, s)
+        .await;
+    assert_eq!(invitee.ops(), vec![sc::SCExpeditionInvitationPacket]);
+
+    let expired_at = crate::systems::social::util::now_ms() + expedition::INVITATION_TIMEOUT_MS + 1;
+    server.expeditions.expire_invitations(&server, expired_at);
+    assert_eq!(
+        invitee.frames(),
+        vec![(
+            sc::SCInvitationCanceledPacket,
+            vec![invitation_canceled_kind::EXPEDITION]
+        )]
+    );
+}
+
+/// Runs one team action on a fresh party of three (A owner, B, C): the direct packet
+/// (0x7d / 0x7e / 0x84) and the `CSAskRiskyTeamAction` it is the confirmation of. Returns
+/// every member's frames so the two paths can be compared byte for byte.
+async fn team_action_frames(action: u8, direct: bool) -> [Vec<(u16, Vec<u8>)>; 3] {
+    let server = test_server();
+    let mut a = pc(&server, 1, "Al", 100.0, 100.0);
+    let mut b = pc(&server, 2, "Bob", 110.0, 100.0);
+    let mut c = pc(&server, 3, "Cy", 120.0, 100.0);
+    let team_id = form_party(&server, &mut a, &mut b).await;
+    a.send(&server, cs::CSInviteToTeamPacket, invite(team_id, "Cy"))
+        .await;
+    c.send(
         &server,
-        cs::CSSendChatMessagePacket,
-        whisper("Nobody", "hi"),
+        cs::CSReplyToJoinTeamPacket,
+        reply(team_id, a.p.character_id, false),
     )
     .await;
+    settle(&mut [&mut a, &mut b, &mut c]);
+
+    let target = match action {
+        risky_action::LEAVE => b.p.character_id,
+        risky_action::KICK => c.p.character_id,
+        risky_action::DISMISS => a.p.character_id,
+        _ => unreachable!(),
+    };
+    if direct {
+        match action {
+            risky_action::LEAVE => {
+                b.send(&server, cs::CSLeaveTeamPacket, direct_leave(team_id))
+                    .await
+            }
+            risky_action::KICK => {
+                a.send(
+                    &server,
+                    cs::CSKickTeamMemberPacket,
+                    direct_kick(team_id, target),
+                )
+                .await
+            }
+            _ => {
+                a.send(&server, cs::CSDismissTeamPacket, direct_dismiss(team_id))
+                    .await
+            }
+        }
+    } else {
+        let actor = if action == risky_action::LEAVE {
+            &mut b
+        } else {
+            &mut a
+        };
+        actor
+            .send(
+                &server,
+                cs::CSAskRiskyTeamActionPacket,
+                risky(team_id, target, action),
+            )
+            .await;
+    }
+    [a.frames(), b.frames(), c.frames()]
+}
+
+/// An invitation issued by a character that goes offline is dropped and its invitee's popup is
+/// closed.
+#[tokio::test]
+async fn team_invitation_is_canceled_when_the_inviter_goes_offline() {
+    let server = test_server();
+    let mut a = pc(&server, 1, "Al", 100.0, 100.0);
+    let mut b = pc(&server, 2, "Bob", 110.0, 100.0);
+    settle(&mut [&mut a, &mut b]);
+
+    a.send(&server, cs::CSInviteToTeamPacket, invite(0, "Bob"))
+        .await;
+    assert_eq!(b.ops(), vec![sc::SCAskToJoinTeamPacket]);
+
+    crate::world::session::set_online(&server, &a.p, false);
     assert_eq!(
-        a.frames(),
-        vec![(
-            sc::SCErrorMsgPacket,
-            crate::systems::social::packets::body(&SCErrorMsgPacket::new(
-                crate::packets::world::error_message::WHISPER_NO_TARGET,
-                0,
-                true,
-            ))
-        )]
+        b.frames(),
+        vec![
+            error_frame(crate::systems::social::util::error::TEAM_INVITOR_OFFLINE),
+            (
+                sc::SCInvitationCanceledPacket,
+                vec![invitation_canceled_kind::TEAM]
+            )
+        ]
     );
 }

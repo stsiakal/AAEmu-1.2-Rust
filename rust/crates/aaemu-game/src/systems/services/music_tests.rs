@@ -504,14 +504,11 @@ async fn upload_defaults_to_grade_zero_without_the_actability() {
 }
 
 #[tokio::test]
-async fn upload_rejects_a_mismatched_song_size() {
+async fn upload_accepts_a_mismatched_song_size() {
+    // The client writer's size unit is not evidenced: warn, do not drop.
     let (server, mut client, _player, instrument, _) = upload_fixture();
     upload(&server, &mut client, 4, instrument, "abc").await;
-    assert!(server.systems.services.music.queued_upload(1).is_none());
-    assert_eq!(
-        client.drain(),
-        vec![(sc::SCErrorMsgPacket, refusal_error())]
-    );
+    assert!(server.systems.services.music.queued_upload(1).is_some());
 }
 
 #[tokio::test]
@@ -526,14 +523,11 @@ async fn upload_rejects_an_unowned_item() {
 }
 
 #[tokio::test]
-async fn upload_rejects_an_owned_non_instrument() {
+async fn upload_accepts_an_owned_non_instrument_such_as_the_music_paper() {
+    // The client sends the bag item it found by id (the music paper), not an instrument.
     let (server, mut client, _player, _, other) = upload_fixture();
     upload(&server, &mut client, 3, other, "abc").await;
-    assert!(server.systems.services.music.queued_upload(1).is_none());
-    assert_eq!(
-        client.drain(),
-        vec![(sc::SCErrorMsgPacket, refusal_error())]
-    );
+    assert!(server.systems.services.music.queued_upload(1).is_some());
 }
 
 #[tokio::test]

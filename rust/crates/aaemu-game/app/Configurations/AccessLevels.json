@@ -74,6 +74,8 @@
         "restrict_chat": 100,
         "rotate": 100,
         "scripts": 100,
+        "allowguildrename": 100,
+        "renameguild": 100,
         "setpremium": 100,
         "set_bounty_money": 100,
         "set_crime_value": 100,
