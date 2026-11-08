@@ -4416,7 +4416,8 @@ config is the baseline.
 
 | Key | Bit | Default | What the client uses it for |
 | --- | --- | --- | --- |
-| `siege` | 0 | on | Siege / dominion UI (`FUN_39496b20:956485`). The Lua key is read by the siege UI; the exact window is INFERRED. |
+| `siege` | 0 | `Housing.SiegeCalendar` (profile) | Siege / dominion UI (`FUN_39496b20:956485`). The Lua key is read by the siege UI; the exact window is INFERRED. The default is the resolved server flag (on for `EuAuroria` / `Kr12`, off for `EuLaunch`); an explicit value wins. |
+| `nations` | 6 | `Social.PlayerNations` (profile) | Player-nation UI (C# `Feature.Nations`, not in the `GetFeatureSet()` Lua table). The default is the resolved server flag (on for `Kr12`, off for the EU profiles); an explicit value wins. |
 | `premium` | 4 | on | Premium / Patron HUD and labor UI (C++ reads at `x2game.dll.c:703203`, `708636`). |
 | `itemSecure` | 45 | on | Item-secure / lock handling (`FUN_397cc350`, item byte flag `0x4`). |
 | `secondpass` | 46 | off | Second-password entry and its opcode path (`x2game.dll.c:45293`, `617228`, `108647`). The second password is not supported; keep it off. |
@@ -4439,8 +4440,45 @@ config is the baseline.
 | `ExtraBits` | any | `{}` | Override map for the unnamed `flag_x_y` bits, `0..=87`. The C++ reads unnamed bits 32, 34, 41, 42, 47, 60 and 73 (purpose unresolved); 78 is the mate equipment whitelist (`PORTING.md`, mate equipment). Defaults: 32 on (plus inherited 16-19, 24-27, 35, 37, 49); 34, 41, 42, 47, 60, 73 and 78 off. |
 
 The C#-named bits that have no `GetFeatureSet()` Lua key (`allowFamilyChanges` 1, `houseSale` 3,
-`nations` 6, `customUiButton` 39, `freeLpRaise` 53, `houseTaxPrepay` 84) have no named config
-switch; they keep their current defaults and `ExtraBits` can override them like any other bit.
+`customUiButton` 39, `freeLpRaise` 53, `houseTaxPrepay` 84) have no named config switch; they
+keep their current defaults and `ExtraBits` can override them like any other bit. `nations` (6)
+now has the named key below because it follows the era profile.
+
+## Server era profile (Rust only, 2026-11-08)
+
+Trion's "Version 1.2" was a label over several builds; the owner decided on 2026-11-08 to
+emulate the EU **Auroria** era by default. `World.Profile` selects the era; its derived values
+are defaults, so every explicit key still wins. The server logs the active profile once at
+startup. Timeline and sources: `D:/aaemu-audits/gap-audit-2026-11-02/research/trion-1.2-eu-na.md`.
+
+| Area | `EuAuroria` (default) | `EuLaunch` | `Kr12` |
+|---|---|---|---|
+| Retail window | Trion EU Conquest of Auroria to the day before Secrets of Ayanad: **2014-11-04 (NA) / 2014-11-06 (EU) to 2015-03-09** (engadget 2014-11-04; mein-mmo 2014-11-06; Total ArcheAge 2015-03, "level cap 55" with Secrets of Ayanad on 2015-03-10) | Trion NA/EU launch: **2014-09-12 (head start) / 2014-09-16 (launch) to 2014-11-03**, before Auroria (gameinformer 2014-08-30; tentonhammer 2014-09-12) | XL KR 1.2 data our templates come from (`r208022`) |
+| Player level cap | 50 | 50 | 55 |
+| Player nations (`systems::social::nation`, NATION-1..17) | off | off | on |
+| Dominion sieges / Auroria claims (`Housing.SiegeCalendar`; `FeatureSet.siege`) | on | off | on |
+| Override keys | `Social.PlayerNations`, `Housing.SiegeCalendar`, `FeatureSet.siege`, `FeatureSet.nations` | same | same |
+
+* **Level cap.** `ExperienceManager.PlayerLevelCap` is no longer a constant: `GameData::load`
+  passes `ServerProfile::player_level_cap()` to `ExperienceTable::from_templates`. A character
+  saved above a lowered cap keeps its level; a gain is trimmed at that character's level, the
+  same as at the cap, and `level_from_exp` never returns a level above the cap even though the
+  `levels` table has 55 rows (the C# search range could run past the cap). The client
+  `FeatureSet` level limit (byte 1) follows the table. Mate cap stays `MATE_LEVEL_CAP = 50`.
+* **Nations.** No public Trion 1.2 source shows player-nation founding (research §1.4/§3);
+  the research treats it as unavailable in 1.2. The server gate is
+  `Social.PlayerNations` (profile default), and the client `FeatureSet.nations` bit follows the
+  same value. A refused founding uses the existing precondition refusal (`FACTION_SEPARATE_RIGHTS`
+  40 for the skill / GM path), not a new error id. Existing nations loaded from the database are
+  not deleted by the switch (a profile change is not a migration).
+* **Sieges and claims.** `Housing.SiegeCalendar` drives the weekly siege calendar; when it is
+  off, the skill claim is refused with `DOMINION_CLOSED` 662 (the existing "not a claimable
+  region" refusal) and the client `FeatureSet.siege` bit is off. Trion's launch era had neither;
+  Auroria opened on 2014-11-04 (NA) / 2014-11-06 (EU) (research §2/§4). The Trion siege itself
+  was a Lodestone system; our KR dominion siege with camp lots is a **server policy
+  approximation** of it, not a claim that the two rules match.
+* **Not modelled (owner decision):** Patron / free-player rules, APEX and labor potions are out
+  of scope for the profile.
 
 ## Live testing (phase 5): fixes and deliberate deviations
 

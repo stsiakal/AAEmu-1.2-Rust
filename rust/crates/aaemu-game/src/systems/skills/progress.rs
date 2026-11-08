@@ -1240,6 +1240,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_era_cap_stops_experience_at_50_and_keeps_an_above_cap_level() {
+        let mut data = GameData::empty();
+        data.experience = crate::data::ExperienceTable::from_templates(
+            (1..=55u8)
+                .map(|level| crate::data::LevelTemplate {
+                    level,
+                    total_exp: i32::from(level) * 1_000,
+                    total_mate_exp: i32::from(level) * 1_000,
+                    skill_points: i32::from(level),
+                })
+                .collect(),
+            50,
+        )
+        .expect("cap 50 table");
+        let server = test_server_with(data);
+        let mut client = TestClient::new(&server, 1, 1);
+        let mut character = test_character(1, "Capped", 100.0, 100.0);
+        character.unit.level = 50;
+        character.experience = 50_000;
+        let player = spawn_player(&server, &client, character, 0x100);
+        client.drain();
+
+        // At the cap: the gain neither levels up nor accumulates beyond the level total.
+        add_exp(&server, &player, 10_000, false);
+        {
+            let c = player.data();
+            assert_eq!((c.unit.level, c.experience), (50, 50_000));
+        }
+
+        // A character saved above the cap keeps 53 and still gains no level.
+        player.data().unit.level = 53;
+        player.data().experience = 53_000;
+        add_exp(&server, &player, 10_000, false);
+        {
+            let c = player.data();
+            assert_eq!((c.unit.level, c.experience), (53, 53_000));
+        }
+    }
+
+    #[tokio::test]
     async fn an_ability_level_rise_upgrades_only_the_learned_skills_that_cross_a_step() {
         use crate::data::skills::SkillTemplate;
 

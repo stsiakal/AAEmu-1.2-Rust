@@ -395,7 +395,7 @@ impl Command for Dominion {
                 .systems
                 .housing
                 .calendar
-                .settings(&server.config.housing)
+                .settings(&server.config.housing, server.config.world.profile)
                 .enabled
             {
                 CommandManager::send_error_text(
@@ -1181,6 +1181,10 @@ mod tests {
     #[tokio::test]
     async fn test_clock_requires_the_calendar_and_only_moves_the_calendar() {
         let f = fixture();
+        // The fixture profile would enable the calendar; start from an explicit off value.
+        f.server
+            .config
+            .update(|config| config.housing.siege_calendar = Some(false));
         let (_, out) = harness::run(&f.server, &f.attacker.p, "dominion clock 2000000000").await;
         assert_eq!(
             out,
@@ -1193,7 +1197,7 @@ mod tests {
 
         f.server
             .config
-            .update(|config| config.housing.siege_calendar = true);
+            .update(|config| config.housing.siege_calendar = Some(true));
         let (_, out) = harness::run(&f.server, &f.attacker.p, "dominion clock 2000000000").await;
         assert_eq!(
             out,

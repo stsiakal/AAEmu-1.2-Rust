@@ -314,14 +314,23 @@ fn disabled_calendar_is_reported_by_the_settings_and_invalid_schedules_are_rejec
         .cycle_for_week(ZONE, date(2014, 1, 5), &timezone())
         .is_none());
 
-    let settings = CalendarSettings::from_config(&HousingConfig {
-        siege_calendar: true,
-        siege_calendar_timezone: "+09:00".into(),
-        ..Default::default()
-    });
+    let settings = CalendarSettings::from_config(
+        &HousingConfig {
+            siege_calendar: Some(true),
+            siege_calendar_timezone: "+09:00".into(),
+            ..Default::default()
+        },
+        ServerProfile::EuAuroria,
+    );
     assert!(settings.enabled);
     assert_eq!(settings.timezone, timezone());
-    assert!(!CalendarSettings::from_config(&HousingConfig::default()).enabled);
+    // A missing key follows the era profile: on for Auroria, off for the launch era.
+    assert!(
+        CalendarSettings::from_config(&HousingConfig::default(), ServerProfile::EuAuroria).enabled
+    );
+    assert!(
+        !CalendarSettings::from_config(&HousingConfig::default(), ServerProfile::EuLaunch).enabled
+    );
 }
 
 #[test]

@@ -520,10 +520,70 @@ pub enum SeaWeatherModelType {
 impl_config_enum!(WindModelType { Official = 0, Realistic = 1 });
 impl_config_enum!(SeaWeatherModelType { Official = 0, Realistic = 1 });
 
+/// The retail era the server emulates (`World.Profile`, Rust only).
+///
+/// The default is the owner decision of 2026-11-08: Trion EU "Auroria" (4 Nov 2014 to
+/// 9 Mar 2015), i.e. the Trion 1.2 build after the Conquest of Auroria update. `EuLaunch` is
+/// the Trion NA/EU launch era (12/16 Sep to 3 Nov 2014, before Auroria). `Kr12` is the XL KR
+/// 1.2 data our templates come from (`r208022`). The timeline and sources are in the audit
+/// research `research/trion-1.2-eu-na.md`; `PORTING.md` cites the dates.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ServerProfile {
+    /// Trion EU "Auroria" era: level cap 50, no player nations, sieges and Auroria claims on.
+    #[default]
+    EuAuroria,
+    /// Trion NA/EU launch era: level cap 50, no player nations, no sieges and no Auroria.
+    EuLaunch,
+    /// XL KR 1.2 (`r208022`): level cap 55, player nations and dominion sieges on.
+    Kr12,
+}
+
+impl ServerProfile {
+    /// Player level cap (`ExperienceManager.PlayerLevelCap`). Trion's 1.2 builds kept level 50
+    /// until Secrets of Ayanad (2015-03-10); the KR 1.2 data goes to 55.
+    pub fn player_level_cap(self) -> u8 {
+        match self {
+            Self::EuAuroria | Self::EuLaunch => 50,
+            Self::Kr12 => 55,
+        }
+    }
+
+    /// Player nations (independence, diplomacy, national tax, monuments): KR only. No public
+    /// Trion 1.2 source shows player-nation founding before the later updates.
+    pub fn player_nations(self) -> bool {
+        matches!(self, Self::Kr12)
+    }
+
+    /// Dominion sieges and Auroria territory claims: the Conquest of Auroria update
+    /// (2014-11-04 NA, 2014-11-06 EU) shipped them; the launch era did not have them.
+    pub fn sieges(self) -> bool {
+        !matches!(self, Self::EuLaunch)
+    }
+}
+
+impl_config_enum!(ServerProfile {
+    EuAuroria = 0,
+    EuLaunch = 1,
+    Kr12 = 2
+});
+
+impl Display for ServerProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::EuAuroria => "EuAuroria",
+            Self::EuLaunch => "EuLaunch",
+            Self::Kr12 => "Kr12",
+        })
+    }
+}
+
 /// `WorldConfig` (`Configurations/World.json`).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct WorldConfig {
+    /// The retail era profile (`World.Profile`, Rust only): see [`ServerProfile`].
+    #[serde(rename = "profile", deserialize_with = "lenient_enum")]
+    pub profile: ServerProfile,
     /// `MOTD`.
     #[serde(rename = "motd")]
     pub motd: String,
@@ -620,6 +680,7 @@ pub struct WorldConfig {
 impl Default for WorldConfig {
     fn default() -> Self {
         Self {
+            profile: ServerProfile::default(),
             motd: String::new(),
             logout_message: String::new(),
             auto_save_interval: 5.0,
@@ -994,6 +1055,22 @@ impl AppConfig {
             .iter()
             .find(|(k, _)| k == command)
             .map(|(_, v)| *v)
+    }
+
+    /// Player nations: the explicit `Social.PlayerNations` value wins, otherwise the era
+    /// profile decides (`World.Profile`).
+    pub fn player_nations_enabled(&self) -> bool {
+        self.social
+            .player_nations
+            .unwrap_or_else(|| self.world.profile.player_nations())
+    }
+
+    /// Sieges and Auroria claims: the explicit `Housing.SiegeCalendar` value wins, otherwise
+    /// the era profile decides (`World.Profile`).
+    pub fn siege_calendar_enabled(&self) -> bool {
+        self.housing
+            .siege_calendar
+            .unwrap_or_else(|| self.world.profile.sieges())
     }
 }
 
@@ -1376,6 +1453,22 @@ where
     parse_scalar(&v)
 }
 
+/// An optional scalar: a missing key leaves `None`, an explicit value (including a JSON
+/// string or number) binds like [`lenient`]. Used where a missing key should follow the
+/// [`ServerProfile`] while an explicit value wins.
+pub(crate) fn lenient_option<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: FromStr,
+    T::Err: Display,
+{
+    let v = Value::deserialize(d)?;
+    match v {
+        Value::Null => Ok(None),
+        other => parse_scalar(&other).map(Some),
+    }
+}
+
 /// A configuration enum: its member name (any case) or numeric value.
 pub(crate) fn lenient_enum<'de, D, T>(d: D) -> Result<T, D::Error>
 where
@@ -1685,18 +1778,28 @@ mod tests {
         assert!(cfg.events.halloween.enabled);
         assert_eq!(cfg.events.halloween.start, "");
         assert_eq!(cfg.events.halloween.end, "");
-        // FeatureSet.json: the shipped switches are the current bytes (data::features), and the
-        // unnamed-bit override list starts empty.
-        assert!(cfg.feature_set.siege);
+        // FeatureSet.json: the shipped switches leave the profile-driven bits (`siege`,
+        // `nations`) unset, the rest match the current bytes, and the unnamed-bit override list
+        // starts empty.
+        assert_eq!(cfg.feature_set.siege, None);
+        assert_eq!(cfg.feature_set.nations, None);
         assert!(!cfg.feature_set.aa_point);
         assert!(!cfg.feature_set.dwarf_warborn);
         assert!(cfg.feature_set.extra_bits.is_empty());
-        // The shipped file applied to the stock level caps is exactly the current fset bytes.
-        let mut fset = crate::data::FeatureSet::initialized(55, 50);
-        fset.apply_config(&cfg.feature_set);
+        // The shipped file applied to the default profile and stock level caps.
+        assert_eq!(cfg.world.profile, ServerProfile::EuAuroria);
+        let mut fset = crate::data::FeatureSet::initialized(
+            cfg.world.profile.player_level_cap(),
+            crate::data::experience::MATE_LEVEL_CAP,
+        );
+        fset.apply_config(
+            &cfg.feature_set,
+            cfg.siege_calendar_enabled(),
+            cfg.player_nations_enabled(),
+        );
         assert_eq!(
             fset.bytes(),
-            &[0x5B, 55, 0x0F, 0x0F, 0xF9, 0x29, 0x33, 0x89, 50, 0x08, 0x1a]
+            &[0x1B, 50, 0x0F, 0x0F, 0xF9, 0x29, 0x33, 0x89, 50, 0x08, 0x1a]
         );
     }
 
@@ -1711,7 +1814,7 @@ mod tests {
             }
         }))
         .unwrap();
-        assert!(!cfg.feature_set.siege);
+        assert_eq!(cfg.feature_set.siege, Some(false));
         assert!(cfg.feature_set.dwarf_warborn);
         assert!(cfg.feature_set.aa_point);
         assert_eq!(cfg.feature_set.extra_bits.get(&78), Some(&true));
@@ -1724,7 +1827,7 @@ mod tests {
             [("FeatureSet__Siege".to_string(), "true".to_string())],
         );
         let cfg = AppConfig::from_value(value).unwrap();
-        assert!(cfg.feature_set.siege);
+        assert_eq!(cfg.feature_set.siege, Some(true));
     }
 
     #[test]
@@ -1815,6 +1918,61 @@ mod tests {
             vec![("alpha".to_string(), 1), ("Zeta".to_string(), 5)]
         );
         assert!(AppConfig::from_value(json!({ "World": { "WindModel": "Nope" } })).is_err());
+    }
+
+    #[test]
+    fn era_profile_defaults_and_explicit_flags_win() {
+        let cfg = AppConfig::from_value(json!({})).unwrap();
+        assert_eq!(cfg.world.profile, ServerProfile::EuAuroria);
+        assert_eq!(cfg.world.profile.player_level_cap(), 50);
+        assert!(!cfg.player_nations_enabled());
+        assert!(cfg.siege_calendar_enabled());
+        assert_eq!(format!("{}", cfg.world.profile), "EuAuroria");
+
+        let cfg = AppConfig::from_value(json!({ "World": { "Profile": "EuLaunch" } })).unwrap();
+        assert_eq!(cfg.world.profile, ServerProfile::EuLaunch);
+        assert_eq!(cfg.world.profile.player_level_cap(), 50);
+        assert!(!cfg.player_nations_enabled());
+        assert!(!cfg.siege_calendar_enabled());
+
+        let cfg = AppConfig::from_value(json!({ "World": { "Profile": "Kr12" } })).unwrap();
+        assert_eq!(cfg.world.profile, ServerProfile::Kr12);
+        assert_eq!(cfg.world.profile.player_level_cap(), 55);
+        assert!(cfg.player_nations_enabled());
+        assert!(cfg.siege_calendar_enabled());
+
+        // An explicit flag wins over the profile in both directions.
+        let cfg = AppConfig::from_value(json!({
+            "World": { "Profile": "EuLaunch" },
+            "Social": { "PlayerNations": true },
+            "Housing": { "SiegeCalendar": "true" }
+        }))
+        .unwrap();
+        assert!(cfg.player_nations_enabled());
+        assert!(cfg.siege_calendar_enabled());
+        let cfg = AppConfig::from_value(json!({
+            "World": { "Profile": "Kr12" },
+            "Social": { "PlayerNations": "false" },
+            "Housing": { "SiegeCalendar": false }
+        }))
+        .unwrap();
+        assert!(!cfg.player_nations_enabled());
+        assert!(!cfg.siege_calendar_enabled());
+        assert_eq!(cfg.world.profile.player_level_cap(), 55);
+
+        // The key binds through the environment (`World__Profile`) and the command line.
+        let mut value = json!({});
+        apply_env(
+            &mut value,
+            [("World__Profile".to_string(), "Kr12".to_string())],
+        );
+        let cfg = AppConfig::from_value(value).unwrap();
+        assert_eq!(cfg.world.profile, ServerProfile::Kr12);
+        let mut value = json!({});
+        apply_args(&mut value, &["--World:Profile=EuLaunch".to_string()]);
+        let cfg = AppConfig::from_value(value).unwrap();
+        assert_eq!(cfg.world.profile, ServerProfile::EuLaunch);
+        assert!(AppConfig::from_value(json!({ "World": { "Profile": "Nope" } })).is_err());
     }
 
     #[test]
