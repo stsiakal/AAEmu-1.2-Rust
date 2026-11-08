@@ -2573,6 +2573,18 @@ is no longer mirrored (see "Known deviations", dead NPC returned and healed).
   `a_failed_expired_lot_refund_keeps_the_lot_and_retries_once`,
   `an_unresolvable_expired_lot_winner_deletes_the_item_once_and_removes_the_lot`,
   `an_expired_auction_delivery_is_deleted_instead_of_taken`.
+* systems::economy (mail retention, 2026-11-08): the flat 14-day receipt policy is replaced by
+  the 1.2 client's `mail_guide` (`ui_texts` 4465): normal mail (types 1-3, 4) is kept 5 days
+  after it was read or 30 days unread; system mail is kept 5 days after it was read or 90 days
+  unread. `Configurations/Mail.json` (`ReadRetentionDays`, `UnreadRetentionDays`,
+  `SystemReadRetentionDays`, `SystemUnreadRetentionDays`) overrides them. The read clock is
+  `open_date`, written when the mail is opened or an attachment is claimed; legacy read rows
+  without it use the receipt date (as the 10.x server does). Mail whose attachments are still
+  unclaimed keeps the unread deadline. Unread player mail is returned to its sender; the other
+  expired attachments (read mail, system mail, deleted sender) are deleted with a warning, as
+  the guide says mail is auto-deleted after its window. The commercial mailbox
+  (`CHARGED`/`PROMOTION`/`MIA_*`) is not on this timer: its own guide (`ui_texts` 4464) says
+  read mail is deleted at once and unread mail is kept.
 * systems::economy (mail leftovers, WP-I4): `/mail admin <receiver> <title> <text> [money]
   [[itemId count] ...]` is a Rust-only GM command (the C# had no such command); `ADMIN` (5) is
   one of the mail types the 1.2 client lists (`mail/common.alb`). It stores a sender-id-0 system
