@@ -509,7 +509,7 @@ buff unchanged, absolute-value inference, real-compact loader for the three colu
 | 79 non-phase funcs, 41 world interactions (`execute_interaction` for the skills InteractionEffect), coffers, bond / seats | `doodad/funcs/`, `doodad/interactions.rs`, `doodad/coffer.rs` | done | Items, loot, coffers through the economy `EconomyBridge`; skills, quests, housing through the bridges; instance funcs (`systems::instances`), `BindSlave` (`systems::vehicles`). Sticky parents are not modelled. The funcs that stay trace-only (`DoodadFuncBankUi` / `_AuctionUi` / `_StoreUi` / `_CofferPerm` / `_RenewItem`, `Climb`, `CraftStart/Act/GetItem/Cancel/Info/Pack`, `InsertCounter`, `StampMaker`, `UccImprint`) are **client-driven**: the 1.2 client loads `doodad_func_bank_uis`, `_auction_uis`, `_store_uis`, `_coffer_perms` and `_renew_items` itself (`strings.txt:13498-13557`), so there is no server answer to add (do not reopen). |
 | SCDoodad* packets, doodad C->S packets (CSChangeDoodadData/Phase, CSCreateDoodad, CSSetLogicDoodad, CSSaveDoodadUccString, CSUnbondDoodad, CSCofferInteraction) | `doodad/packets.rs`, `doodad/coffer.rs` | done | Byte-exact tests. `SCWorldInteractionCanceledPacket` 0x07f (`bc unitObjId, u32 doodadObjId`, reader `FUN_397c6540`) is defined and byte-tested but never sent: its trigger is capture-pending (CAP-INT-1). `SCDoodadPhaseMsgPacket` 0x157 (`bc doodadObjId, u32 funcGroupId`, reader `FUN_397b6460`) is sent on an authored `phase_msg` change (WP-UI1, see the deviations). |
 | `CSCreateDoodadPacket` placement checks / 1.2 seed-builder rules | `doodad/manager.rs` (`handle_create_doodad`, `create_player_doodad`, `create_player_doodad_server_spawned`), `doodad/placement.rs` | deviation | **Deviation:** the C# checked only the source item, public farm (`CanPlace`), house permission and labor, and several refusals were silent. The Rust applies the 1.2 client's seed-builder validation (`FUN_393a8fa0`; research `s3-farm-plant-harvest.md`, capture `2026-10-30-capture-farm-cinema.md`) to the one planting entry path, `CSCreateDoodadPacket` (`handle_create_doodad` -> checked `create_player_doodad`), through `placement::refusal`. The fake-trial GM command and crime evidence (bloodstains / footprints) spawn server-side doodads and use `create_player_doodad_server_spawned` through `SocialHooks::create_player_doodad`, so they are not planting paths and are not validated; item-use backpacks (`spawn_backpack_doodad`) and skill `SpawnDoodad` effects are also not plantings. Rules, in `FUN_393a8fa0` order: (1) `restrict_zone_id` mismatch -> `DOODAD_SIM_AREA` 276 (F11: the client shows "Can't be installed here."); (2) water: group 40 (marine crops) must stand in water and every other group refuses it, `DOODAD_SIM_AREA` 276 — the server's `WorldInstance.IsWater` with the client PR's `surface > z + 0.3 m` margin (the decompiled `worldvtbl+0xf4` test and F5 were not decoded: capture-pending); (3) range: at most 30 m in 3D, `TOO_FAR_AWAY` 154 — `FUN_393a8fa0` (~761319) refuses only `900.0 < d²`, so exactly 30 m is allowed (F1's screen-projected sweep cannot pin the boundary). The server measures from its own player position, which lags a moving client; the code base has no placement-range allowance (the 15 m `DOODAD_RANGE_ALLOWANCE` in `systems::skills` covers cast targets, not placement), so none is added; (4) doodads: sphere test `dist3D < r_new + r_other` only when both are round (`FUN_3983b360`: groups 2, 3, 5, 12, 40, 80, template 1219, group 38), radius `max(sim_radius / 1000, 0.1)` m, `DOODAD_SIM_TOO_CLOSE_TO_OTHER_DOODAD` 277. Every mixed/non-round pair uses oriented boxes (`FUN_390318f0` / `FUN_39030ae0`) that are not decoded, and non-round units use a physics collider (`FUN_39180d50`), so those pairs are skipped: the server is permissive, never stricter than the client (real group 72 plantables 5287–5290 / 6591 with 3 m and group 69 3596 with 2 m stay placeable); (5) round doodads against units inside their radius -> `DOODAD_SIM_TOO_CLOSE_TO_OTHER_UNIT` 278; (6) dominion: only item template 29800 ("Blueprint: Territory Statue", `DAT_39ac774c`) is gated (step 7, `dll.c:761340-761378`). The spot must be in a non-zero zone group whose dominion record is owned by the caster's own expedition (not the nation king) and lies within the live tower's 2D `radius_dominion` (`guard_tower_settings.radius_dominion`, the `+0xa0` short; the field order is INFERRED from `DominionTerritoryData`'s wire order), else `LOCATE_INVALID_DOMINION_AREA` 749; every other item skips the gate and the refusal answers before the seed is consumed. Silent drops answer `FAILED_TO_USE_ITEM` 207 for a missing / foreign item or an unknown template — **inference**, not a capture: the 1.2 client uses the same code when a seed use is cancelled, but no server->client answer was captured (a zone-banned item keeps its 440 `ITEM_CANNOT_USE_HERE`). Malformed positions (non-finite / scale outside 0..10) stay silent: they are anti-cheat guards, not a 1.2 client path. Open client steps not implemented: the ±6 m footprint height spread (step 2, `FUN_393a7720`; skipped for groups 2, 3, 5, 12, 37, 40, 80 — footprint sampling undecoded and F7 not driven); the house/farm area rule of step 0 (the server keeps its own house/public-farm checks); the area-box test `FUN_393287c0` (0x114); the overlap skip list `FUN_397a7cc0` / `FUN_397a7ce0` (it compares four template pointers whose ids are not initialized in the decompile); and the farm-plot radius call `FUN_3983b280(..,1)` (the decompiled body ignores the second argument). Research `re-placement-fakeuse.md` sections D1b-D1d records the rest as below the bug bar or blocked: D1b (a doodad cube straddling a shrunken house box, 276) needs the render-model z box and is largely covered by `house_at_location_in_world` + `allowed_to_interact` answering `NO_PERM` for a spot inside a house (score 2, worker-ready NO); D1c (±6 m footprint spread, 279, plus the z snap to the minimum) needs the model local bbox (score 3, worker-ready NO); D1d's terrain material (place skin) rule is implemented behind the default-off `Housing.PlacementStrictSurface` (see the D1d place-skin section below); the kind-4 reachability and the border sample are INFERRED. The hard-coded farm zones vs `common_farms` (S5) belong to slice 11 and are unchanged. Concurrency (Greptile P1 on #25): the final check and the doodad's insertion into the grid are one critical section under `WorldInstance::placement_guard`, so two plantings at the same empty spot cannot both pass the overlap check; the seed is consumed only after the insert succeeds and a failed consumption deletes the doodad again. **Deviation:** C# consumed the seed before `Spawn()`, which left the check-then-spawn window open; the refusal error and the economy callbacks run after the guard is dropped. |
-| Heightmaps (`WorldCell` heightmap.dat, `GetHeight`, `GetReferenceHeight`), NPC reference height in `SCUnitStatePacket` | `heightmap.rs`, `world/unit_state.rs` | done | Lazy per cell (`PreLoadTerrain`); with `GeoDataMode` the navmesh height of `systems::ai::geodata` comes first. Median error 0.095 m vs 4 003 real spawn Z values (0.111 m with the same coefficient but the C# truncating cast, 0.098 m with the C# coefficient). Used by the skill controllers / displacements, plots and NPC spawns. **Deviation:** the u16 grid coefficient is `ushort.MaxValue / MaxHeight`, not the C#'s `ushort.MaxValue / (MaxHeight / 4.0)`; the whole 0..=MaxHeight range fits and samples are rounded to the nearest step, where the C# truncated (see the 2026-11-08 heightmap-ceiling deviation below). |
+| Heightmaps (`WorldCell` heightmap.dat, `GetHeight`, `GetReferenceHeight`), NPC reference height in `SCUnitStatePacket` | `heightmap.rs`, `world/unit_state.rs` | done | Lazy per cell (`PreLoadTerrain`); with `GeoDataMode` the navmesh height of `systems::ai::geodata` comes first. Median error 0.095 m vs 4 003 real spawn Z values (0.111 m with the same coefficient but the C# truncating cast, 0.098 m with the C# coefficient). Used by the skill controllers / displacements, plots and NPC spawns. **Deviation:** the u16 grid coefficient is `ushort.MaxValue / MaxHeight`, not the C#'s `ushort.MaxValue / (MaxHeight / 4.0)`; the whole 0..=MaxHeight range fits and samples are rounded to the nearest step, where the C# truncated (see the 2026-11-08 heightmap-ceiling deviation below). Low-resolution sector nodes (n_size 2/5/9/17) are resampled with the original client's bilinear rule instead of the C# `UpScale` quirk (see the 2026-11-08 low-resolution-node deviation below). |
 | `GimmickManager`, `GimmickGameData`, `GimmickSpawner`, movement handlers | `gimmick/` | done | |
 | `AreaTriggerManager` (+ aoe_shapes, wi_group_wis), `SubZoneManager`, `SphereQuestManager` (world side) | `area_trigger.rs`, `subzone.rs`, `sphere_quest.rs` | done | Quest effects via `QuestsBridge`. Area membership compares entity identity, so reconnecting with a reused object ID leaves the retained old session and enters the new one; this corrects the mirrored C# ID-only comparison and restores active school auras. Unchanged entities and overlapping aura counts are retained. Sub-zone index scan of the pak is slow in debug (~25 s). |
 | `PortalManager` (recall, district return, summoned portals, portal book, teleports) | `portal/` | done | Trial court check (`systems::social`), mates / slaves on instance change (`systems::vehicles`). |
@@ -1245,6 +1245,7 @@ owner's statue through the same ordered path.
 | `HousingGameData` (`item_housings`, `housings`, `housing_binding_doodads` + `Data/housing_bindings*.json`, `housing_build_steps`, `housing_decorations`, `item_housing_decorations`, `housing_groups` incl. `allowed_tax_delay_week`, `PostLoad`), `TaxationsManager` (`taxations`) | `systems/housing/data.rs` | done | Gated real-DB test `housing_real_compact_db` (row counts, bindings positioned, shipped tax delays). Duplicate build steps fail the load (C# `Dictionary.Add`). A NULL / missing `allowed_tax_delay_week` column loads as `None` (WP-H1). |
 | `HousingManager` (all methods), `House` behaviour (`CurrentStep` setter + bound doodads, `AddBuildAction`, `Spawn` / `Delete` / visibility of `AttachedDoodads`, `AllowedToInteract`, `OnDeath`, `Save`), `HousingTaxTask`, `MailForTax` content | `systems/housing/{manager,ops,db}.rs` | done | Build (tax certificates or gold), permission, rename, recover toggle, demolish (+ `ReturnHouseItemsToOwner` mails), sale / sale markers / cancel / buy (+ mails, furniture owner), decoration, taxes (bills, untouchable / removal buffs, demolition timer every 10 s), death, `GetHouseAtLocation`, act-ability bonus. Items / money / mail go through `housing::hooks::HousingEconomyHooks` (economy installs it). **Tax grace (WP-H1, housing-farm-ucc#4 / tables-ignored-columns#8):** `tax_due_date` is `protection_end - allowed_tax_delay_week * 7 d` of the housing group containing the house (resolved like placement, first area/group wins); a missing group / area / world / column, or a negative value, keeps the C# fixed 7 days. Shipped data: only group 13 authors 0 and it is `can_extend = false`, so it never receives a bill and keeps its authored 7-day lifetime; its `SCHouseTaxInfo` plaque no longer counts the last week as an unpaid week (`weeks_without_pay` stays -1 until the protection end). Every other shipped group authors 1, so billing, removal and mail dates are unchanged. `MailForTax` (economy) carries the resolved `allowed_tax_delay_week` the same way. |
 | Housing packets (11 CS, 14 SC incl. `SCLoginCharInfoHouse`, `SCMyHouse`) | `systems/housing/packets.rs` | done | Byte-exact tests. `CSChangeHousePayPacket` has opcode 0xfff in 1.2 (not registered). `SCHouseOwnerNameChangedPacket` is social's (`packets/misc.rs`). |
+| `HousingManager.ReturnHouseItemsToOwner` demolish mail delay | `systems/housing/ops.rs` (`return_house_items_to_owner`) | deviation | **Deviation:** the C# set `RecvDate = UtcNow.AddHours(failedToPayTax ? HoursForFailedTaxToReturnHouse (22) : 0)`, holding the design and returned furniture of a tax-failure demolish for 22 hours. The Rust delivers every demolish mail immediately (server owner's decision, 2026-11-08: players found their house gone and nothing in the post); `HoursForFailedTaxToReturnHouse` was removed. `failed_to_pay_tax` still means no deposit refund. |
 | `CraftEffect` (`WorldInteractionGroup.Building`) | `systems/housing/mod.rs::apply_effect` | done | Routed first by `skills::ext::ExtHooks::route_effect`; quest `DoDoodadInteractionEvents` after it. |
 | `SpawnManager.Load` / `SpawnPersistentDoodads` housing parts, `LoadAccount` / `CSListCharacter` / `CSSelectCharacter` / `Character.Load` / `DeleteCharacterAssets` housing parts | `npcs/spawn_manager.rs`, `packets/c2g.rs`, `world/session.rs`, `db_character.rs` (one call each) | done | `LoadPlayerHousing` + `SpawnAll` before the persistent doodads, house parenting + bound doodads, `ReconcileBoundDoodads` (`UsePersistentHouseDoodads`). |
 | Placement validation | `systems/housing/placement.rs`, `systems/npcs/subzone.rs` | done | Original 1.2 housing XML `value1` tags resolve `housing_areas`/groups/categories; finite world positions, the whole `4n` footprint grid (`FUN_39331f70`/`FUN_39331ba0`), snapped-box house overlap (`FUN_39331f30`/`FUN_393349e0`), unit/doodad overlap with house-attached doodads skipped (`FUN_39335860`), authored `max_construct_count`, account eligibility, and nonrenewable beginner plots are checked server-side under the world placement guard. The placement / purchase / decoration range uses the caster's composed world position, so a mounted rider, a seated player or a ship passenger is measured at their world location instead of the parent-relative seat local. Terrain and mode-1 (n=0) model-box checks are omitted because the server has no render-model bounds (never stricter than the client). World-scoped land checks also guard planting and housing crafting benches. Real-data test: `placement::tests::real_area_338_footprint_accepts_only_the_fitting_spot`. |
@@ -1905,6 +1906,27 @@ is no longer mirrored (see "Known deviations", dead NPC returned and healed).
   `spawn_between_1024_m_and_the_world_ceiling_snaps_onto_the_terrain`, and the gated
   `real_heights_above_1024_m`.
 
+* systems::npcs (2026-11-08, low-resolution heightmap nodes): the C# `NodeCell.UpScale` was
+  replaced. Its `FindNearestSignificantPoints` divided by `nSize` and used `nSize / 33` as the
+  source scale, so every 33 x 33 target interpolated only the node's raw points
+  (0,0)..(1,1); `GetHeight` then indexed the upscaled 33-wide array with the wrong stride (the
+  C# reused `nSize`). The original 1.2 client keeps the `size x size` samples (spacing
+  `64 / (size - 1)` m) and bilinearly interpolates them at the 2 m grid positions with the
+  upper index clamped to `size - 2` (`AABevy1.2/crates/aa-world/src/heightmap.rs:240-255`,
+  `sample_node`). The Rust now does the same inside `GetHeight`, interpolating the node's own
+  samples in f32 with no re-quantisation (the C# `UpScale` re-encoded the interpolated heights
+  into the u16 h-dec grid). A 1 x 1 node, which the client treats as invalid and the 1.2 data
+  does not contain, is our choice to cover the sector with its one height. The original-client
+  recheck settled the disagreement: at the 12 audit points whose quad touches an n_size
+  2/5/9/17 sector node the original client matches Bevy within 0.066 m, while the C# rule put
+  the server a median 10.6 m (max 25.6 m) off
+  (`D:/aaemu-audits/terrain-3way-2026-11-08/REPORT.md` finding 2 and the recheck section,
+  `recheck-results.csv`). After the change all 12 are within 0.0985 m of the original client;
+  that remainder is the existing `rescale_to_int` truncation of each source sample (up to
+  `i_step * 5 cm`, not a fixed 5 cm), and the f32 resampling adds no step of its own. Tests:
+  `low_resolution_nodes_resample_like_the_client` (sizes 2/5/9/17 against the rule) and the
+  gated `real_low_resolution_node_heights` (0.15 m bound for that truncation floor).
+
 * systems::npcs (2026-11-05, WP-UI1 doodad phase messages): the C# had the
   `SCDoodadPhaseMsg` opcode (`SCOffsets.cs` 0x157) but no sender, and loaded neither
   `doodad_func_groups.phase_msg` nor `is_msg_to_zone`. The Rust loads both columns (NULL
@@ -2388,8 +2410,11 @@ is no longer mirrored (see "Known deviations", dead NPC returned and healed).
   `save_rule_id` / `real_time` default to 0 / false when the `buffs` table lacks those columns.
 * Quests: `Character.Load` reads the rows; `systems::quests::on_character_selected` builds the
   live quests from them (template check, `QuestInitialized` / `RequestEvaluation`, daily reset).
-* Mail counts at select are always 0 — this matches the C#, whose `GetCurrentMailList` runs before
-  the character is registered in the WorldManager and therefore never counts.
+* Mail counts at select: deliberate deviation. The C# `Character.Load` -> `GetCurrentMailList` ran
+  before the character was in the WorldManager, so login always reported 0 unread mails and mail
+  that arrived offline never lit the client alert. The Rust counts the unread mail (`recv_date`
+  passed, receiver, not READ) at enter world (`mail::count_unread_mail_for`, 2026-11-08, testers
+  missed offline-created tax bills); no `SCGotMail` is sent at select.
 * `Character.OnZoneChange` into a closed or unknown zone: the system message is sent but the
   forced transport out (5 x `SCErrorMsg(ClosedZone)`, then `SCCharacterResurrected` at the closest
   return portal) is not done (needs PortalManager return portals / resurrection).
@@ -2523,6 +2548,30 @@ is no longer mirrored (see "Known deviations", dead NPC returned and healed).
   unbid system lot and deletes its item (the lot-id argument and the refusal of player lots /
   lots with a bid are assumed). `client_id = 0` rows load normally on restart. The C# had
   neither command and no system-lot path.
+* systems::economy (expired auction items, 2026-11-08): the item timer only visits the
+  equipment / bag / bank containers of online characters, so a timed item on the auction house
+  never expires while it sits in escrow (a re-listed camp lot, or any timed item, could be sold
+  and delivered after its lifetime ended). Rules: an already expired item cannot be posted
+  (refused with the client's existing invalid-item code 240, ui_texts 241 "cannot put up the
+  item", item kept); a bid or buyout is refused with the same code before any money moves, so
+  a buyout can neither lose the buyer's debit nor refund an already-refunded old bidder a
+  second time; a lot whose escrow item expires before settlement is not delivered -- the
+  winner is refunded in full by the normal bid-fail mail and the item is deleted, with no
+  seller share and no `AUCTION_BUY`/`AUCTION_SOLD` credit (the refund mail is delivered before
+  any state change, so a refused mail leaves the lot for the next tick; a winner that no
+  longer resolves to a character is released with an error instead of retrying forever); and a
+  delivery taken from the mail after its item expired is deleted instead of entering the bag
+  and reported to the client like an expired bag item (`SCSyncItemLifespanPacket`, `added =
+  false`); this covers mails persisted before this fix and items that expire while the mail
+  waits (the delivery mail carries no price, so no refund is minted there). Timed items are
+  otherwise still accepted: only an already expired one is refused (no 1.2 evidence for a
+  general timed-item rule). The shared `item_timers::expired_at` matches the container timer's
+  definition. Tests: `an_expired_item_cannot_be_posted_and_reports_the_invalid_item_code`,
+  `an_expired_lot_refuses_bids_and_buyouts_before_any_money_moves`,
+  `an_item_that_expires_in_escrow_refunds_the_winner_and_is_deleted`,
+  `a_failed_expired_lot_refund_keeps_the_lot_and_retries_once`,
+  `an_unresolvable_expired_lot_winner_deletes_the_item_once_and_removes_the_lot`,
+  `an_expired_auction_delivery_is_deleted_instead_of_taken`.
 * systems::economy (mail leftovers, WP-I4): `/mail admin <receiver> <title> <text> [money]
   [[itemId count] ...]` is a Rust-only GM command (the C# had no such command); `ADMIN` (5) is
   one of the mail types the 1.2 client lists (`mail/common.alb`). It stores a sender-id-0 system
@@ -4447,7 +4496,8 @@ config is the baseline.
 
 | Key | Bit | Default | What the client uses it for |
 | --- | --- | --- | --- |
-| `siege` | 0 | on | Siege / dominion UI (`FUN_39496b20:956485`). The Lua key is read by the siege UI; the exact window is INFERRED. |
+| `siege` | 0 | `Housing.SiegeCalendar` (profile) | Siege / dominion UI (`FUN_39496b20:956485`). The Lua key is read by the siege UI; the exact window is INFERRED. The default is the resolved server flag (on for `EuAuroria` / `Kr12`, off for `EuLaunch`); an explicit value wins. |
+| `nations` | 6 | `Social.PlayerNations` (profile) | Player-nation UI (C# `Feature.Nations`, not in the `GetFeatureSet()` Lua table). The default is the resolved server flag (on for `Kr12`, off for the EU profiles); an explicit value wins. |
 | `premium` | 4 | on | Premium / Patron HUD and labor UI (C++ reads at `x2game.dll.c:703203`, `708636`). |
 | `itemSecure` | 45 | on | Item-secure / lock handling (`FUN_397cc350`, item byte flag `0x4`). |
 | `secondpass` | 46 | off | Second-password entry and its opcode path (`x2game.dll.c:45293`, `617228`, `108647`). The second password is not supported; keep it off. |
@@ -4470,8 +4520,66 @@ config is the baseline.
 | `ExtraBits` | any | `{}` | Override map for the unnamed `flag_x_y` bits, `0..=87`. The C++ reads unnamed bits 32, 34, 41, 42, 47, 60 and 73 (purpose unresolved); 78 is the mate equipment whitelist (`PORTING.md`, mate equipment). Defaults: 32 on (plus inherited 16-19, 24-27, 35, 37, 49); 34, 41, 42, 47, 60, 73 and 78 off. |
 
 The C#-named bits that have no `GetFeatureSet()` Lua key (`allowFamilyChanges` 1, `houseSale` 3,
-`nations` 6, `customUiButton` 39, `freeLpRaise` 53, `houseTaxPrepay` 84) have no named config
-switch; they keep their current defaults and `ExtraBits` can override them like any other bit.
+`customUiButton` 39, `freeLpRaise` 53, `houseTaxPrepay` 84) have no named config switch; they
+keep their current defaults and `ExtraBits` can override them like any other bit. `nations` (6)
+now has the named key below because it follows the era profile.
+
+## Server era profile (Rust only, 2026-11-08)
+
+Trion's "Version 1.2" was a label over several builds; the owner decided on 2026-11-08 to
+emulate the EU **Auroria** era by default. `World.Profile` selects the era; its derived values
+are defaults, so every explicit key still wins. The server logs the active profile once at
+startup. Timeline and sources: `D:/aaemu-audits/gap-audit-2026-11-02/research/trion-1.2-eu-na.md`.
+
+| Area | `EuAuroria` (default) | `EuLaunch` | `Kr12` |
+|---|---|---|---|
+| Retail window | Trion EU Conquest of Auroria to the day before Secrets of Ayanad: **2014-11-04 (NA) / 2014-11-06 (EU) to 2015-03-09** (engadget 2014-11-04; mein-mmo 2014-11-06; Total ArcheAge 2015-03, "level cap 55" with Secrets of Ayanad on 2015-03-10) | Trion NA/EU launch: **2014-09-12 (head start) / 2014-09-16 (launch) to 2014-11-03**, before Auroria (gameinformer 2014-08-30; tentonhammer 2014-09-12) | XL KR 1.2 data our templates come from (`r208022`) |
+| Player level cap | 50 | 50 | 55 |
+| Player nations (`systems::social::nation`, NATION-1..17) | off | off | on |
+| Weekly siege calendar (`Housing.SiegeCalendar`) | on | off | on |
+| Auroria claims / client `FeatureSet.siege` (profile; not the calendar key) | on | off | on |
+| Override keys | `Housing.SiegeCalendar` (calendar only), `FeatureSet.siege` (client bit), `Social.PlayerNations`, `FeatureSet.nations` | same | same |
+
+* **Level cap.** `ExperienceManager.PlayerLevelCap` is no longer a constant: `GameData::load`
+  passes `ServerProfile::player_level_cap()` to `ExperienceTable::from_templates`. A character
+  saved above a lowered cap keeps its level; a gain is trimmed at that character's level, the
+  same as at the cap, and `level_from_exp` never returns a level above the cap even though the
+  1.2 `levels` table has **101 rows** (the C# search range could run past the cap; from level 1
+  it could return level 56 at cap 55). The client `FeatureSet` level limit (byte 1) follows the
+  table. Mate cap stays `MATE_LEVEL_CAP = 50`.
+* **Partial exp above the cap is trimmed.** On load (`Character.ValidateAndFixExpAndLevel` ->
+  `validate_and_fix`) and on every exp gain the character's partial progress beyond the cap is
+  trimmed to the current level's total (save stores that result); the level itself is never lowered. Switching the profile back to a
+  higher cap therefore does not restore the trimmed progress.
+* **Open risk (client level limit with an above-cap character).** How the 1.2 client renders the
+  exp bar, the level number and tooltips when its `FeatureSet` level limit is 50 and the
+  character's level is above 50 is **UNVERIFIED**; it needs a live original-client check. The
+  server keeps the level and trims the exp as described above, so the client does receive a
+  level above its configured limit.
+* **Nations.** No public Trion 1.2 source shows player-nation founding (research §1.4/§3);
+  the research treats it as unavailable in 1.2. The server gate is
+  `Social.PlayerNations` (profile default), and the client `FeatureSet.nations` bit follows the
+  same value. A refused founding uses the existing precondition refusal (`FACTION_SEPARATE_RIGHTS`
+  40 for the skill / GM path), not a new error id. Existing nations loaded from the database are
+  not deleted by the switch (a profile change is not a migration).
+* **Sieges and claims are decoupled (2026-11-08 follow-up).** `Housing.SiegeCalendar` drives
+  only the inferred weekly siege calendar; its default follows the profile (on for `EuAuroria` /
+  `Kr12`, off for `EuLaunch`) and an explicit value wins. Auroria territory claims and the
+  client `FeatureSet.siege` bit follow the **profile** (`World.Profile`), not the calendar key:
+  an operator under `EuAuroria` with `Housing.SiegeCalendar=false` (GM-scheduled sieges only)
+  still claims territories and still shows the siege UI. An explicit `FeatureSet.siege` value
+  wins for the client bit; there is no separate claims key. A refused claim uses the existing
+  `DOMINION_CLOSED` 662 (the "not a claimable region" refusal). Trion's launch era had no
+  sieges or Auroria; Auroria opened on 2014-11-04 (NA) / 2014-11-06 (EU) (research §2/§4). The
+  Trion siege itself was a Lodestone system; our KR dominion siege with camp lots is a **server
+  policy approximation** of it, not a claim that the two rules match.
+* **UPGRADE (2026-11-08 follow-up).** A configuration without `Housing.SiegeCalendar` now gets
+  the weekly siege calendar from the default profile (`EuAuroria`: on). Before this change the
+  key defaulted to off (explicit GM schedules only). The calendar rules are INFERRED from the
+  1.2 tables with corroborated times; to keep the old calendar behaviour set
+  `Housing.SiegeCalendar=false`. That no longer disables Auroria claims or the client siege UI.
+* **Not modelled (owner decision):** Patron / free-player rules, APEX and labor potions are out
+  of scope for the profile.
 
 ## Live testing (phase 5): fixes and deliberate deviations
 
@@ -4777,11 +4885,14 @@ and in NPC wandering / buff remaining times.
   character or change the schedule; leaving also cancels the caller's engraving.
   `systems/housing/dominion/calendar.rs` adds the weekly period calendar from the 1.2 tables
   behind `Housing.SiegeCalendar` (default off, so the explicit GM path and its tests are
-  unchanged) and `Housing.SiegeCalendarTimezone` (empty/`local` = server local; the retail
-  timezone is UNKNOWN, INFERRED). Period ids/order, boundary arithmetic, the five wire
-  durations and the peace `started` = next auction start are EVIDENCED by the client
-  (`FUN_3956fc70`, `FUN_3946ba60`, `FUN_39838ff0`/`FUN_39839040`, `FUN_39839740`,
-  `FUN_3946be90`); weekday 0 = Sunday is INFERRED from the Sunday `siege_plans` weeks. The
+  unchanged) and `Housing.SiegeCalendarTimezone` (empty/`utc` = UTC, the default; `local` =
+  server local; the default is UTC because the Western launch-era schedule lists the same
+  wall-clock times as GMT, `round6-siege.md` 1, grade C). Period ids/order, boundary
+  arithmetic, the five wire durations and the peace `started` = next auction start are
+  EVIDENCED by the client (`FUN_3956fc70`, `FUN_3946ba60`, `FUN_39838ff0`/`FUN_39839040`,
+  `FUN_39839740`, `FUN_3946be90`); weekday 0 = Sunday is INFERRED from the Sunday
+  `siege_plans` weeks and corroborated (grade C) by the November 2014 Western schedule's
+  Sunday sieges at the table's times (`round6-siege.md` 1). The
   plan-week -> siege-Sunday mapping is also INFERRED: a plan week starts on Sunday and the
   authored warmup/siege weekday 0 is the Sunday that ends that week (a lower weekday rolls
   forward), the only reading that keeps the authored order auction Wed -> declare Fri ->
@@ -4790,16 +4901,40 @@ and in NPC wandering / buff remaining times.
   declare -> peace
   (client "unearned_win", `FUN_392f7db0`); a declared siege follows 2 -> 3 -> 4 -> 5. Only
   the week's rotating zone pair gets a cycle; other weeks stay in peace with the next cycle's
-  auction start. The plan rotation is deduplicated from `siege_plans` and, after the 2014
-  table, extended by the three-week modulo policy measured from 2014-01-05 (INFERRED server
-  policy; the retail recurrence is UNKNOWN). Explicit GM schedules keep their own timers and
+  auction start. The three-week pair rotation is corroborated (grade C) by the November 2014
+  Western schedule, whose consecutive weeks siege different pairs (`round6-siege.md` 1); the
+  plan rotation is deduplicated from `siege_plans` and, after the 2014 table, extended by the
+  three-week modulo policy measured from 2014-01-05 (the extrapolation stays an INFERRED
+  server policy; the retail recurrence beyond the table is UNKNOWN). Explicit GM schedules
+  keep their own timers and
   override the calendar for that territory. `/dominion clock <unixSeconds|off>` sets a
   non-persistent test clock for live verification of every period; it only drives the weekly
   calendar view. Explicit siege deadlines/tick transitions and the persisted state always use
   the real clock, and the command is refused while `Housing.SiegeCalendar` is disabled.
   GM scheduling with player registration is the chosen server policy for actually running a
-  siege; the camps can be posted as system lots with the GM `auction_post_siege_items` command
-  (WP-SD1b), but automatic posting at the auction period (WP-SD1c) remains unimplemented.
+  siege; the camps can also be posted as system lots with the GM `auction_post_siege_items`
+  command (WP-SD1b). Automatic posting at the auction period (WP-SD1c) is implemented by
+  `systems/housing/dominion/auction_post.rs`: on the first tick of a zone's auction period it
+  posts that zone's `siege_zones.declare_item_id` as a system lot. The lot count and item ids
+  come from the data (one per zone in the running rotation week; the six distinct camps in the
+  shipped table), the lot is anchored at the cycle's `auction_start` with the 48 h duration
+  class (the authored auction -> declare gap), the start bid is the item template's `price`
+  (5,000,000 copper), there is no buyout and the seller is the system (`client_id = 0`).
+  **INFERRED, capture-pending:** one lot per zone in the running pair (the six distinct camp
+  items cover the three pairs), the 48 h class rather than a lot that could be cut short, the start bid and
+  no-buyout choice, and that no siege-specific bid rule exists (increment, tie-break, outbid
+  refund and bid eligibility stay the normal auction engine's). Posting is idempotent per
+  cycle through the persisted `dominions.auction_posted_cycle` marker (a restart inside the
+  auction period posts nothing twice; a failed item creation releases the marker so the next
+  tick retries). The won camp item expires when the declare period ends (the cycle's
+  `warmup_start`) through the item's own `expiration_time` timer. Tests:
+  `auction_start_posts_one_system_lot_per_running_zone_from_the_authored_data`,
+  `posting_is_idempotent_on_a_repeated_tick_and_across_a_restart`,
+  `a_later_rotation_week_posts_its_own_zones_lots`,
+  `a_won_camp_item_expires_when_the_declare_period_ends_and_the_timer_removes_it`,
+  `a_disabled_calendar_posts_nothing`, `a_zone_without_a_camp_item_posts_nothing`, the gated
+  `auction_post_real_compact_db_prices_and_auction_gap` and
+  `dominion_auction_post_marker_round_trips_through_its_row` (MySQL).
   The rest of the dominion / siege work from the round-2 research (`siege-social-2.md`) is
   open: the offense ticket purchase WP-SD5 (CAPTURE-BLOCKED:
   `doodad_func_purchase_siege_tickets` has no rows) and siege hostility WP-SD7 (decision-blocked:
@@ -4812,6 +4947,19 @@ and in NPC wandering / buff remaining times.
   20:30..22:30 times never hit one); `view_at` returns None for the whole zone when its next
   rotation cycle cannot be built; and without WP-S2 (declaration) the calendar never enters
   warmup/siege on its own, so periods 3/4 exist only through an explicit GM schedule.
+* systems::housing (2026-11-08, calendar timezone default): `Housing.SiegeCalendarTimezone`
+  now defaults to **UTC** instead of the server's local offset (`""`/`utc`/`z` = UTC;
+  `local` and explicit `+HH:MM` offsets are still accepted). This is a **behaviour change**
+  for servers that never set the value: the territory claim window moves too, because
+  `claim_window_at` uses the same offset regardless of `Housing.SiegeCalendar` (the switch
+  only gates the weekly periods; the authored `open_weekday/open_hour/open_duration_hours`
+  claim window always follows the configured offset). The resolved offset and whether it came
+  from the configuration or the default are logged once at startup
+  (`systems/housing/mod.rs::System::start`). Evidence: `round6-siege.md` 1 (grade C, Total
+  ArcheAge 2014-11-20/25 lists the same wall-clock times as GMT); the original data's zone is
+  not proven, so `local` remains for servers that want it. Tests:
+  `timezone_parses_offsets_and_defaults_to_utc`,
+  `timezone_display_and_the_config_source_are_loggable`.
 * systems::housing / systems::social (WP-SD2a, 2026-11-06): the siege declaration is now
   persistent state, and the weekly calendar hands it over to the explicit siege record at the
   cycle's warmup start. `DominionState.declaration` holds the attacker expedition, the
@@ -4869,15 +5017,22 @@ and in NPC wandering / buff remaining times.
   cancels the effect. Cancelling is `dominion undeclare [zone]` (the GM command), which clears
   the declaration and broadcasts the zero offense team; the in-game trigger is UNKNOWN
   (destroying/removing the camp is the candidate), so it is capture-pending.
-  **Capture-pending assumptions:** 459 is used for the missing policy although 581 is the
-  other candidate text; the placement thresholds behind 625 (resurrection point), 633
-  (house), 661 (another zone) and 741 (obstacle), and the "siege too imminent" window behind
-  760, are UNKNOWN and are NOT enforced (no refusal today); the cancellation trigger's UI is
-  UNKNOWN. The check order is this server's policy. Tests:
+  The error split is now decided from the 1.2 texts and policy labels: 459
+  `SIEGE_MASTER_ONLY` (ui 2613 "only the siege commander") is the declaration's
+  `siege_master` refusal, and 581 `SIEGE_NO_RIGHTS_IN_EXPEDITION` (ui 4661 "you have no
+  siege-participation rights in the expedition") is the roster join's `join_siege` refusal
+  (ui 4656 "can join siege"); both player and GM roster-registration paths use
+  `dominion::rights::join_policy_allows` (`/joinsiege` and `/dominion register`), so no path
+  can add a member whose rank forbids joining. **Capture-pending assumptions:** the placement
+  thresholds behind 625 (resurrection point), 633 (house), 661 (another zone) and 741
+  (obstacle), and the "siege too imminent" window behind 760, are UNKNOWN and are NOT
+  enforced (no refusal today); the cancellation trigger's UI is UNKNOWN. The check order is
+  this server's policy. Tests:
   `camp_use_records_a_declaration_consumes_the_item_and_announces_the_team` (real
   `CSStartSkillPacket` item cast, item consumed once, cancel zero team),
   `camp_use_refusals_use_the_client_ids_and_keep_the_item` (342/343/344/386/345/459/444/639/
-  442/443, item kept each time).
+  442/443, item kept each time), `unrelated_stale_or_rank_ineligible_members_cannot_join`
+  (581 on the join path), `the_gm_register_path_also_applies_the_join_policy`.
 * systems::housing (WP-SD2c, 2026-11-06): the headquarters follow the declaration. The camp
   doodad bound by SD2b is the offense HQ from acceptance: `Headquarters::bind_declaration`
   stores it against the declaration (no siege record yet) and `bind_materialised` stamps it
@@ -4956,7 +5111,7 @@ and in NPC wandering / buff remaining times.
   are zone groups 54/56); outside the recurring `open_weekday/open_hour/open_duration_hours`
   window it is `DOMINION_NOT_DECLARE_TIME` 582 (case `0x246`; ui_texts 4662, whose `$2 weekday
   $3 o'clock $4 hours` parameters are exactly those columns). The window is computed by
-  `dominion::calendar::claim_window_at` (weekday 0 = Sunday INFERRED as everywhere else) and
+  `dominion::calendar::claim_window_at` (weekday 0 = Sunday, as corroborated above) and
   applies **regardless of `Housing.SiegeCalendar`**: that switch drives the inferred weekly
   cycle, not the authored claim columns. It uses the **real wall clock**; the GM
   `/dominion clock` is restricted to the calendar view. `open_duration_hours >= 168` covers the
