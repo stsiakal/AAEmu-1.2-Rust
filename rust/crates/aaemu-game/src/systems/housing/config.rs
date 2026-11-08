@@ -42,8 +42,10 @@ pub struct HousingConfig {
         deserialize_with = "crate::config::lenient_option"
     )]
     pub siege_calendar: Option<bool>,
-    /// Offset of the `siege_zones` weekday/hour/minute columns, e.g. `+09:00`. Empty or
-    /// `local` uses the server's current local offset; the retail timezone is UNKNOWN.
+    /// Offset of the `siege_zones` weekday/hour/minute columns, e.g. `+09:00`. Empty (the
+    /// default) or `utc` is UTC; `local` uses the server's current local offset. UTC is the
+    /// default because the Western 2014 schedule names the same wall-clock times as GMT
+    /// (`round6-siege.md` 1, grade C); the retail data's zone is not proven.
     /// `Housing.SiegeCalendarTimezone`.
     #[serde(rename = "siegecalendartimezone")]
     pub siege_calendar_timezone: String,
