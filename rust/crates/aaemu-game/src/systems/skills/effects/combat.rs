@@ -550,12 +550,16 @@ pub(super) fn damage_with_aoe(
     // multiplies the already integer damage, truncates, then enforces minimum 1.
     // The final floor is unconditional in this landed-hit diagnostic, including
     // multiplier 1. Misses and immunity returned above; only opted-in plots scale.
-    let value = aoe_multiplier
+    let landed = aoe_multiplier
         .map_or(value, |multiplier| (value as f32 * multiplier) as i32)
         .max(1);
+    // Server policy: hits on an abandoned house remove a fixed share of its maximum HP. Applied
+    // before the packet, reflection and `reduce_current_hp` so the client sees the real damage.
+    // Life/mana steal keep using the unscaled hit, so striking an abandoned house is no heal.
+    let value = crate::systems::housing::abandoned_house_hit_damage(server, &trg, &caster, landed);
     let absorbed = ((final_damage * (1.0 - reduction_mul)) as i32).max(0);
-    let health_stolen = ((value as f32 * (e.health_steal_ratio as f32 / 100.0)) as i32).max(0);
-    let mana_stolen = ((value as f32 * (e.mana_steal_ratio as f32 / 100.0)) as i32).max(0);
+    let health_stolen = ((landed as f32 * (e.health_steal_ratio as f32 / 100.0)) as i32).max(0);
+    let mana_stolen = ((landed as f32 * (e.mana_steal_ratio as f32 / 100.0)) as i32).max(0);
     let caster_t = Target::Obj(caster.clone());
     let trg_t = Target::Obj(trg.clone());
     let test_drive = matches!(args.cast, CastAction::Buff { buff_id: 6151, .. });
@@ -614,7 +618,18 @@ pub(super) fn damage_with_aoe(
             );
         }
     }
-    if e.check_crime && relation_to(server, &caster_t, &trg_t) == RelationState::Friendly {
+    // Hitting yourself or your own mount / slave is never a crime (no Retribution, no evidence).
+    let own_unit = match (
+        owner_character(server, &caster),
+        owner_character(server, &trg),
+    ) {
+        (Some(c), Some(t)) => c.obj_id == t.obj_id,
+        _ => false,
+    };
+    if e.check_crime
+        && !own_unit
+        && relation_to(server, &caster_t, &trg_t) == RelationState::Friendly
+    {
         if !trg.with_base_unit(|b| b.buffs().check_buff(buff_constants::RETRIBUTION)) {
             unit_combat::set_criminal_state(server, &caster, true, &trg);
         }

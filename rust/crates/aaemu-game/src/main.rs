@@ -171,9 +171,27 @@ async fn run() -> anyhow::Result<()> {
                         "Mail retention upgrade grace anchored at the first run with this version"
                     );
                 }
-                Ok(None) => tracing::warn!(
-                    "Mail retention update marker is missing; pre-existing mail gets no grace"
-                ),
+                Ok(None) => {
+                    // No marker row (`AutoApplyUpdates` off, or no `SQL/updates` folder):
+                    // anchor the grace at this start, so the first tick cannot delete old
+                    // mail, and record the (no-op) marker so later starts keep this anchor.
+                    let now = chrono::Utc::now();
+                    config.mail.retention_grace_start_unix = now.timestamp();
+                    if let Err(e) = sqlx::query(
+                        "INSERT IGNORE INTO `updates` (`script_name`,`installed`,`install_date`,`last_error`) VALUES (?, 1, ?, '')",
+                    )
+                    .bind(MAIL_RETENTION_UPDATE)
+                    .bind(now.naive_utc())
+                    .execute(&mut *conn)
+                    .await
+                    {
+                        tracing::warn!("Mail retention update marker not recorded ({e})");
+                    }
+                    tracing::warn!(
+                        grace_start = config.mail.retention_grace_start_unix,
+                        "Mail retention update marker was missing; anchoring the grace at this start"
+                    );
+                }
                 Err(e) => tracing::warn!(
                     "Mail retention update marker unreadable ({e}); pre-existing mail gets no grace"
                 ),
