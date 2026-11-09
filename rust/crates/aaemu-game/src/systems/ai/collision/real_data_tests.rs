@@ -441,6 +441,11 @@ fn real_server_with(e: &Env, geo_data_mode: bool) -> crate::server::GameServer {
     config.connections.mysql_provider.host = "127.0.0.1".into();
     config.connections.mysql_provider.port = 1;
     config.world.geo_data_mode = geo_data_mode;
+    if std::env::var_os("AAEMU_NO_VISAREAS").is_some() {
+        // The audit's "before" run: brush.dat and vegetation.dat only.
+        config.physics.vis_areas = false;
+        config.physics.voxels = false;
+    }
     let db = sqlx::mysql::MySqlPoolOptions::new()
         .acquire_timeout(std::time::Duration::from_millis(200))
         .connect_lazy_with(config.connections.mysql_provider.connect_options());
@@ -787,9 +792,9 @@ fn world_npc_spawns(world: &str) -> Vec<[f32; 3]> {
     spawns
 }
 
-/// The instance halls whose floor model is not in the collision world (the dungeon halls are
-/// `object.dat` / `big_object.dat` models): the NPC spawns sit 44-200 m above the terrain, which
-/// is all the ground probe finds. A walker must keep standing where the world authored it (the
+/// The instance halls whose floor model was not in the collision world before `visareas.dat`
+/// was loaded (the halls are `visareas.dat` brushes, not `object.dat` / `big_object.dat`): the NPC
+/// spawns sit 44-200 m above the terrain, which is all the ground probe finds without them. A walker must keep standing where the world authored it (the
 /// navmesh height with `GeoDataMode`, else its level) instead of dropping to that terrain with its
 /// first step (Kroloal Cradle monsters stood 191 m below their spawns, out of reach).
 /// `AAEMU_GAME_PAK=D:\AA1.2\game_pak cargo test -p aaemu-game real_instance_walkers -- --ignored --nocapture`
@@ -854,4 +859,664 @@ async fn real_instance_walkers_keep_the_floor_of_their_hall() {
         server.world.remove_world(100);
         server.systems.ai.collision.remove(100);
     }
+}
+
+/// The Profane Temple (`instance_sal_temple`) end boss Akmit (12189) knocked back in its hall: the
+/// ground probe only finds the terrain far under the hall, which testers saw the boss land on
+/// (2026-11-08). The displaced position must stay at the hall level.
+/// `AAEMU_GAME_PAK=D:\AA1.2\game_pak cargo test -p aaemu-game real_sal_temple_boss -- --ignored --nocapture`
+#[tokio::test]
+#[ignore = "needs AAEMU_GAME_PAK"]
+async fn real_sal_temple_boss_knockback_stays_on_the_hall_floor() {
+    use crate::models::npc::Npc;
+    use crate::systems::skills::effects::special::movement::move_npc;
+    use crate::world::{Entity, WorldObject};
+    let Some(e) = env_with(true) else { return };
+    let server = std::sync::Arc::new(real_server_with(&e, true));
+    crate::systems::ai::geodata::start(&server);
+    let name = "instance_sal_temple";
+    let template = server
+        .game_data
+        .worlds
+        .get_world_template_by_name(name)
+        .expect(name)
+        .clone();
+    let zone = template.zone_keys.first().copied().unwrap_or(0);
+    server.world.create_world_instance(Arc::new(template), 100);
+    let (x, y, z) = (615.5f32, 434.4f32, 148.8f32);
+    assert!(
+        super::ground_height(&server, 100, x, y, z).is_some_and(|h| (h - 148.84).abs() < 0.2),
+        "the Akmit floor of the hall"
+    );
+    let npc = Entity::new(0x400, {
+        let mut n = Npc::new(12189);
+        n.unit.hp = 1000;
+        n.unit.max_hp = 1000;
+        n.unit.transform.set_xyz(x, y, z);
+        n.unit.transform.zone_id = zone;
+        n.unit.transform.instance_id = 100;
+        n.unit.transform.world_id = 100;
+        n.spawner_z = Some(z);
+        n
+    });
+    server
+        .world
+        .world(100)
+        .expect("instance")
+        .spawn(&npc, &server.view_ctx());
+    let _ = WorldObject::from(&npc);
+    for (dx, dy) in [(5.0, 0.0), (-5.0, 0.0), (0.0, 5.0), (0.0, -5.0)] {
+        npc.data().unit.transform.set_xyz(x, y, z);
+        move_npc(&server, &npc, (x + dx, y + dy, z), None, true);
+        let p = npc.data().unit.transform;
+        println!("knocked by ({dx}, {dy}): z = {:.2}", p.z);
+        assert!(
+            (p.z - z).abs() <= 12.0,
+            "the boss was displaced from {z} to {} under the hall",
+            p.z
+        );
+    }
+    server.world.remove_world(100);
+    server.systems.ai.collision.remove(100);
+}
+
+/// Every `visareas.dat` and `object.dat` of every world parses strictly (no leftover bytes) and
+/// the voxels inflate to a physics mesh.
+/// `AAEMU_GAME_PAK=D:\AA1.2\game_pak cargo test -p aaemu-game real_visareas_parse -- --ignored --nocapture`
+#[test]
+#[ignore = "needs AAEMU_GAME_PAK"]
+fn real_visareas_parse_every_file() {
+    let Some(e) = env() else { return };
+    let worlds = WorldTemplates::load(&e.files, &app_path()).expect("world templates");
+    let (mut files, mut voxels, mut bad) = (0, 0, Vec::new());
+    for t in worlds.templates() {
+        for cx in 0..t.cell_x {
+            for cy in 0..t.cell_y {
+                let dir = format!("game/worlds/{}/cells/{cx:03}_{cy:03}/client", t.name);
+                if let Some(d) = e.files.read_file(&format!("{dir}/visareas.dat")) {
+                    files += 1;
+                    match cells::read_visareas(&d) {
+                        Ok(f) => {
+                            for v in &f.voxels {
+                                voxels += 1;
+                                let ok = v.inflate().is_some_and(|b| {
+                                    super::models::load_model("v", &b)
+                                        .ok()
+                                        .flatten()
+                                        .is_some_and(|m| m.collides())
+                                });
+                                if !ok {
+                                    bad.push(format!("{dir}: voxel without a mesh"));
+                                }
+                            }
+                        }
+                        Err(err) => bad.push(format!("{dir}/visareas.dat: {err}")),
+                    }
+                }
+                if let Some(d) = e.files.read_file(&format!("{dir}/object.dat")) {
+                    files += 1;
+                    match cells::read_object_dat(&d) {
+                        Ok(f) => voxels += f.voxels.len(),
+                        Err(err) => bad.push(format!("{dir}/object.dat: {err}")),
+                    }
+                }
+            }
+        }
+    }
+    println!("{files} files, {voxels} voxels, {} failures", bad.len());
+    assert!(bad.is_empty(), "{bad:#?}");
+    assert!(files > 0 && voxels > 0);
+}
+
+/// Floors the static collision of `visareas.dat` and the cave voxels now provide: the Profane
+/// Temple hall under Akmit, the Dahuta cave and a library hall.
+#[tokio::test]
+#[ignore = "needs AAEMU_GAME_PAK"]
+async fn real_visareas_and_voxel_floors() {
+    let Some(e) = env_with(true) else { return };
+    let server = std::sync::Arc::new(real_server_with(&e, true));
+    let t = server
+        .game_data
+        .worlds
+        .get_world_template_by_name("instance_sal_temple")
+        .expect("sal_temple")
+        .clone();
+    server.world.create_world_instance(Arc::new(t), 100);
+    let h = super::ground_height(&server, 100, 615.5, 434.4, 148.8);
+    println!("sal_temple Akmit floor {h:?}");
+    assert!(h.is_some_and(|h| (h - 148.84).abs() < 0.2), "{h:?}");
+    let h = super::ground_height(&server, 0, 11935.0, 16408.0, 291.8);
+    println!("Dahuta cave floor {h:?}");
+    assert!(h.is_some_and(|h| (h - 291.11).abs() < 1.0), "{h:?}");
+    let t = server
+        .game_data
+        .worlds
+        .get_world_template_by_name("instance_library")
+        .expect("library")
+        .clone();
+    server.world.create_world_instance(Arc::new(t), 101);
+    let spawns = world_npc_spawns("instance_library");
+    let on_floor = spawns
+        .iter()
+        .take(200)
+        .filter(|s| {
+            super::ground_height(&server, 101, s[0], s[1], s[2])
+                .is_some_and(|h| (h - s[2]).abs() < 2.0)
+        })
+        .count();
+    println!(
+        "library: {on_floor}/{} spawns with a floor within 2 m",
+        spawns.len().min(200)
+    );
+    assert!(on_floor * 2 > spawns.len().min(200));
+}
+
+/// Static audit: how many NPC spawns of each world have a floor within 2 m of their Z through
+/// `ground_height`. Run with `AAEMU_NO_VISAREAS=1` for the "before" numbers.
+/// `AAEMU_GAME_PAK=D:\AA1.2\game_pak cargo test -p aaemu-game real_spawn_floor_audit -- --ignored --nocapture`
+#[tokio::test]
+#[ignore = "needs AAEMU_GAME_PAK"]
+async fn real_spawn_floor_audit() {
+    let Some(e) = env_with(true) else { return };
+    let server = std::sync::Arc::new(real_server_with(&e, true));
+    let t0 = Instant::now();
+    let (mut total, mut ok_total) = (0, 0);
+    for (i, t) in server
+        .game_data
+        .worlds
+        .templates()
+        .to_vec()
+        .into_iter()
+        .enumerate()
+    {
+        let path = app_path().join(format!("Data/Worlds/{}/npc_spawns.json", t.name));
+        if !path.exists() {
+            continue;
+        }
+        let spawns = world_npc_spawns(&t.name);
+        let id = if t.name == "main_world" {
+            0
+        } else {
+            200 + i as u32
+        };
+        if id != 0 {
+            server.world.create_world_instance(Arc::new(t.clone()), id);
+        }
+        let ok = spawns
+            .iter()
+            .filter(|s| {
+                super::ground_height(&server, id, s[0], s[1], s[2])
+                    .is_some_and(|h| (h - s[2]).abs() <= 2.0)
+            })
+            .count();
+        println!(
+            "{}: {} spawns, {} with a floor within 2 m",
+            t.name,
+            spawns.len(),
+            ok
+        );
+        total += spawns.len();
+        ok_total += ok;
+        if id != 0 {
+            server.world.remove_world(id);
+            server.systems.ai.collision.remove(id);
+        }
+    }
+    println!(
+        "total {total}, floor within 2 m: {ok_total}, {:?}",
+        t0.elapsed()
+    );
+}
+
+/// Roam-target path checks (2026-11-08 measurement): for the NPC spawns of main_world (open
+/// terrain / town split by the brushes within 12 m) and two instance halls, how often is the
+/// straight segment spawn -> random point in 6 m blocked, by `clip_move` (capsule blink,
+/// shortfall > 0.5 m), by a slope-following ray at 1 m (static + terrain, 0x101) and by the
+/// same ray against static geometry only (0x001).
+/// `AAEMU_GAME_PAK=D:\AA1.2\game_pak cargo test -p aaemu-game real_roam_path_block_rates -- --ignored --nocapture`
+#[tokio::test]
+#[ignore = "needs AAEMU_GAME_PAK"]
+async fn real_roam_path_block_rates() {
+    use crate::systems::npcs::heightmap::ReferenceHeightAi;
+    let Some(e) = env_with(true) else { return };
+    let server = std::sync::Arc::new(real_server_with(&e, true));
+    crate::systems::ai::geodata::start(&server);
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let mut rnd = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed >> 40) as f32 / (1u64 << 24) as f32
+    };
+    let worlds: [(&str, u32, usize); 3] = [
+        ("main_world", 0, 3000),
+        ("instance_sal_temple", 100, 400),
+        ("instance_library", 101, 400),
+    ];
+    for (name, id, take) in worlds {
+        if id != 0 {
+            let t = server
+                .game_data
+                .worlds
+                .get_world_template_by_name(name)
+                .expect(name)
+                .clone();
+            server.world.create_world_instance(Arc::new(t), id);
+        }
+        let zone = server
+            .game_data
+            .worlds
+            .get_world_template_by_name(name)
+            .unwrap()
+            .zone_keys
+            .first()
+            .copied()
+            .unwrap_or(0);
+        let spawns = world_npc_spawns(name);
+        let step = (spawns.len() / take).max(1);
+        // [open, town] for main_world; [all] otherwise
+        #[derive(Default, Clone, Copy)]
+        struct Acc {
+            n: u32,
+            clip: u32,
+            ray_ts: u32,
+            ray_s: u32,
+            only_clip: u32,
+            only_ray_ts: u32,
+            clip_us: u128,
+            ray_us: u128,
+            h05: u32,
+            h15: u32,
+            veg: u32,
+            floorish: u32,
+        }
+        let mut acc = [Acc::default(), Acc::default()];
+        for s in spawns.iter().step_by(step) {
+            let from = *s;
+            let town = if id == 0 {
+                let boxes = super::box_obstacles(
+                    &server,
+                    id,
+                    [from[0], from[1], from[2] + 2.0],
+                    [12.0, 12.0, 6.0],
+                    0.0,
+                    0x001,
+                )
+                .unwrap_or_default();
+                boxes
+                    .iter()
+                    .filter(|(o, _)| matches!(o, Owner::Brush { .. }))
+                    .count()
+                    >= 3
+            } else {
+                false
+            };
+            for _ in 0..3 {
+                let x = (rnd() - 0.5) * 12.0 + from[0];
+                let y = (rnd() - 0.5) * 12.0 + from[1];
+                let z = crate::systems::ai::npc::reference_height_in(
+                    &server,
+                    id,
+                    Some(ReferenceHeightAi {
+                        can_fly: false,
+                        hold_or_idle: false,
+                        spawner_z: Some(from[2]),
+                        world_z: from[2],
+                    }),
+                    x,
+                    y,
+                    from[2],
+                    zone,
+                );
+                let to = [x, y, z];
+                let a = &mut acc[usize::from(town)];
+                a.n += 1;
+                let t0 = Instant::now();
+                let clipped = super::displacement::clip_move(&server, id, from, to);
+                a.clip_us += t0.elapsed().as_micros();
+                let full = ((to[0] - from[0]).powi(2) + (to[1] - from[1]).powi(2)).sqrt();
+                let clip_blocked = clipped.is_some_and(|c| {
+                    let got = ((c[0] - from[0]).powi(2) + (c[1] - from[1]).powi(2)).sqrt();
+                    got < full - 0.5
+                });
+                let t1 = Instant::now();
+                let ray = |mask: u32| {
+                    super::raycast(
+                        &server,
+                        id,
+                        [from[0], from[1], from[2] + 1.0],
+                        [to[0], to[1], to[2] + 1.0],
+                        mask,
+                        ray_flags::DEFAULT,
+                    )
+                    .is_some_and(|h| h.is_some())
+                };
+                let r_ts = ray(mask::STATIC_TERRAIN);
+                a.ray_us += t1.elapsed().as_micros();
+                let r_s = ray(0x001);
+                let hit_at = |h: f32| {
+                    super::raycast(
+                        &server,
+                        id,
+                        [from[0], from[1], from[2] + h],
+                        [to[0], to[1], to[2] + h],
+                        0x001,
+                        ray_flags::DEFAULT,
+                    )
+                    .flatten()
+                };
+                a.h05 += u32::from(hit_at(0.5).is_some());
+                a.h15 += u32::from(hit_at(1.5).is_some());
+                if let Some(h) = hit_at(1.0) {
+                    a.veg += u32::from(matches!(h.owner, Some(Owner::Vegetation { .. })));
+                    a.floorish += u32::from(h.normal.z.abs() > 0.6);
+                }
+                a.clip += u32::from(clip_blocked);
+                a.ray_ts += u32::from(r_ts);
+                a.ray_s += u32::from(r_s);
+                a.only_clip += u32::from(clip_blocked && !r_s);
+                a.only_ray_ts += u32::from(r_ts && !r_s);
+            }
+        }
+        for (label, a) in ["open/all", "town"].iter().zip(acc.iter()) {
+            if a.n == 0 {
+                continue;
+            }
+            println!(
+                "{name} [{label}]: n={} clip_move blocked {} ({:.1}%), ray1m static+terrain {} ({:.1}%), ray1m static {} ({:.1}%); clip-only(not static ray) {}, terrain-only ray {}; clip {:.0} us, ray {:.0} us avg; static ray at 0.5 m {}, at 1.5 m {}; 1 m hits on vegetation {}, on floor-like surfaces (|n.z|>0.6) {}",
+                a.n,
+                a.clip,
+                100.0 * a.clip as f32 / a.n as f32,
+                a.ray_ts,
+                100.0 * a.ray_ts as f32 / a.n as f32,
+                a.ray_s,
+                100.0 * a.ray_s as f32 / a.n as f32,
+                a.only_clip,
+                a.only_ray_ts,
+                a.clip_us as f32 / a.n as f32,
+                a.ray_us as f32 / a.n as f32,
+                a.h05,
+                a.h15,
+                a.veg,
+                a.floorish,
+            );
+        }
+        if id != 0 {
+            server.world.remove_world(id);
+            server.systems.ai.collision.remove(id);
+        }
+    }
+}
+
+/// The production wall check (`walk::walk_blocked`) on the roam targets of the measurement above,
+/// and on every segment of every authored `Data/Path/*.path` route in main_world (split into
+/// 4 m pieces with the ground height under each end; routes in the air are skipped).
+/// `AAEMU_GAME_PAK=D:\AA1.2\game_pak cargo test -p aaemu-game real_walk_check_rates -- --ignored --nocapture`
+#[tokio::test]
+#[ignore = "needs AAEMU_GAME_PAK"]
+async fn real_walk_check_rates() {
+    use crate::systems::npcs::heightmap::ReferenceHeightAi;
+    let Some(e) = env_with(true) else { return };
+    let server = std::sync::Arc::new(real_server_with(&e, true));
+    crate::systems::ai::geodata::start(&server);
+    let mut seed = 0x1234_5678_9ABC_DEF1u64;
+    let mut rnd = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed >> 40) as f32 / (1u64 << 24) as f32
+    };
+    // roam targets
+    let spawns = world_npc_spawns("main_world");
+    let step = (spawns.len() / 3000).max(1);
+    let (mut n, mut blocked, mut town_n, mut town_blocked) = (0u32, 0u32, 0u32, 0u32);
+    let t0 = Instant::now();
+    for s in spawns.iter().step_by(step) {
+        let town = super::box_obstacles(
+            &server,
+            0,
+            [s[0], s[1], s[2] + 2.0],
+            [12.0, 12.0, 6.0],
+            0.0,
+            0x001,
+        )
+        .unwrap_or_default()
+        .iter()
+        .filter(|(o, _)| matches!(o, Owner::Brush { .. }))
+        .count()
+            >= 3;
+        for _ in 0..3 {
+            let x = (rnd() - 0.5) * 12.0 + s[0];
+            let y = (rnd() - 0.5) * 12.0 + s[1];
+            let z = crate::systems::ai::npc::reference_height_in(
+                &server,
+                0,
+                Some(ReferenceHeightAi {
+                    can_fly: false,
+                    hold_or_idle: false,
+                    spawner_z: Some(s[2]),
+                    world_z: s[2],
+                }),
+                x,
+                y,
+                s[2],
+                0,
+            );
+            let b = super::walk::walk_blocked(&server, 0, *s, [x, y, z]).unwrap_or(false);
+            if town {
+                town_n += 1;
+                town_blocked += u32::from(b);
+            } else {
+                n += 1;
+                blocked += u32::from(b);
+            }
+        }
+    }
+    println!(
+        "roam targets: open {blocked}/{n} blocked ({:.2}%), town {town_blocked}/{town_n} ({:.2}%), {:.0} us per check",
+        100.0 * blocked as f32 / n.max(1) as f32,
+        100.0 * town_blocked as f32 / town_n.max(1) as f32,
+        t0.elapsed().as_micros() as f32 / (n + town_n).max(1) as f32
+    );
+    // authored routes
+    let folder = app_path().join("Data/Path");
+    let mut files: Vec<_> = std::fs::read_dir(&folder)
+        .expect("Data/Path")
+        .filter_map(|f| f.ok())
+        .map(|f| f.path())
+        .collect();
+    files.sort();
+    let max_xy = (e.cells.0 as f32 * 1024.0, e.cells.1 as f32 * 1024.0);
+    let (mut segs, mut bad_segs, mut skipped_air, mut skipped_out, mut routes_bad) =
+        (0u32, 0u32, 0u32, 0u32, 0u32);
+    let mut worst: Vec<(u32, String)> = Vec::new();
+    let t1 = Instant::now();
+    let mut checks = 0u32;
+    for f in &files {
+        let text = std::fs::read_to_string(f).unwrap_or_default();
+        let pts = crate::systems::ai::path_handler::parse_path_file(&text);
+        let mut route_bad = 0;
+        for w in pts.windows(2) {
+            let (a, b) = (w[0].position, w[1].position);
+            let zero = |p: crate::systems::skills::controllers::Vec3| {
+                p.x == 0.0 && p.y == 0.0 && p.z == 0.0
+            };
+            if zero(a) || zero(b) {
+                continue;
+            }
+            if [a, b]
+                .iter()
+                .any(|p| p.x < 0.0 || p.y < 0.0 || p.x >= max_xy.0 || p.y >= max_xy.1)
+            {
+                skipped_out += 1;
+                continue;
+            }
+            let len = ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt();
+            let pieces = (len / 4.0).ceil().max(1.0) as usize;
+            let ground = |t: f32| -> Option<[f32; 3]> {
+                let (x, y) = (a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
+                let z = a.z + (b.z - a.z) * t;
+                let g = super::ground_height_probe(&server, 0, x, y, z, 2.0, 12.0).flatten()?;
+                Some([x, y, g])
+            };
+            let mut prev = ground(0.0);
+            let mut seg_blocked = false;
+            let mut seg_air = prev.is_none();
+            for i in 1..=pieces {
+                let cur = ground(i as f32 / pieces as f32);
+                match (prev, cur) {
+                    (Some(p), Some(c)) => {
+                        checks += 1;
+                        seg_blocked |= super::walk::walk_blocked(&server, 0, p, c).unwrap_or(false);
+                    }
+                    _ => seg_air = true,
+                }
+                prev = cur;
+            }
+            if seg_air {
+                skipped_air += 1;
+                continue;
+            }
+            segs += 1;
+            if seg_blocked {
+                bad_segs += 1;
+                route_bad += 1;
+            }
+        }
+        if route_bad > 0 {
+            routes_bad += 1;
+            worst.push((
+                route_bad,
+                f.file_name().unwrap().to_string_lossy().into_owned(),
+            ));
+        }
+    }
+    worst.sort_by(|a, b| b.cmp(a));
+    println!(
+        "{} route files: {segs} ground segments checked ({checks} pieces, {:.0} us each), {bad_segs} blocked in {routes_bad} routes; skipped {skipped_air} (no ground within 12 m / air), {skipped_out} outside main_world",
+        files.len(),
+        t1.elapsed().as_micros() as f32 / checks.max(1) as f32
+    );
+    println!("most blocked routes: {:?}", &worst[..worst.len().min(15)]);
+}
+
+/// The type-2 vegetation records of `object.dat` (not in `vegetation.dat`): per world how many
+/// there are, how many resolve to a colliding model, how many duplicate a `vegetation.dat`
+/// instance of the same cell (same group, position rounded to 0.1 m), and what loading them adds
+/// to the collision instances of main_world.
+/// `AAEMU_GAME_PAK=D:\AA1.2\game_pak cargo test -p aaemu-game real_object_dat_vegetation -- --ignored --nocapture`
+#[test]
+#[ignore = "needs AAEMU_GAME_PAK"]
+fn real_object_dat_vegetation_audit() {
+    let Some(e) = env() else { return };
+    let files = Files::Client(e.files.clone());
+    let models = ModelCache::new(Arc::new(files.clone()));
+    let worlds = WorldTemplates::load(&e.files, &app_path()).expect("world templates");
+    let mut total_records = 0usize;
+    for t in worlds.templates() {
+        let xml = e
+            .files
+            .read_file(&format!("game/worlds/{}/vegetation.xml", t.name))
+            .map(|b| crate::data::client_files::decode_text(&b))
+            .unwrap_or_default();
+        let groups: HashMap<u16, cells::VegetationGroup> = cells::read_vegetation_groups(&xml)
+            .into_iter()
+            .map(|g| (g.id, g))
+            .collect();
+        let (mut records, mut colliding, mut dups, mut bad) = (0usize, 0usize, 0usize, 0usize);
+        let (mut base_inst, mut with_inst) = (0usize, 0usize);
+        let full = t.name == "main_world";
+        for cx in 0..t.cell_x {
+            for cy in 0..t.cell_y {
+                let dir = format!("game/worlds/{}/cells/{cx:03}_{cy:03}/client", t.name);
+                let mut load = super::world::CellLoad {
+                    brushes: true,
+                    vegetation: true,
+                    visareas: true,
+                    voxels: true,
+                    object_vegetation: false,
+                };
+                let mut cell_base = 0;
+                if full {
+                    cell_base = super::world::prepare_cell_with(
+                        &files,
+                        &models,
+                        &t.name,
+                        &groups,
+                        (cx, cy),
+                        &load,
+                    )
+                    .instances
+                    .len();
+                    base_inst += cell_base;
+                    with_inst += cell_base;
+                }
+                let Some(d) = e.files.read_file(&format!("{dir}/object.dat")) else {
+                    continue;
+                };
+                let Ok(f) = cells::read_object_dat(&d) else {
+                    bad += 1;
+                    continue;
+                };
+                if f.vegetation.is_empty() {
+                    continue;
+                }
+                let key = |v: &cells::VegetationRecord| {
+                    (
+                        v.group,
+                        (v.pos.x * 10.0).round() as i32,
+                        (v.pos.y * 10.0).round() as i32,
+                        (v.pos.z * 10.0).round() as i32,
+                    )
+                };
+                let existing: std::collections::HashSet<_> = e
+                    .files
+                    .read_file(&format!("{dir}/vegetation.dat"))
+                    .and_then(|b| cells::read_vegetation(&b).ok())
+                    .unwrap_or_default()
+                    .iter()
+                    .map(key)
+                    .collect();
+                for v in &f.vegetation {
+                    records += 1;
+                    if existing.contains(&key(v)) {
+                        dups += 1;
+                    }
+                    let m = groups
+                        .get(&v.group)
+                        .filter(|g| !g.model.is_empty())
+                        .and_then(|g| models.get(&g.model));
+                    if m.is_some_and(|m| m.collides()) {
+                        colliding += 1;
+                    }
+                }
+                if full {
+                    load.object_vegetation = true;
+                    let b = super::world::prepare_cell_with(
+                        &files,
+                        &models,
+                        &t.name,
+                        &groups,
+                        (cx, cy),
+                        &load,
+                    );
+                    with_inst += b.instances.len() - cell_base;
+                }
+            }
+        }
+        total_records += records;
+        println!(
+            "{}: object.dat vegetation {records}, colliding {colliding}, duplicates of vegetation.dat {dups}, unparsable files {bad}",
+            t.name
+        );
+        if full {
+            println!(
+                "main_world: instances {base_inst} -> {with_inst} (+{}, {:.1}%), StaticInstance {} bytes",
+                with_inst - base_inst,
+                (with_inst - base_inst) as f64 * 100.0 / base_inst.max(1) as f64,
+                std::mem::size_of::<super::world::StaticInstance>()
+            );
+        }
+    }
+    assert!(total_records > 0);
 }

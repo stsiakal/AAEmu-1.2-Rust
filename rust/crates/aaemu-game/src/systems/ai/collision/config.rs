@@ -38,6 +38,18 @@ pub struct PhysicsConfig {
     pub enable: bool,
     #[serde(rename = "geometry", deserialize_with = "lenient_enum")]
     pub geometry: GeometryLevel,
+    /// The brushes of `visareas.dat` (instance halls, portal buildings; default on). Unused
+    /// at `Geometry: Terrain`.
+    #[serde(rename = "visareas", deserialize_with = "lenient")]
+    pub vis_areas: bool,
+    /// The voxel meshes (caves) of `visareas.dat` and `object.dat`; unused at `Terrain`.
+    #[serde(rename = "voxels", deserialize_with = "lenient")]
+    pub voxels: bool,
+    /// The type-2 vegetation records of `object.dat` (trees / rocks that are not in
+    /// `vegetation.dat`; default on: +48 023 collision instances in main_world, about 56 MB);
+    /// unused at `Terrain`.
+    #[serde(rename = "objectvegetation", deserialize_with = "lenient")]
+    pub object_vegetation: bool,
     /// Cells (1024 m) kept loaded around every player / ship / active NPC: 0 = only the cell
     /// itself, 1 = 3×3 …
     #[serde(rename = "loadradiuscells", deserialize_with = "lenient")]
@@ -77,6 +89,9 @@ impl Default for PhysicsConfig {
         Self {
             enable: true,
             geometry: GeometryLevel::Full,
+            vis_areas: true,
+            voxels: true,
+            object_vegetation: true,
             load_radius_cells: 1,
             load_on_query: true,
             unload_after_seconds: 600,
