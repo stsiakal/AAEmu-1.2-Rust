@@ -114,6 +114,9 @@
 //! sync <token> [count]              suite barrier: wait until `count` bots (default: all) are here
 //! expectpkt <PacketName> [secs]     fail unless the packet arrives within `secs` (default 5)
 //! expectnopkt <PacketName> [secs]   fail if the packet arrives within `secs` (default 5)
+//! expectchat <type> "<text>" [secs] fail unless SCChatMessage has that type and text
+//! expecttradecancel <reason> <caused 0|1> [secs]
+//!                                   fail unless SCTradeCanceled has that reason / causedByMe
 //! expectbuff <buff> [self|peer|player:NAME] [secs]
 //!                                   fail unless SCBuffCreated for that buff / owner arrives
 //! expectbuffremoved <buff> [self|peer|player:NAME] [secs]
@@ -869,6 +872,97 @@ async fn expect_no_packet(game: &mut GameClient, want: &str, secs: u64) -> anyho
                 bail!("unexpected packet {want} within {secs} s");
             }
         }
+    }
+}
+
+/// `(chat type, message)` of an `SCChatMessagePacket`.
+fn chat_type_and_text(p: &Packet) -> Option<(i16, String)> {
+    if !p.is_sc(sc::SCChatMessagePacket) {
+        return None;
+    }
+    let mut s = p.stream();
+    let chat_type = s.read_i16().ok()?;
+    s.read_i16().ok()?;
+    s.read_u32().ok()?;
+    s.read_bc().ok()?;
+    s.read_u32().ok()?;
+    s.read_u8().ok()?;
+    s.read_u8().ok()?;
+    s.read_u32().ok()?;
+    s.read_string().ok()?;
+    Some((chat_type, s.read_string().ok()?))
+}
+
+/// `expectchat <chat type> "<text>" [secs]`: an `SCChatMessagePacket` with that chat type and
+/// message text (the sender block is skipped like `questitem::chat_text`).
+async fn expect_chat(
+    game: &mut GameClient,
+    chat_type: i16,
+    text: &str,
+    secs: u64,
+) -> anyhow::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            bail!("expected chat type {chat_type} '{text}' within {secs} s; it did not arrive");
+        }
+        let Some(p) = game
+            .recv_within(left.min(Duration::from_millis(250)))
+            .await?
+        else {
+            continue;
+        };
+        if chat_type_and_text(&p).is_some_and(|(t, m)| t == chat_type && m == text) {
+            println!("    got chat type {chat_type} '{text}'");
+            return Ok(());
+        }
+    }
+}
+
+/// `(reason, causedByMe)` of an `SCTradeCanceledPacket`.
+fn trade_cancel_reason(p: &Packet) -> Option<(i32, bool)> {
+    if !p.is_sc(sc::SCTradeCanceledPacket) {
+        return None;
+    }
+    let mut s = p.stream();
+    Some((s.read_i32().ok()?, s.read_bool().ok()?))
+}
+
+/// `expecttradecancel <reason> <caused 0|1> [secs]`: an `SCTradeCanceledPacket` with exactly
+/// that reason and causedByMe flag (`i32 reason, bool causedByMe`).
+async fn expect_trade_canceled(
+    game: &mut GameClient,
+    reason: i32,
+    caused: bool,
+    secs: u64,
+) -> anyhow::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            bail!(
+                "expected SCTradeCanceled(reason {reason}, caused {caused}) within {secs} s; it \
+                 did not arrive"
+            );
+        }
+        let Some(p) = game
+            .recv_within(left.min(Duration::from_millis(250)))
+            .await?
+        else {
+            continue;
+        };
+        let Some((got_reason, got_caused)) = trade_cancel_reason(&p) else {
+            continue;
+        };
+        if got_reason == reason && got_caused == caused {
+            println!("    got SCTradeCanceled(reason {got_reason}, caused {got_caused})");
+            return Ok(());
+        }
+        bail!(
+            "SCTradeCanceled reason {got_reason} caused {got_caused}, expected reason {reason} \
+             caused {caused}"
+        );
     }
 }
 
@@ -2125,6 +2219,29 @@ async fn run_lines(
                 let secs: u64 = parts.get(1).and_then(|x| x.parse().ok()).unwrap_or(5);
                 expect_packet(game, name, secs).await?;
             }
+            "expectchat" => {
+                let args = split_quoted(rest)?;
+                let chat_type: i16 = args
+                    .first()
+                    .context("expectchat <chat type> \"<text>\" [secs]")?
+                    .parse()?;
+                let text = args
+                    .get(1)
+                    .context("expectchat <chat type> \"<text>\" [secs]")?;
+                let secs: u64 = args.get(2).and_then(|x| x.parse().ok()).unwrap_or(5);
+                expect_chat(game, chat_type, text, secs).await?;
+            }
+            "expecttradecancel" => {
+                let reason: i32 =
+                    num(&parts, 0).context("expecttradecancel <reason> <caused 0|1> [secs]")?;
+                let caused = match parts.get(1).copied() {
+                    Some("1") | Some("true") => true,
+                    Some("0") | Some("false") => false,
+                    other => bail!("expecttradecancel caused must be 0 or 1, not {other:?}"),
+                };
+                let secs: u64 = parts.get(2).and_then(|x| x.parse().ok()).unwrap_or(5);
+                expect_trade_canceled(game, reason, caused, secs).await?;
+            }
             "expectnopkt" => {
                 let name = parts.first().context("expectnopkt <PacketName> [secs]")?;
                 let secs: u64 = parts.get(1).and_then(|x| x.parse().ok()).unwrap_or(5);
@@ -2730,6 +2847,61 @@ async fn run_lines(
 #[cfg(test)]
 mod tests {
     use super::split_quoted;
+
+    #[test]
+    fn chat_and_trade_cancel_readers_decode_the_server_writers() {
+        use crate::game::LEVEL_GAME;
+        use aaemu_commons::{Marshal, PacketStream};
+        use aaemu_game::packets::world::{ChatSender, SCChatMessagePacket};
+        use aaemu_game::systems::economy::trade::SCTradeCanceledPacket;
+
+        let mut body = PacketStream::new();
+        SCChatMessagePacket {
+            chat_type: 2,
+            sender: Some(ChatSender {
+                faction_id: 148,
+                obj_id: 0x100,
+                id: 7,
+                race: 1,
+                name: "Al".into(),
+                gm: false,
+            }),
+            message: "trade".into(),
+            ability: 3,
+            language_type: 0,
+        }
+        .write(&mut body);
+        let p = super::Packet {
+            level: LEVEL_GAME,
+            opcode: aaemu_game::opcodes::sc::SCChatMessagePacket,
+            body: body.into_bytes(),
+        };
+        assert_eq!(
+            super::chat_type_and_text(&p),
+            Some((2, "trade".to_string()))
+        );
+
+        let mut body = PacketStream::new();
+        SCTradeCanceledPacket {
+            reason: 2,
+            caused_by_me: false,
+        }
+        .write(&mut body);
+        let p = super::Packet {
+            level: LEVEL_GAME,
+            opcode: aaemu_game::opcodes::sc::SCTradeCanceledPacket,
+            body: body.into_bytes(),
+        };
+        assert_eq!(super::trade_cancel_reason(&p), Some((2, false)));
+        assert_eq!(
+            super::trade_cancel_reason(&super::Packet {
+                level: LEVEL_GAME,
+                opcode: aaemu_game::opcodes::sc::SCChatMessagePacket,
+                body: Vec::new(),
+            }),
+            None
+        );
+    }
 
     #[test]
     fn quoted_arguments_keep_spaces_and_escapes() {
