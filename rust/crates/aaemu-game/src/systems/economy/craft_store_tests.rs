@@ -1815,7 +1815,19 @@ async fn shop_catalog_grades_full_bag_rolls_back() {
     buy_grade(&mut w, STACK, 4, 1, shop_currency_type::HONOR).await;
     assert_eq!(bag.lock().unwrap().items, before);
     assert_eq!(w.pa.data().honor_point, 100);
-    assert!(w.a.drain().is_empty());
+    // The refused purchase tells the client why: the bag is full.
+    assert_eq!(
+        w.a.drain(),
+        vec![(
+            sc::SCErrorMsgPacket,
+            err_bytes(
+                super::error_message::BAG_FULL,
+                super::error_message::BAG_FULL,
+                0,
+                true
+            )
+        )]
+    );
 }
 
 #[tokio::test]
@@ -1930,7 +1942,12 @@ async fn shop_checkout_capacity_failure_rolls_back_all_goods_and_buyback() {
         assert!(Inv::of(&w.pa).bag().lock().unwrap().items.is_empty());
         assert_eq!(buyback.lock().unwrap().items, before_back);
         assert_eq!(w.pa.data().money, 1000);
-        assert!(w.a.drain().is_empty());
+        // The capacity failure of the goods is a full bag; a vanished buy-back item is silent.
+        assert_eq!(
+            w.a.drain().len(),
+            usize::from(!with_buyback),
+            "BAG_FULL only for the goods"
+        );
     }
 }
 
@@ -2262,8 +2279,8 @@ async fn expand_expert_flow() {
     let rest = item_at(&pa, 2, 0).unwrap();
     assert_eq!(rest.count, 1);
     assert_eq!(pa.data().expanded_expert, 1);
-    // C# bug mirrored: the vocation cost is added.
-    assert_eq!(pa.data().vocation_point, 30);
+    // The vocation cost is charged (the C# added it).
+    assert_eq!(pa.data().vocation_point, 10);
     assert_eq!(
         w.a.drain(),
         vec![
@@ -2271,7 +2288,7 @@ async fn expand_expert_flow() {
                 sc::SCGamePointChangedPacket,
                 bytes(&SCGamePointChangedPacket {
                     kind: 1,
-                    amount: 10
+                    amount: -10
                 })
             ),
             (
@@ -2351,6 +2368,47 @@ async fn convert_item_look_flow() {
     assert_eq!(
         w.a.drain(),
         vec![(sc::SCErrorMsgPacket, err_bytes(207, 207, 0, true))]
+    );
+}
+
+#[tokio::test]
+async fn convert_item_look_needs_the_full_reagent_count() {
+    let mut w = world();
+    let pa = w.pa.clone();
+    let base = give(&w, &pa, slot_type::INVENTORY, SWORD, 1, 0);
+    let look = give(&w, &pa, slot_type::INVENTORY, SWORD, 1, 1);
+    // The conversion costs 2 powder: one is not enough and nothing is consumed.
+    give(&w, &pa, slot_type::INVENTORY, POWDER, 1, 2);
+    let mut s = PacketStream::new();
+    s.write_u64(base).write_u64(look);
+    w.a.drain();
+    run::<store::CSConvertItemLookPacket>(&mut w, 0, s.as_bytes());
+    assert_eq!(
+        w.a.drain(),
+        vec![(sc::SCErrorMsgPacket, err_bytes(722, 722, POWDER, true))]
+    );
+    assert_eq!(item_at(&pa, 2, 2).unwrap().count, 1);
+    assert_eq!(
+        item_at(&pa, 2, 0).unwrap().details.image_item_template_id,
+        0
+    );
+    assert!(item_at(&pa, 2, 1).is_some());
+}
+
+#[tokio::test]
+async fn craft_batch_count_is_clamped() {
+    let mut w = world();
+    install_craft_hooks(&w);
+    let pa = w.pa.clone();
+    pa.data().labor_power = 100;
+    give(&w, &pa, slot_type::INVENTORY, STACK, 6, 0);
+    execute_craft(&mut w, CRAFT, i32::MIN);
+    assert_eq!(w.server.systems.economy.craft.state(1).count, 1);
+    craft::cancel_craft(&w.server, &pa);
+    execute_craft(&mut w, CRAFT, i32::MAX);
+    assert_eq!(
+        w.server.systems.economy.craft.state(1).count,
+        craft::MAX_CRAFT_BATCH
     );
 }
 

@@ -231,6 +231,28 @@ pub fn start_skill(server: &GameServer, conn: &mut GameConnection, mut p: CSStar
     let mut result;
     let mut value = 0u32;
     let data = &server.game_data;
+    // A unit caster is the sender itself: `initial_target` resolves the caster field to a
+    // unit and uses it as the target of self / party / pet / position skills, and the started /
+    // fired packets echo it, so a forged field would run the skill on (and as) another unit.
+    // Mount casters are checked below (`mount_authority`); item and doodad casters resolve
+    // through their own validation. A mate named as a plain `Unit` caster is the battle pet
+    // cast: it goes on to `cast_as_battle_pet`, which refuses a mate that is not the sender's.
+    if let SkillCaster::Unit(obj_id) | SkillCaster::Unk1(obj_id) = p.caster {
+        let battle_pet = matches!(p.caster, SkillCaster::Unit(_))
+            && super::geometry::world_of(server, &me)
+                .and_then(|w| w.object(obj_id))
+                .is_some_and(|o| o.as_mate().is_some());
+        if obj_id != player.obj_id && !battle_pet {
+            tracing::warn!(
+                character = %player.data().unit.name,
+                skill_id,
+                caster = obj_id,
+                "Client cast naming another unit as the caster refused"
+            );
+            send_cast_refused(&player, skill_id, p.caster, target, p.skill_object);
+            return;
+        }
+    }
     // A skill reached only through an item use must come with that item: the plain unit cast
     // would otherwise run it (and consume nothing) anywhere. The Item caster branch below
     // validates the item's own use skill and consumes the reagent item.
@@ -316,7 +338,28 @@ pub fn start_skill(server: &GameServer, conn: &mut GameConnection, mut p: CSStar
     let is_common = data.skills.is_common_skill(skill_id);
     let auto = player.data().unit.skill_state.auto_attack.clone();
     let is_auto = player.data().unit.is_auto_attack;
-    if let SkillCaster::Mount { obj_id, .. } = p.caster {
+    // The client's battle pet AI (follow, auto target, auto-cast) and the pet bar send the pet's
+    // skills with the mate as a plain `Unit` caster, not as `Mount`. A mate of this player casts
+    // as itself; it never takes the owner's range, angle, GCD or auto-attack.
+    let pet_caster = match p.caster {
+        SkillCaster::Unit(id) if id != player.obj_id => super::geometry::world_of(server, &me)
+            .and_then(|w| w.object(id))
+            .filter(|o| o.as_mate().is_some()),
+        _ => None,
+    };
+    if let Some(mate) = pet_caster {
+        let (result_pet, value_pet) = cast_as_battle_pet(
+            server,
+            &player,
+            &mate,
+            skill_id,
+            p.caster,
+            &mut target,
+            &p.skill_object,
+        );
+        result = result_pet;
+        value = value_pet;
+    } else if let SkillCaster::Mount { obj_id, .. } = p.caster {
         // Mount / slave skill
         let Some(skill) = template_skill(server, skill_id, 1) else {
             return;
@@ -371,6 +414,17 @@ pub fn start_skill(server: &GameServer, conn: &mut GameConnection, mut p: CSStar
                 mount_skill_id,
                 caster = p.caster.obj_id(),
                 "Client mount cast names a mount skill row outside the vehicle's bar refused"
+            );
+            send_cast_refused(&player, skill_id, p.caster, target, p.skill_object);
+            return;
+        }
+        // The client only offers a pet skill once the mate's level reaches its `ability_level`.
+        if caster.as_mate().is_some() && !mate_level_allows(&caster, &skill) {
+            tracing::debug!(
+                character = %player.data().unit.name,
+                skill_id,
+                caster = p.caster.obj_id(),
+                "Client mount cast refused: the mate's level is below the skill's level"
             );
             send_cast_refused(&player, skill_id, p.caster, target, p.skill_object);
             return;
@@ -620,10 +674,17 @@ pub fn start_skill(server: &GameServer, conn: &mut GameConnection, mut p: CSStar
             "Client cast of an inactive or unlearned ability skill refused"
         );
         result = denied;
-    } else if player.data().skills.skills.iter().any(|s| s.id == skill_id) {
-        let Some(t) = server.game_data.systems.skills.skill(skill_id).cloned() else {
-            return;
-        };
+    } else if let Some(t) = server
+        .game_data
+        .systems
+        .skills
+        .skill(skill_id)
+        .filter(|t| t.ability_id != 0)
+        .filter(|_| player.data().skills.skills.iter().any(|s| s.id == skill_id))
+        .cloned()
+    {
+        // Only class skills run from the learned list; an ability-less skill in it (never
+        // learnable) takes the client-source check below like any other unlearned skill.
         let skill = skill::new_skill_for(server, t, Some(&me));
         let (r, v) = skill::use_skill(
             server,
@@ -721,6 +782,73 @@ pub fn start_skill(server: &GameServer, conn: &mut GameConnection, mut p: CSStar
     }
 }
 
+/// The pet skill level gate: a mate casts a skill only once its level reaches the skill's
+/// `ability_level` (Berserk 17284 needs 30, Guard Dog 17704 needs 40), as the client enforces.
+fn mate_level_allows(mate: &WorldObject, skill: &SkillRef) -> bool {
+    let level = mate.with_unit(|u| u.unit().level).unwrap_or(0);
+    i32::from(level) >= skill.template.ability_level
+}
+
+/// A client cast whose caster is a mate of the player (`SkillCaster::Unit(mate)`): the battle
+/// pet's AI casts and its bar. The skill runs as the mate (its own range / angle / GCD /
+/// cooldowns; kill credit still goes to the owner through the mate-caster code). Only the
+/// mate's default / base skill and the skills on its own bar are accepted, and only once the
+/// mate's level reaches the skill's `ability_level` (the client's own gate).
+fn cast_as_battle_pet(
+    server: &GameServer,
+    player: &crate::world::PlayerRef,
+    mate: &WorldObject,
+    skill_id: u32,
+    wire_caster: SkillCaster,
+    target: &mut SkillCastTarget,
+    skill_object: &SkillObject,
+) -> (u8, u32) {
+    let refuse = |reason: &str| {
+        // The pet AI casts several times a second; a refusal is not worth a WARN per cast.
+        tracing::debug!(
+            character = %player.data().unit.name,
+            skill_id,
+            caster = mate.obj_id(),
+            reason,
+            "Client cast as a battle pet refused"
+        );
+        // The caller answers with `NO_PERM` like every other refused client cast.
+        (skill_result::NO_PERM, 0)
+    };
+    if !super::mount_authority::may_cast_as(server, player, mate) {
+        return refuse("not the player's mate");
+    }
+    let data = &server.game_data;
+    let template_id = mate.with_unit(|u| u.unit().template_id).unwrap_or(0);
+    let base_skill = data
+        .systems
+        .npcs
+        .npc
+        .template(template_id)
+        .map_or(0, |t| t.base_skill_id.max(0) as u32);
+    let allowed = (skill_id != 0 && skill_id == base_skill)
+        || data.skills.is_default_skill(skill_id)
+        || super::mount_authority::may_use_vehicle_skill(server, mate, skill_id);
+    if !allowed || data.skills.is_item_only_skill(skill_id) {
+        return refuse("skill is not on the pet's bar");
+    }
+    let Some(skill) = template_skill(server, skill_id, 1) else {
+        return (skill_result::NO_PERM, 0);
+    };
+    if !mate_level_allows(mate, &skill) {
+        return refuse("pet level below the skill's level");
+    }
+    super::skill::use_skill(
+        server,
+        &skill,
+        mate,
+        wire_caster,
+        target,
+        Some(skill_object.clone()),
+        false,
+    )
+}
+
 /// Answers a refused client cast with the started-skill packet carrying `result` / `value`.
 fn send_cast_failed(
     player: &crate::world::PlayerRef,
@@ -807,6 +935,9 @@ fn is_variant_of_skill(
     let Some(t) = data.skill(skill_id) else {
         return false;
     };
+    if t.ability_id == 0 {
+        return false; // ability-less skills have no tree to be a variant in
+    }
     let learned: Vec<u32> = player.data().skills.skills.iter().map(|s| s.id).collect();
     learned.into_iter().any(|id| {
         data.skill(id)
