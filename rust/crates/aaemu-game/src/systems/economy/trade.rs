@@ -519,9 +519,12 @@ pub fn on_player_died(server: &GameServer, player: &PlayerRef) {
     cancel_if_trading(server, player.obj_id, cancel_reason::NORMAL);
 }
 
-/// A zone change (teleport / instance load, `Character.OnZoneChange`) ends a running trade:
-/// the 1.2 client clears the trade UI on `ENTERED_LOADING` without sending `CSCancelTrade`.
-pub fn on_player_zone_changed(server: &GameServer, player: &PlayerRef) {
+/// A server-forced teleport (portal, GM move, instance/world load, resurrection displacement)
+/// ends a running trade at once: the 1.2 client clears the trade UI on `ENTERED_LOADING` and
+/// sends no `CSCancelTrade` for a same-zone teleport, so the next movement packet could be the
+/// only thing that would have ended it. A plain zone-group crossing on foot is not a load and
+/// must keep the trade (the per-move distance check still covers moving apart).
+pub fn on_player_teleported(server: &GameServer, player: &PlayerRef) {
     cancel_if_trading(server, player.obj_id, cancel_reason::NORMAL);
 }
 

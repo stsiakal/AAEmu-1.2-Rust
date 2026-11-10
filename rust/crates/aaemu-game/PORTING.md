@@ -2544,11 +2544,14 @@ is no longer mirrored (see "Known deviations", dead NPC returned and healed).
   `FUN_394fd9a0`), and 5 for another exclusive window. The port keeps 0 for internal
   cancellations, uses 1 for leave-world, 2 for its own 5 m check, and 0 for death / loading zone
   change (the client suppresses its own line on `ENTERED_LOADING`); `CSCancelTrade` reasons pass
-  through, so the client's 5 keeps its 538/539 text. Death, a loading zone change (different
-  zone group) and movement out of range now end the trade for both players; hooks only cancel
-  when a trade exists. Tests: `moving_out_of_range_cancels_with_the_client_checks_reason`,
+  through, so the client's 5 keeps its 538/539 text. Death, a server-forced teleport (portal,
+  GM move, instance/world load or resurrection displacement, same zone group included) and
+  movement out of range now end the trade for both players; a plain zone-group crossing on foot
+  keeps it. Hooks only cancel when a trade exists. Tests:
+  `moving_out_of_range_cancels_with_the_client_checks_reason`,
   `a_death_cancels_a_running_trade_for_both_players`,
-  `a_loading_zone_change_cancels_a_running_trade`,
+  `crossing_a_zone_group_border_keeps_a_running_trade`,
+  `a_same_group_teleport_cancels_a_running_trade_at_once`,
   `lifecycle_hooks_without_a_trade_send_no_cancel_packet`.
 * systems::economy: auction lots are enumerated in id order (`ConcurrentDictionary` order in C#),
   search / cheapest lot skip lots whose item or template is missing; mails are kept in a map that

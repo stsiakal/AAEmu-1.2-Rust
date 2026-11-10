@@ -805,7 +805,7 @@ async fn a_death_cancels_a_running_trade_for_both_players() {
 }
 
 #[tokio::test]
-async fn a_loading_zone_change_cancels_a_running_trade() {
+async fn crossing_a_zone_group_border_keeps_a_running_trade() {
     use crate::data::world_data::{Zone, ZoneGroup};
     use crate::systems::economy::tests::{test_data, world_with};
     let mut data = test_data();
@@ -834,16 +834,66 @@ async fn a_loading_zone_change_cancels_a_running_trade() {
     let mut w = world_with(data);
     w.pa.data().unit.transform.zone_id = 1000;
     w.pb.data().unit.transform.zone_id = 1000;
-    // No trade: the hook must not send a spurious SCTradeCanceled.
-    crate::world::session::on_zone_change(&w.server, &w.pa, 1000, 2000);
-    assert!(w.a.drain().is_empty() && w.b.drain().is_empty());
-    w.pa.data().unit.transform.zone_id = 1000;
+    // 2 m apart: still in trade range while the border is crossed on foot.
+    w.pb.data().unit.transform.set_xyz(102.0, 100.0, 100.0);
     start(&mut w);
     w.a.drain();
     w.b.drain();
-    // A different zone *group* is the loading-screen case; the 1.2 client clears the trade UI
-    // on ENTERED_LOADING without sending CSCancelTrade, so the server ends the trade.
+    // `handle_zone_changes` fires for plain movement; a zone-group border crossing is not a
+    // client load and keeps its trade UI, so the server must keep the trade too.
     crate::world::session::on_zone_change(&w.server, &w.pa, 1000, 2000);
+    assert!(w.a.drain().is_empty() && w.b.drain().is_empty());
+    assert_eq!(w.server.systems.economy.trade.trades().len(), 1);
+}
+
+#[tokio::test]
+async fn a_same_group_teleport_cancels_a_running_trade_at_once() {
+    use crate::data::world_data::{Zone, ZoneGroup};
+    use crate::models::transform::Transform;
+    use crate::systems::economy::tests::{test_data, world_with};
+    let mut data = test_data();
+    data.zones.groups.insert(
+        1,
+        ZoneGroup {
+            id: 1,
+            name: "Group One".into(),
+            ..Default::default()
+        },
+    );
+    for key in [1000, 1001] {
+        data.zones.zones.insert(
+            key,
+            Zone {
+                id: key,
+                name: format!("Zone {key}"),
+                zone_key: key,
+                group_id: 1,
+                ..Default::default()
+            },
+        );
+    }
+    let mut w = world_with(data);
+    w.pa.data().unit.transform.zone_id = 1000;
+    w.pb.data().unit.transform.zone_id = 1000;
+    w.pb.data().unit.transform.set_xyz(102.0, 100.0, 100.0);
+    start(&mut w);
+    w.a.drain();
+    w.b.drain();
+    let instance_id = w.pa.data().unit.transform.instance_id;
+    // A portal / GM move inside one zone group is still a client load; the client clears the
+    // trade UI without CSCancelTrade, so the teleport itself must end the trade.
+    assert!(crate::world::session::teleport_character(
+        &w.server,
+        &w.pa,
+        Transform {
+            instance_id,
+            zone_id: 1001,
+            x: 102.0,
+            y: 100.0,
+            z: 100.0,
+            ..Default::default()
+        },
+    ));
     assert_eq!(w.a.drain(), vec![canceled(0, true)]);
     assert_eq!(w.b.drain(), vec![canceled(0, false)]);
     assert!(w.server.systems.economy.trade.trades().is_empty());

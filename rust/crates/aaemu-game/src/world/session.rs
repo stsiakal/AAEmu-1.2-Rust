@@ -179,12 +179,6 @@ pub fn on_zone_change(server: &GameServer, p: &PlayerRef, last_zone: u32, new_zo
     let new = zones.zone_by_key(new_zone).cloned();
     let last_group = last.as_ref().map_or(0, |z| z.group_id as i16);
     let new_group = new.as_ref().map_or(0, |z| z.group_id as i16);
-    // A loading zone change (different zone group, like a teleport / instance load) ends a
-    // running trade: the 1.2 client clears the trade UI on `ENTERED_LOADING` without sending
-    // `CSCancelTrade`, so the server must end it for both players.
-    if last_zone != new_zone && last_group != new_group {
-        crate::systems::economy::trade::on_player_zone_changed(server, p);
-    }
     if last_group != 0 {
         zone_chat(server, last_zone).leave(p);
     }
@@ -240,6 +234,10 @@ pub fn teleport_character(server: &GameServer, p: &PlayerRef, destination: Trans
             destination.instance_id
         );
     }
+    // A teleport is a client load (same zone or not): the 1.2 client clears the trade UI on
+    // `ENTERED_LOADING` and does not send `CSCancelTrade` for a same-zone teleport, so end the
+    // trade now. A plain zone-group crossing on foot does not come through here.
+    crate::systems::economy::trade::on_player_teleported(server, p);
     // A rider, a bound seat or a doodad bond would stay half attached on the server once the
     // transform loses its parent (the client is moved off it): dismount first, as the GM
     // teleport and the trial do (`Character.ForceDismount`, `AttachUnitReason.PrefabChanged`).
@@ -1532,7 +1530,7 @@ pub async fn send_chat_message(
             // would therefore have no visible recipient, so refuse it explicitly instead of
             // silently dropping it.
             tracing::warn!(
-                "Refusing chat type {} (performance) from {}: the 1.2 client has no display                  channel for type 13",
+                "Refusing chat type {} (performance) from {}: the 1.2 client has no display channel for type 13",
                 chat,
                 sender.name
             );
