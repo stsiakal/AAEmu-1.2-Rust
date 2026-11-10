@@ -1094,7 +1094,12 @@ async fn run_lines(
                 clock += 1500;
                 // A plain CSMoveUnit, no GM `/move`: e.g. to leave a trade's range.
                 game.move_to((x + dx, y + dy, z + dz), clock).await?;
-                println!("    walked to ({:.1}, {:.1}, {:.1})", x + dx, y + dy, z + dz);
+                println!(
+                    "    walked to ({:.1}, {:.1}, {:.1})",
+                    x + dx,
+                    y + dy,
+                    z + dz
+                );
             }
             "gopeer" => {
                 let p = peer(game, parts.first().copied())?;
