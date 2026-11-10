@@ -250,10 +250,10 @@ impl Default for HousingConfig {
             siege_declare_resurrect_check: true,
             siege_declare_resurrect_margin: 100.0,
             siege_declare_obstacle_radius: default_siege_declare_obstacle_radius(),
-            lodestone_max_hp: None,
-            defense_tower_max_hp: None,
             siege_larceny: SiegeLarcenyMode::default(),
             siege_larceny_crime: false,
+            lodestone_max_hp: None,
+            defense_tower_max_hp: None,
         }
     }
 }
