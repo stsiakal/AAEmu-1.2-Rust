@@ -51,6 +51,13 @@
 //!                                   CSICSBuyGoodPacket (0x11d); fail unless the buy succeeds,
 //!                                   `SCGotMail` is a CHARGED (9) mail and SCCountUnreadMail's
 //!                                   4th counter is 1
+//! giftics <shop id> <detail> <receiver> [main] [sub]
+//!                                   CSICSBuyGoodPacket (0x11d) as a gift; fail unless
+//!                                   SCICSBuyResult is successful and no SCErrorMsg arrives.
+//!                                   The receiver may be offline (no SCGotMail to the buyer).
+//! unreadmail <sent> <received> <mia> <commercial>
+//!                                   fail unless the last SCCountUnreadMailPacket (sent at
+//!                                   spawn, so it includes offline mail) has these counters
 //! aucpost <npc tpl> <item tpl> <start> <buyout> <duration>
 //!                                   walk to the auctioneer NPC, CSAuctionPost (client writer
 //!                                   `FUN_397bae70`) and decode `SCAuctionPosted`
@@ -66,8 +73,10 @@
 //!                                    item); fails unless the expected error (and no result) or
 //!                                    an `SCGradeEnchantResult` arrives.
 //! waitpeer [secs] [name]             read packets until another player is in sight (60 s default)
-//! rawcs <opcode hex> [<body hex>]    send any client packet (`SELF` / `PEER` / `ITEM(<template>)`
-//!                                    in the body hex)
+//! rawcs <opcode hex> [<body hex>]    send any client packet (`SELF` / `PEER` = 3-byte object
+//!                                    ids, `SELFID` / `PEERID` = u32 character ids,
+//!                                    `GUILD` = u32 guild id, `ITEM(<template>)` = stack id,
+//!                                    `STR(<text>)` = a length-prefixed string)
 //! rawcsend <opcode hex> <body hex>   send it without draining (the caller asserts the reply)
 //! rawcswait <opcode hex> <body hex> <PacketName> [secs]
 //!                                    send it and fail unless that packet answers (default 5 s)
@@ -1697,6 +1706,56 @@ async fn run_lines(
                     "buyics: SCCountUnreadMail's commercial counter is not 1"
                 );
             }
+            "giftics" => {
+                let shop_id: u32 = num(&parts, 0)?;
+                let detail: u8 = num(&parts, 1)?;
+                let receiver = *parts
+                    .get(2)
+                    .with_context(|| "giftics: missing receiver name")?;
+                let main_tab: u8 = parts.get(3).and_then(|x| x.parse().ok()).unwrap_or(0);
+                let sub_tab: u8 = parts.get(4).and_then(|x| x.parse().ok()).unwrap_or(0);
+                let mut body = aaemu_commons::PacketStream::new();
+                body.write_u8(1)
+                    .write_u32(shop_id)
+                    .write_u8(main_tab)
+                    .write_u8(sub_tab)
+                    .write_u8(detail)
+                    .write_str(receiver);
+                game.send_cs(cs::CSICSBuyGoodPacket, body.as_bytes())
+                    .await?;
+                let got = game
+                    .drain(Duration::from_millis(1500), Duration::from_secs(10))
+                    .await?;
+                show(&got);
+                let mut bought = None;
+                let mut error = None;
+                for p in &got {
+                    if p.is_sc(sc::SCICSBuyResultPacket) {
+                        bought = Some(p.stream().read_bool()?);
+                    } else if p.is_sc(sc::SCErrorMsgPacket) {
+                        error = Some(p.stream().read_i16()?);
+                    }
+                }
+                ensure!(
+                    bought == Some(true),
+                    "giftics: no successful SCICSBuyResult (SCErrorMsg {error:?})"
+                );
+                ensure!(error.is_none(), "giftics: SCErrorMsg {error:?}");
+            }
+            "unreadmail" => {
+                let want = (
+                    num::<i32>(&parts, 0)?,
+                    num::<i32>(&parts, 1)?,
+                    num::<i32>(&parts, 2)?,
+                    num::<i32>(&parts, 3)?,
+                );
+                let got = game
+                    .state
+                    .count_unread_mail
+                    .context("unreadmail: no SCCountUnreadMailPacket seen")?;
+                ensure!(got == want, "unreadmail: got {got:?}, want {want:?}");
+                println!("    SCCountUnreadMail {got:?}");
+            }
             "aucpost" => {
                 let npc_tpl: u32 = num(&parts, 0)?;
                 let item_tpl: u32 = num(&parts, 1)?;
@@ -2281,14 +2340,17 @@ async fn run_lines(
                     )
                 };
                 let raw = parts.get(1).copied().unwrap_or("");
-                let peer_bc = if raw.contains("PEER") {
-                    bc(peer(game, None)
-                        .context("PEER needs another player in sight")?
-                        .obj_id)
+                let peer_unit = if raw.contains("PEER") {
+                    Some(peer(game, None).context("PEER / PEERID need another player in sight")?)
                 } else {
-                    String::new()
+                    None
                 };
-                // `GUILD` is the bot's guild id as a little-endian u32.
+                let le32 = |id: u32| id.to_le_bytes().map(|b| format!("{b:02x}")).concat();
+                let peer_bc = peer_unit.as_ref().map(|u| bc(u.obj_id)).unwrap_or_default();
+                let peer_id = peer_unit.as_ref().map(|u| le32(u.id)).unwrap_or_default();
+                // `GUILD` is the bot's guild id as a little-endian u32; `SELFID` / `PEERID` are
+                // character ids (`CSFamilyReplyInvitation` and the other u32 character-id
+                // packets), while `SELF` / `PEER` stay the 3-byte `bc` object ids.
                 let mut hex = raw
                     .replace(
                         "GUILD",
@@ -2299,8 +2361,26 @@ async fn run_lines(
                             .map(|b| format!("{b:02x}"))
                             .concat(),
                     )
+                    .replace("PEERID", &peer_id)
+                    .replace("SELFID", &le32(game.state.selected_char))
                     .replace("SELF", &bc(game.state.self_obj))
                     .replace("PEER", &peer_bc);
+                // `STR(<text>)` expands to a `PacketStream` string (u16 length + UTF-8 bytes).
+                while let Some(start) = hex.find("STR(") {
+                    let rest = &hex[start + 4..];
+                    let end = rest.find(')').context("STR( needs a closing )")?;
+                    let text = &rest[..end];
+                    anyhow::ensure!(
+                        text.len() <= usize::from(u16::MAX),
+                        "STR() text is longer than a packet string"
+                    );
+                    let bytes = text.as_bytes();
+                    let mut enc = format!("{:02x}{:02x}", bytes.len() & 0xff, bytes.len() >> 8);
+                    for byte in bytes {
+                        enc.push_str(&format!("{byte:02x}"));
+                    }
+                    hex.replace_range(start..start + 4 + end + 1, &enc);
+                }
                 // `ITEM(<template>)` expands to the stack id remembered by
                 // `item <template>`, little-endian, so a packet can carry the real item
                 // instance id.
