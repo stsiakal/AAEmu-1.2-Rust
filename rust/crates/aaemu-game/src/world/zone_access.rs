@@ -239,6 +239,8 @@ fn transport(server: &GameServer, player: &PlayerRef, destination: Transform) {
     {
         return;
     }
+    // This displacement is a teleport/return load, not a plain zone crossing: end a trade.
+    crate::systems::economy::trade::on_player_teleported(server, player);
     if old.instance_id != destination.instance_id {
         leave_instance_membership(server, player, old.instance_id);
     }
@@ -303,6 +305,11 @@ fn leave_instance_membership(server: &GameServer, player: &PlayerRef, instance: 
     use crate::systems::instances::events::CharEvent;
     let events = &server.systems.instances.events.characters;
     if let Some(dungeon) = server.systems.instances.dungeon_of_world(instance) {
+        server.systems.instances.indun.note_entry_item_leave(
+            player.character_id,
+            dungeon.zone_group_id(),
+            dungeon.indun_zone.restore_item_time,
+        );
         {
             let mut state = dungeon.st();
             state
