@@ -123,6 +123,9 @@
 //! expectbuffremoved <buff> [self|peer|player:NAME] [secs]
 //!                                   fail unless SCBuffRemoved for a previously announced
 //!                                   SCBuffCreated of that buff / owner arrives
+//! expecthpdrop <self|peer|player:NAME> [secs]  fail unless that unit's HP falls below its
+//!                                   value at the command start (the last SCUnitPointsPacket)
+//! expectnohpdrop <self|peer|player:NAME> [secs]  fail if that unit's HP falls in the window
 //! expectlog <regex> [secs]          fail unless a new game-log line matches (AAEMU_VERIFY_GAME_LOG)
 //! expectdb "<sql>" <value> [secs]   fail unless the SQL's value equals `value`
 //!                                   (AAEMU_VERIFY_MYSQL; re-checked for `secs` when given)
@@ -801,6 +804,41 @@ async fn expect_buff_removed(
     }
 }
 
+/// `expecthpdrop` / `expectnohpdrop`: watch the unit's last `SCUnitPointsPacket` HP against
+/// the value seen when the command starts.
+async fn expect_hp_drop(
+    game: &mut GameClient,
+    spec: Option<&str>,
+    secs: u64,
+    want_drop: bool,
+) -> anyhow::Result<()> {
+    let target = buff_target(game, spec)?;
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let baseline = game.state.unit_points.get(&target).map(|p| p.0);
+    anyhow::ensure!(
+        baseline.is_some(),
+        "no SCUnitPointsPacket for unit {target} yet (hp unknown)"
+    );
+    loop {
+        let hp = game.state.unit_points.get(&target).map(|p| p.0);
+        let dropped = matches!((baseline, hp), (Some(b), Some(n)) if n < b);
+        if want_drop && dropped {
+            println!("    hp of {target}: {baseline:?} -> {hp:?}");
+            return Ok(());
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            if want_drop {
+                bail!("no HP drop for unit {target} within {secs} s (hp {hp:?})");
+            }
+            println!("    no HP drop on {target} in {secs} s");
+            return Ok(());
+        }
+        let wait = left.min(Duration::from_millis(250));
+        game.recv_within(wait).await?;
+    }
+}
+
 /// `/move` to `(x, y, z)`, acknowledge it and wait for the area around the new position.
 async fn teleport_to(
     game: &mut GameClient,
@@ -1236,8 +1274,27 @@ async fn run_lines(
                 let tpl: u32 = num(&parts, 1)?;
                 let npc = nearest(game, tpl).with_context(|| format!("NPC {tpl} not in sight"))?;
                 clock += 1500;
-                game.move_to((npc.pos.0 + 1.0, npc.pos.1, npc.pos.2), clock)
-                    .await?;
+                // Optional 3rd argument: cast from that many metres away (on the side the bot
+                // came from) instead of 1 m next to the NPC, like `icast`'s distance argument.
+                match parts.get(2).and_then(|d| d.parse::<f32>().ok()) {
+                    Some(d) => {
+                        let me = game.state.self_pos;
+                        let (dx, dy) = (me.0 - npc.pos.0, me.1 - npc.pos.1);
+                        let len = dx.hypot(dy).max(0.001);
+                        let at = (
+                            npc.pos.0 + dx / len * d,
+                            npc.pos.1 + dy / len * d,
+                            npc.pos.2,
+                        );
+                        // Face the NPC: a skill's damage effects can require the target in
+                        // front (unchanged for the default 1 m form).
+                        game.move_to_facing(at, npc.pos, clock).await?;
+                    }
+                    None => {
+                        game.move_to((npc.pos.0 + 1.0, npc.pos.1, npc.pos.2), clock)
+                            .await?
+                    }
+                }
                 game.change_target(npc.obj_id).await?;
                 game.start_skill(skill, npc.obj_id).await?;
                 last_npc = npc.obj_id;
@@ -2271,6 +2328,11 @@ async fn run_lines(
                 let buff: u32 = num(&parts, 0)?;
                 let secs: u64 = parts.get(2).and_then(|x| x.parse().ok()).unwrap_or(10);
                 expect_buff_removed(game, buff, parts.get(1).copied(), secs).await?;
+            }
+            "expecthpdrop" | "expectnohpdrop" => {
+                let spec = parts.first().copied();
+                let secs: u64 = parts.get(1).and_then(|x| x.parse().ok()).unwrap_or(10);
+                expect_hp_drop(game, spec, secs, cmd == "expecthpdrop").await?;
             }
             "expectlog" => {
                 let args = split_quoted(rest)?;
