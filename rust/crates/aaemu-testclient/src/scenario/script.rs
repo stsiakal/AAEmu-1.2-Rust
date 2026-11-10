@@ -9,6 +9,7 @@
 //! gmraw <command line>               same, without draining (the caller asserts the reply)
 //! tp <x> <y> <z>                     /move there, acknowledge the teleport, wait for the area
 //! moverel <dx> <dy> <dz>             /move to self + delta (e.g. leave an aura radius)
+//! walkrel <dx> <dy> <dz>             plain CSMoveUnit to self + delta (no GM command)
 //! gopeer [name]                      /move to the peer's position (no drain)
 //! pump <secs>                        just read packets
 //! units [<npc template>...]          NPCs in sight (all within 60 m when no template given)
@@ -1085,6 +1086,15 @@ async fn run_lines(
                 let (x, y, z) = game.state.self_pos;
                 // No drain: the caller asserts the buff enter / leave packets that follow.
                 teleport_to(game, &mut clock, x + dx, y + dy, z + dz, false).await?;
+            }
+            "walkrel" => {
+                let (dx, dy, dz): (f32, f32, f32) =
+                    (num(&parts, 0)?, num(&parts, 1)?, num(&parts, 2)?);
+                let (x, y, z) = game.state.self_pos;
+                clock += 1500;
+                // A plain CSMoveUnit, no GM `/move`: e.g. to leave a trade's range.
+                game.move_to((x + dx, y + dy, z + dz), clock).await?;
+                println!("    walked to ({:.1}, {:.1}, {:.1})", x + dx, y + dy, z + dz);
             }
             "gopeer" => {
                 let p = peer(game, parts.first().copied())?;
