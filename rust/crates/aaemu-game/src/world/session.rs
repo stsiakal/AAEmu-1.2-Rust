@@ -179,6 +179,12 @@ pub fn on_zone_change(server: &GameServer, p: &PlayerRef, last_zone: u32, new_zo
     let new = zones.zone_by_key(new_zone).cloned();
     let last_group = last.as_ref().map_or(0, |z| z.group_id as i16);
     let new_group = new.as_ref().map_or(0, |z| z.group_id as i16);
+    // A loading zone change (different zone group, like a teleport / instance load) ends a
+    // running trade: the 1.2 client clears the trade UI on `ENTERED_LOADING` without sending
+    // `CSCancelTrade`, so the server must end it for both players.
+    if last_zone != new_zone && last_group != new_group {
+        crate::systems::economy::trade::on_player_zone_changed(server, p);
+    }
     if last_group != 0 {
         zone_chat(server, last_zone).leave(p);
     }
