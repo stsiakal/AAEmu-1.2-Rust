@@ -7,6 +7,10 @@
 #   Scripts/verify.sh --only guild            # suites whose name contains "guild"
 #   Scripts/verify.sh --report D:/tmp/report  # report directory
 #
+# A suite whose header carries a line starting with "# standalone" mutates server-global state or
+# takes minutes (gm-commands): it is skipped by the default run and runs only when selected with
+# --only, for example `Scripts/verify.sh --only gm-commands`.
+#
 # Run from inside a lane worktree (Scripts/lane.sh new <name>); the stack, databases, ports and
 # runtime directory are the lane's own. Never run outside a lane. See Docs/wiki/Verification.md.
 set -euo pipefail
@@ -66,6 +70,9 @@ for f in "${all[@]}"; do
   name=$(basename "$f" .vtest)
   if [ -n "$ONLY" ]; then
     case "$name" in *"$ONLY"*) ;; *) continue ;; esac
+  elif grep -q '^# standalone' "$f"; then
+    # Mutates server-global state or takes minutes: only runs when selected with --only.
+    continue
   fi
   suites+=("$f")
 done
@@ -97,10 +104,11 @@ else
 fi
 
 # The spoof check reads a debug line from the express-text handler, the aggro-link suite one
-# from the AI behaviors and the music suites the upload / save-notes lines (services::music,
-# skills::effects::special); give the game log those filters, then restart this lane's stack so the
+# from the AI behaviors, the music suites the upload / save-notes lines (services::music,
+# skills::effects::special) and the gimmick-contact suite the contact-cast line
+# (npcs::gimmick); give the game log those filters, then restart this lane's stack so the
 # filters and the patched config apply.
-export RUST_LOG="${RUST_LOG:-info},aaemu_game::systems::services::express_text=debug,aaemu_game::systems::ai::behaviors=debug,aaemu_game::systems::services::music=debug,aaemu_game::systems::skills::effects::special=debug"
+export RUST_LOG="${RUST_LOG:-info},aaemu_game::systems::services::express_text=debug,aaemu_game::systems::ai::behaviors=debug,aaemu_game::systems::services::music=debug,aaemu_game::systems::skills::effects::special=debug,aaemu_game::systems::npcs::gimmick=debug"
 "$REPO/Scripts/live-stack.sh" stop
 
 export AAEMU_VERIFY_GAME_LOG="$GAME_LOG"

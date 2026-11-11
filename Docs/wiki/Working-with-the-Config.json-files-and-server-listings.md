@@ -704,6 +704,35 @@ default to `true` and can be turned off to restore the old faction-only behaviou
   The destination is inferred; the client evidence is only which revive window it
   shows.
 
+## Dungeon entry rules
+
+Two settings in `Configurations/Dungeons.json` (or `Config.Local.json`) control the entry rules
+of dungeons that need an entry item:
+
+```json
+{
+  "Dungeons": {
+    "EntryLimit": { "Enabled": null, "Count": 3, "WindowSeconds": 14400 },
+    "RequireEntryItems": true
+  }
+}
+```
+
+- `EntryLimit.Enabled`: whether the old AAEmu visit cap applies (`Count` fresh entries within
+  `WindowSeconds`). Leave it out (or `null`) and the era profile `World.Profile` decides: off
+  for the default `EuAuroria`, on for `EuLaunch` and `Kr12`. `true` or `false` overrides the
+  profile. `Count` (default 3) replaces the 3 for every zone group except the data's
+  "unlimited" rows (zone group 49 and the channel dungeons); `WindowSeconds` (default 14400,
+  four hours) is the window. The entry history is recorded even while the cap is off and is
+  kept in memory only (it resets when the server restarts).
+- `RequireEntryItems` (default `true`): `false` neither requires nor consumes the
+  `indun_zones.item_id` entry item of any dungeon.
+- Not configurable: five dungeon zone groups have a one-hour `restore_item_time` in the 1.2
+  data, so after leaving a run that consumed an entry item one new run of the same zone group
+  within an hour is free (once per ticket). It applies on every profile; only
+  `RequireEntryItems: false` removes the ticket cost altogether. The owner's recollection is
+  the only evidence for these rules (see `PORTING.md`, "Inferred").
+
 ## Logging
 
 Logging is not configured in `Config.json`. Both servers log to stdout; the
@@ -848,7 +877,7 @@ form `FeatureSet__Siege=false`.
 | `achievement` | 63 | `true` | Achievement window. |
 | `dwarfWarborn` | 74 | `false` | Dwarf / Warborn race selection. The shipped `characters` data has both races `creatable = 'f'`, so turning the bit on does not make them creatable by itself. |
 | `mailCoolTime` | 75 | `true` | Mail send cooldown display (INFERRED). |
-| `hudAuctionButton` | 81 | `true` | Auction-house button in the HUD. |
+| `hudAuctionButton` | 81 | `true` | Auction-house button in the HUD. While `true` the server also accepts auction requests from players who are not at an auctioneer NPC; set it to `false` to require the NPC again. |
 | `auctionPostBuff` | 83 | `true` | Auction posting buff / UI (INFERRED). |
 | `aaPoint` | 44 | `false` | AA-point amounts in price and currency displays. AA points are not supported, so keep it off. |
 | `ExtraBits` | any | `{}` | `bit -> bool` overrides for the unnamed `flag_x_y` bits (`0..=87`); a `false` value turns a default-on bit off. Bit 78 is the mate equipment whitelist. The C++ reads 32, 34, 41, 42, 47, 60 and 73 too, but their purpose is unresolved. |
@@ -1015,6 +1044,34 @@ line is still charged in honor through the item's honor price.
 only, not from a capture of the retail server. Keep the switch off until an original-client
 capture shows how the retail shop behaved. The implementation and the open question are
 recorded in `rust/crates/aaemu-game/PORTING.md` (WP-SD4a).
+
+## Siege area: removal of non-participants
+
+While a siege runs, a character that stands inside the siege area (the Archeum Lodestone's
+siege radius, or the attackers' camp circle) without being a participant of the siege is moved
+to the nearest return point outside the area, and the client shows "Not a siege participant".
+The check runs once a second. A participant is a character on the siege roster that still
+belongs to its side's guild; game masters (access level 100 or higher) are never moved. The
+rule is **on** by default. To leave everybody where they stand, add this game-server override
+to `Config.Local.json`:
+
+```json
+{
+  "Housing": {
+    "SiegeEvictNonParticipants": false
+  }
+}
+```
+
+The switch covers the removal only. The hostility between the two siege sides inside the area
+and the participant seals are always on.
+
+**Capture-pending (INFERRED):** the removal comes from 2014 period guides (grade C), not from a
+1.2 server source or a capture of the retail server. In the 1.2 data the castle zones are
+`closed`, so the zone-access rule already removes non-GM characters from them: with the
+unchanged data only GMs can stand in a castle area, and this rule spares them. It matters on a
+server whose castle zones are open. The implementation and the open questions are recorded in
+`rust/crates/aaemu-game/PORTING.md`.
 
 ## Siege calendar and territory claim-window timezone
 

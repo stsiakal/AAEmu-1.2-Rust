@@ -13,14 +13,16 @@ use std::sync::{Mutex, OnceLock};
 use crate::data::world_data::ZoneData;
 use crate::data::world_templates::WorldTemplates;
 
-use super::data::{QuestData, RawSignSphere};
+use super::data::{DbSphere, QuestData, RawSignSphere};
 use super::model::sphere_trigger;
 use super::packets::SCAreaTeamMessagePacket;
 use super::templates::ActKind;
 use super::ui_packets::SCQuestAcceptConditionalPacket;
 use crate::server::GameServer;
+use crate::systems::npcs::doodad::phase::{do_change_phase, do_func, Operation};
+use crate::systems::npcs::doodad::runtime::DoodadCtx;
 use crate::systems::social::packets::duel::SCAreaChatBubblePacket;
-use crate::world::{PlayerRef, WorldObject};
+use crate::world::{DoodadRef, PlayerRef, WorldObject};
 
 /// `SphereQuest` (one `quest_sign_sphere.g` area, world coordinates).
 #[derive(Debug, Clone, PartialEq)]
@@ -373,6 +375,10 @@ struct AreaState {
     /// A false -> true transition while inside offers again (a level-up among others), while
     /// staying eligible does not repeat the offer.
     eligible: HashMap<u32, bool>,
+    /// `SphereDoodadInteract` areas (indexes) the character is inside whose interaction has not
+    /// settled yet: tried again on every tick until it acts or the character leaves the area
+    /// (see [`dispatch_doodad_interact`]).
+    pending_interact: Vec<usize>,
 }
 
 /// Minimum interval between two `SCQuestAcceptConditional` offers of the same sphere to the
@@ -704,7 +710,8 @@ impl SphereQuestManager {
     /// non-empty `team_msg` sends `SCAreaTeamMessage(enter, sphere id)` to that player only
     /// (CAP-UI-6: `is_personal_msg` is true for every shipped `team_msg` row; the non-personal
     /// audience is UNKNOWN). On leave only a row with `enter_or_leave` set fires.
-    /// `SphereDoodadInteract` casts its authored skill on the doodads inside the area (see
+    /// `SphereDoodadInteract` casts its authored skill on the doodads inside the area, on entry
+    /// and then on every tick while the character stays inside until it has acted (see
     /// [`dispatch_doodad_interact`]); the other types (SphereSkill / SphereSound / SphereBuff)
     /// are loaded but have no effect here (a separate content decision).
     fn tick_area_spheres(&self, server: &GameServer, now: i64) {
@@ -758,7 +765,10 @@ impl SphereQuestManager {
             // Drop characters that left the world; keep their offer bookkeeping while inside.
             states.retain(|id, _| next.contains_key(id));
             for (id, inside) in next {
-                states.entry(id).or_default().inside = inside;
+                let st = states.entry(id).or_default();
+                st.pending_interact
+                    .retain(|area| inside.binary_search(area).is_ok());
+                st.inside = inside;
             }
         }
         let entered: HashSet<(u32, usize)> = events
@@ -766,6 +776,9 @@ impl SphereQuestManager {
             .filter(|(_, _, enter)| *enter)
             .map(|(p, i, _)| (p.character_id, *i))
             .collect();
+        // `SphereDoodadInteract` areas to try this tick: the ones entered now and the ones a
+        // character stands in whose interaction has not settled yet.
+        let mut interact: Vec<(PlayerRef, usize)> = Vec::new();
         for (player, area, enter) in events {
             let Some(sphere) = data.spheres.get(&areas[area].sphere_id) else {
                 continue;
@@ -787,7 +800,36 @@ impl SphereQuestManager {
                 });
             }
             if enter && sphere.sphere_detail_type == "SphereDoodadInteract" {
-                dispatch_doodad_interact(server, &player, &areas[area], sphere.sphere_detail_id);
+                interact.push((player.clone(), area));
+            }
+        }
+        {
+            let states = self.area_state.lock().expect("area state poisoned");
+            for (player, _) in &inside_players {
+                let Some(st) = states.get(&player.character_id) else {
+                    continue;
+                };
+                for &area in &st.pending_interact {
+                    if !interact
+                        .iter()
+                        .any(|(p, a)| *a == area && p.character_id == player.character_id)
+                    {
+                        interact.push((player.clone(), area));
+                    }
+                }
+            }
+        }
+        for (player, area) in interact {
+            let Some(sphere) = data.spheres.get(&areas[area].sphere_id) else {
+                continue;
+            };
+            // No lock is held across the dispatch (it takes the character's and the doodad's).
+            let settled = dispatch_doodad_interact(server, &player, &areas[area], sphere);
+            let mut states = self.area_state.lock().expect("area state poisoned");
+            let st = states.entry(player.character_id).or_default();
+            st.pending_interact.retain(|a| *a != area);
+            if !settled {
+                st.pending_interact.push(area);
             }
         }
         // `SphereAcceptQuest` offers: on entry and when a character already inside becomes
@@ -1007,8 +1049,21 @@ impl SphereQuestManager {
     }
 }
 
-/// `SphereDoodadInteract`: on entering the sphere, use the authored skill on the doodads inside
-/// the sphere's `sphere_area_fill.json` area.
+/// `SphereDoodadInteract`: use the authored skill on the doodads inside the sphere's
+/// `sphere_area_fill.json` area. Tried when the character enters the area and then on every tick
+/// while it stays inside, until it settles (`SphereQuestManager::tick_area_spheres`): the skill
+/// has a range (4 m for skill 11284) and the Sharpwind bridge doodad lies 1.9 m from the centre
+/// of its 5 m area, so it is 3.1 to 6.9 m from the point where a character enters the area (only
+/// an entry within 48 degrees of the direction to the bridge is in range; the start pool lies
+/// 60 m east of it, so a character coming from there enters about 5 m away) and in range only
+/// once the character steps onto it. An entry-only trigger never collapsed the bridge for a
+/// character that walks onto it. The shipped sphere row points the same way:
+/// `trigger_condition_id` 3 (`EVERY_N_TIME_AFTER`, 500 ms) is a repeated check while inside.
+///
+/// Returns whether the interaction is settled: `true` when a doodad was triggered, or when nothing
+/// in the area can be triggered (no authored skill, no doodad inside the area whose phase has an
+/// area trigger); `false` while the character's requirements are not met or a doodad that reacts
+/// is out of the skill's range or busy, so the next tick tries again.
 ///
 /// Evidence: the 10.x `DoodadAreaTriggerRuntime` documents zone area edges of kind 21
 /// (`SphereDoodadInteract`) whose `value1` is the `spheres.id`, resolved through
@@ -1017,12 +1072,22 @@ impl SphereQuestManager {
 /// (4 m for skill 11284) and the sphere area bound the candidates. Sharpwind's sphere 1552
 /// ("bridge collapse area", 5 m at the Derelict Bridge) contains only the bridge doodad
 /// (5058, phase func `DoodadFuncAreaTrigger`), which advances to the broken model.
+///
+/// The hook is generic, so it also drives every other shipped `SphereDoodadInteract` area whose
+/// doodad has a `DoodadFuncAreaTrigger` row: the open world's quarry rock piles (doodad 2803
+/// inside the areas of sphere 1446) and Unstable Floor (doodad 1495, sphere 429), see
+/// `PORTING.md`. The sphere's own requirements
+/// (`unit_reqs`) gate it like the `SphereAcceptQuest` offers do. The candidates are the doodads
+/// of the player's region neighbourhood (two regions around, at least 128 m; the largest
+/// authored `max_range` of the 105 shipped rows is 30 m), never the whole instance, so the scan
+/// is bounded by the grid and not by the number of doodads in the world.
 fn dispatch_doodad_interact(
     server: &GameServer,
     player: &PlayerRef,
     area: &SphereArea,
-    sphere_detail_id: u32,
-) {
+    sphere: &DbSphere,
+) -> bool {
+    let sphere_detail_id = sphere.sphere_detail_id;
     let Some(detail) = server
         .game_data
         .systems
@@ -1031,10 +1096,20 @@ fn dispatch_doodad_interact(
         .sphere_doodad_interacts
         .get(sphere_detail_id)
     else {
-        return;
+        return true;
     };
     if detail.skill_id == 0 {
-        return;
+        return true;
+    }
+    // `None`: the character's quest state is unavailable this tick; like a failed requirement it
+    // is tried again on the next one (a level-up or a quest step while inside qualifies).
+    let (id, or) = (sphere.id, sphere.or_unit_reqs);
+    if !super::events::with_quests(server, player, None, move |ctx| {
+        ctx.can_trigger_sphere(id, or)
+    })
+    .unwrap_or(false)
+    {
+        return false;
     }
     let max_range = server
         .game_data
@@ -1044,17 +1119,25 @@ fn dispatch_doodad_interact(
         .map_or(0.0, |t| t.max_range as f32)
         .max(1.0);
     let Some(world) = server.world.world_of(&WorldObject::from(player)) else {
-        return;
+        return true;
     };
     let me = world.world_pos_rot(&WorldObject::from(player));
     let caster = WorldObject::from(player);
-    for doodad in world.all_doodads() {
+    let Some(region) = world.region_by_pos(me.x, me.y) else {
+        return false;
+    };
+    let candidates: Vec<DoodadRef> = world
+        .neighbors(region)
+        .into_iter()
+        .flat_map(|n| world.objects_in_region(n))
+        .filter_map(|o| o.as_doodad().cloned())
+        .collect();
+    // `acted`: a doodad was triggered. `waiting`: a doodad that reacts lies inside the area but
+    // out of the skill's range of the character (or is busy): it may come in range later.
+    let (mut acted, mut waiting) = (false, false);
+    for doodad in candidates {
         let pos = world.world_pos_rot(&WorldObject::from(&doodad));
         if !area.contains((pos.x, pos.y, pos.z)) {
-            continue;
-        }
-        let (dx, dy, dz) = (pos.x - me.x, pos.y - me.y, pos.z - me.z);
-        if dx * dx + dy * dy + dz * dz > max_range * max_range {
             continue;
         }
         // The 10.x `DoodadAreaTriggerRuntime.Dispatch` runs the owning `DoodadFuncAreaTrigger`
@@ -1074,25 +1157,41 @@ fn dispatch_doodad_interact(
         else {
             continue;
         };
+        let (dx, dy, dz) = (pos.x - me.x, pos.y - me.y, pos.z - me.z);
+        if dx * dx + dy * dy + dz * dz > max_range * max_range {
+            waiting = true;
+            continue;
+        }
+        // The phase reservation every other phase driver takes (`Doodad.Use`, a period
+        // boundary): a doodad busy on another thread, or already deleted, is skipped.
+        let Some(_operation) = Operation::enter(&doodad) else {
+            waiting = true;
+            continue;
+        };
+        // One object-data lock at a time: copy the logged values out first.
+        let template_id = doodad.data().template_id;
+        let name = player.data().unit.name.clone();
         tracing::debug!(
             "SphereDoodadInteract {}: using doodad {} ({}) for {}",
             sphere_detail_id,
             doodad.obj_id,
-            doodad.data().template_id,
-            player.data().unit.name
+            template_id,
+            name
         );
-        let ctx = crate::systems::npcs::doodad::runtime::DoodadCtx::new(
-            server,
-            world.clone(),
-            doodad.clone(),
-        );
-        doodad.data().phase.to_next_phase = true;
-        crate::systems::npcs::doodad::phase::do_func(&ctx, Some(&caster), 0, Some(&func));
-        if doodad.data().phase.to_next_phase {
+        let ctx = DoodadCtx::new(server, world.clone(), doodad.clone());
+        // No pre-set: the `DoodadFuncAreaTrigger` arm alone decides (player caster, enter row,
+        // authored next phase), so a func that stops early cannot advance the doodad.
+        doodad.data().phase.to_next_phase = false;
+        if !do_func(&ctx, Some(&caster), 0, Some(&func)) {
+            // `do_func` moved the doodad to the authored next phase: run that phase's funcs and
+            // announce it, as `Doodad.Use` does after an advance.
             let next = doodad.data().func_group_id as i32;
-            crate::systems::npcs::doodad::phase::do_change_phase(&ctx, Some(&caster), next);
+            do_change_phase(&ctx, Some(&caster), next);
         }
+        doodad.data().phase.to_next_phase = false;
+        acted = true;
     }
+    acted || !waiting
 }
 
 /// `SphereQuestTrigger.Tick`: returns the new `LastCheckLocation` when the trigger ran.
