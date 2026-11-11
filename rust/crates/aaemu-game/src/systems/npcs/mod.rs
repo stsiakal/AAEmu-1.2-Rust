@@ -218,6 +218,7 @@ mod manager_tests;
 mod schedule_item_session_tests;
 #[cfg(test)]
 mod sharpwind_spawn_tests;
+mod sharpwind_doodad_tests;
 #[cfg(test)]
 mod spawn_tests;
 
