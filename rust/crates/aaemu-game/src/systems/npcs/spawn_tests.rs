@@ -406,6 +406,189 @@ async fn npc_spawn_death_despawn_respawn_timing() {
     drop(player);
 }
 
+/// `npc_spawners.save_indun = 't'` (the authored dungeon spawners, e.g. Sharpwind's slimes):
+/// a dead member stays dead for the instance run - no respawn deadline and no periodic refill.
+#[tokio::test]
+async fn save_indun_spawner_does_not_respawn_a_dead_member() {
+    let mut data = GameData::empty();
+    let mut t10 = template(10, 1);
+    t10.save_indun = true;
+    data.systems.npcs.npc_spawners = NpcSpawnerData::from_parts(
+        vec![template(1, 1), t10],
+        vec![member(1, 1, 1), member(100, 10, 500)],
+    )
+    .unwrap();
+    let server = Arc::new(test_server_with(data));
+    server.set_self();
+    *server.systems.npcs.spawns.test_backend.lock().unwrap() = Some(Arc::new(Backend));
+    let m = manager(&server);
+    assert_eq!(
+        m.add_npc_spawner(&server, npc_def(500, 500.0, 500.0)),
+        Ok(1)
+    );
+    let spawner = m
+        .get_all_spawners()
+        .values()
+        .flatten()
+        .next()
+        .unwrap()
+        .clone();
+    assert!(spawner.template().unwrap().save_indun);
+
+    let client = TestClient::new(&server, 1, 1);
+    let player = spawn_player(&server, &client, test_character(1, "P", 510.0, 500.0), 5000);
+    spawn_manager::active_region_tick(&server);
+    let world = server.world.world(0).unwrap();
+    let npcs = world.all_npcs();
+    assert_eq!(npcs.len(), 1);
+    let npc = npcs[0].clone();
+    {
+        let mut d = npc.data();
+        d.unit.hp = 0;
+        d.dead_time_ms = crate::world::now_ms();
+    }
+    spawn_manager::on_npc_died(&server, &npc);
+    assert!(
+        m.pending_respawns().is_empty(),
+        "save_indun must not schedule a respawn"
+    );
+    assert!(spawner.saved_death());
+
+    advance(11);
+    m.check_respawns_tick(&server);
+    spawn_manager::active_region_tick(&server);
+    assert!(
+        !world
+            .all_npcs()
+            .iter()
+            .any(|n| !n.data().unit.is_dead() && n.data().unit.template_id == 500),
+        "the periodic refill must not resurrect a save_indun member"
+    );
+
+    advance(20);
+    m.check_respawns_tick(&server);
+    spawn_manager::active_region_tick(&server);
+    spawner.do_spawn(&server);
+    assert!(
+        !world.all_npcs().iter().any(|n| !n.data().unit.is_dead()),
+        "a direct fill must stay frozen too"
+    );
+    drop(player);
+}
+
+/// [`server`] with a fresh world instance + spawn manager and a registered live `Dungeon`
+/// (`is_system` / `client_driven` as given). The placement uses template 10 (`save_indun =
+/// 'f'`), so only the run kind decides.
+fn instance_server(
+    id: u32,
+    is_system: bool,
+    client_driven: bool,
+) -> (Arc<GameServer>, Arc<WorldInstance>) {
+    let server = server();
+    let template = server
+        .game_data
+        .worlds
+        .get_world_template_by_id(0)
+        .unwrap()
+        .clone();
+    let world = server.world.create_world_instance(Arc::new(template), id);
+    crate::systems::instances::dungeon::register_test_dungeon(
+        &server,
+        &world,
+        is_system,
+        client_driven,
+    );
+    (server, world)
+}
+
+/// Spawns NPC 500 in `world`, kills it and returns (manager, spawner, world).
+fn kill_one_placement(
+    server: &Arc<GameServer>,
+    world: &Arc<WorldInstance>,
+) -> (Arc<SpawnManager>, Arc<NpcSpawner>) {
+    let m = server.systems.npcs.spawns.get_or_create(world);
+    assert_eq!(m.add_npc_spawner(server, npc_def(500, 500.0, 500.0)), Ok(1));
+    let spawner = m
+        .get_all_spawners()
+        .values()
+        .flatten()
+        .next()
+        .unwrap()
+        .clone();
+    assert!(spawner.is_placement());
+    assert!(!spawner.template().unwrap().save_indun);
+    spawner.do_spawn(server);
+    let npc = world.all_npcs().first().cloned().expect("spawned");
+    {
+        let mut d = npc.data();
+        d.unit.hp = 0;
+        d.dead_time_ms = crate::world::now_ms();
+    }
+    spawn_manager::on_npc_died(server, &npc);
+    (m, spawner)
+}
+
+/// A spawn-file placement inside a per-run dungeon stays dead even without `save_indun` (e.g.
+/// Sharpwind's Blackbeard assassin 11572, whose only spawner row is `save_indun = 'f'`): a 1.2
+/// dungeon run is one run, so its trash and bosses never respawn.
+#[tokio::test]
+async fn instance_placement_without_save_indun_stays_dead() {
+    let (server, world) = instance_server(100, false, false);
+    let (m, spawner) = kill_one_placement(&server, &world);
+    assert!(
+        m.pending_respawns().is_empty(),
+        "a dungeon-run placement must not schedule a respawn"
+    );
+    assert!(spawner.saved_death());
+
+    advance(11);
+    m.check_respawns_tick(&server);
+    spawner.do_spawn(&server);
+    assert!(
+        !world.all_npcs().iter().any(|n| !n.data().unit.is_dead()),
+        "neither the timer nor a refill may resurrect it"
+    );
+}
+
+/// A system / persistent instance (Mirage Isle, the Library wings, channels) keeps its normal
+/// respawn rules: it is not a one-run dungeon copy.
+#[tokio::test]
+async fn system_instance_placement_still_respawns() {
+    let (server, world) = instance_server(101, true, false);
+    let (m, spawner) = kill_one_placement(&server, &world);
+    assert_eq!(
+        m.pending_respawns().len(),
+        1,
+        "a system instance placement keeps its respawn deadline"
+    );
+    assert!(!spawner.saved_death());
+
+    advance(11);
+    m.check_respawns_tick(&server);
+    spawner.do_spawn(&server);
+    assert!(
+        world
+            .all_npcs()
+            .iter()
+            .any(|n| !n.data().unit.is_dead() && n.data().unit.template_id == 500),
+        "the system instance must respawn the NPC"
+    );
+}
+
+/// The client-driven prologue is a scripted solo instance, not a normal party dungeon run: its
+/// placements keep their respawn rules too.
+#[tokio::test]
+async fn client_driven_instance_placement_still_respawns() {
+    let (server, world) = instance_server(102, false, true);
+    let (m, spawner) = kill_one_placement(&server, &world);
+    assert_eq!(
+        m.pending_respawns().len(),
+        1,
+        "the prologue keeps its respawn deadline"
+    );
+    assert!(!spawner.saved_death());
+}
+
 #[tokio::test]
 async fn fully_looted_corpse_uses_shortened_deadline_and_respawn_keeps_its_own_timer() {
     use crate::data::items::ITEM_COINS;
@@ -3395,6 +3578,311 @@ fn quest_fill_npcs_reach_the_area_spawner_minimum() {
         7,
         "Bloodhand stragglers (quest 4207)"
     );
+}
+
+/// The kill-quest areas of the 2026-11-11 tester reports after the second fill. Each area's
+/// `npc_spawns_quest_fill.json` points bring the spawn points of its area spawner members to the
+/// spawner's authored `min_population` (and not above its `maxPopulation` where the fill applied).
+/// Points are counted within 350 m of the area centre, distinct per template (the loader drops
+/// rows of the same template within 2 m, so the stacked Schima Rogue rows count once). Four areas
+/// already held their `min_population` and were left alone: the Poacher 2514 camp (4 >= 4), the
+/// Wild Fangs Poacher 9201 camp (5 points, already above its max 3) and the Pavitra's Fall site
+/// 12814 (15 = min; its Death Shroud 2906 share is 3 of the authored mix, so quest 943's 8 kills
+/// wait on the 75 s respawn).
+#[test]
+fn quest_fill_reported_areas_reach_the_area_spawner_minimum() {
+    use crate::systems::npcs::doodad::spawner::{parse_list, NpcSpawnerDef};
+
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("app/Data/Worlds/main_world");
+    let mut points: Vec<(u32, f32, f32, f32)> = Vec::new();
+    for file in [
+        "npc_spawns.json",
+        "npc_spawns_10x.json",
+        "npc_spawns_quest_fill.json",
+    ] {
+        let Ok(text) = std::fs::read_to_string(dir.join(file)) else {
+            return;
+        };
+        for d in parse_list(&text, NpcSpawnerDef::from_json).expect(file) {
+            let p = d.base.position;
+            points.push((d.base.unit_id, p.x, p.y, p.z));
+        }
+    }
+    let near = |units: &[u32], x: f32, y: f32| {
+        let mut seen: Vec<(u32, f32, f32, f32)> = Vec::new();
+        for &(unit, px, py, pz) in &points {
+            if !units.contains(&unit) || (px - x).hypot(py - y) > 350.0 {
+                continue;
+            }
+            if seen.iter().any(|&(su, sx, sy, sz)| {
+                su == unit
+                    && (sx - px).abs() < 2.0
+                    && (sy - py).abs() < 2.0
+                    && (sz - pz).abs() < 2.0
+            }) {
+                continue;
+            }
+            seen.push((unit, px, py, pz));
+        }
+        seen.len()
+    };
+    // (spawner, min, max, whether this fill changed the area, members, centre, report item)
+    type Area = (
+        u32,
+        usize,
+        usize,
+        bool,
+        &'static [u32],
+        f32,
+        f32,
+        &'static str,
+    );
+    let areas: [Area; 11] = [
+        (
+            8778,
+            11,
+            15,
+            true,
+            &[4210],
+            23829.6,
+            9473.4,
+            "Schima Rogue, quests 1367/2758/2759",
+        ),
+        (
+            5588,
+            4,
+            7,
+            false,
+            &[2514],
+            20090.4,
+            8364.9,
+            "Poacher, quests 861/2703",
+        ),
+        (
+            12808,
+            2,
+            3,
+            false,
+            &[9201],
+            19886.1,
+            8649.6,
+            "Wild Fangs Poacher, quest 3307",
+        ),
+        (
+            5585,
+            7,
+            12,
+            true,
+            &[2509, 2510],
+            18581.4,
+            7660.4,
+            "Mahadevi Seabug / Tropical Turtle, quests 2711/2902",
+        ),
+        (
+            12814,
+            15,
+            21,
+            false,
+            &[2905, 2906, 2907, 2953],
+            17178.5,
+            8356.8,
+            "Pavitra's Fall site, quests 943/951/2770",
+        ),
+        (
+            7933,
+            5,
+            9,
+            true,
+            &[2952],
+            17195.2,
+            8022.3,
+            "Fire Elemental Explorer, quest 3862",
+        ),
+        (
+            4131,
+            24,
+            40,
+            true,
+            &[2914],
+            16561.5,
+            7965.7,
+            "Earth Elemental Seeker, quest 2774",
+        ),
+        (
+            4130,
+            9,
+            15,
+            true,
+            &[9924],
+            16325.5,
+            8451.7,
+            "Ghostly Soldier, quest 3866",
+        ),
+        (
+            4128,
+            14,
+            20,
+            true,
+            &[2911],
+            16902.2,
+            7347.2,
+            "Armored Crayfish, quest 3861",
+        ),
+        (
+            4138,
+            12,
+            20,
+            true,
+            &[2942],
+            16359.8,
+            7649.6,
+            "Saffron Thief, quests 947/2776",
+        ),
+        (
+            5255,
+            9,
+            15,
+            true,
+            &[5090],
+            22892.8,
+            10869.4,
+            "Crazed Disciple, quest 1415",
+        ),
+    ];
+    for (spawner, min, max, filled, units, x, y, what) in areas {
+        let count = near(units, x, y);
+        assert!(
+            count >= min,
+            "spawner {spawner} {what}: {count} points within 350 m, min_population {min}"
+        );
+        if filled {
+            assert!(
+                count <= max,
+                "spawner {spawner} {what}: {count} points within 350 m, max_population {max}"
+            );
+        }
+    }
+}
+
+/// The 2026-11-11 world-wide fill must not put two NPCs of an area on top of each other. The
+/// loader scatters an NPC that would spawn on another live NPC only onto a 1.5-3 m ring
+/// (`stacked_npcs::scatter_position`), so a fill point closer than the documented 8 m minimum to
+/// another fill point or to an authored point of its area is still a stacked spawn in practice.
+/// The first version of the fill left Giant Direwolf 1009 on Shadowhawk Assassin 8937, Mahadevi
+/// Gorilla 9375 on Elephant 9378, and Cruel Overseer 1579 on its camp members; this test pins the
+/// regenerated points of all 43 areas, their per-template counts, and the 8 m spacing (X/Y).
+#[test]
+fn quest_fill_points_keep_eight_metres_from_each_other_and_the_authored_points() {
+    use crate::systems::npcs::doodad::spawner::{parse_list, NpcSpawnerDef};
+
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("app/Data/Worlds/main_world");
+    let mut authored: Vec<(u32, f32, f32)> = Vec::new();
+    let mut fill: Vec<(u32, f32, f32)> = Vec::new();
+    for file in ["npc_spawns.json", "npc_spawns_10x.json"] {
+        let text = std::fs::read_to_string(dir.join(file)).expect(file);
+        for d in parse_list(&text, NpcSpawnerDef::from_json).expect(file) {
+            let p = d.base.position;
+            authored.push((d.base.unit_id, p.x, p.y));
+        }
+    }
+    let text = std::fs::read_to_string(dir.join("npc_spawns_quest_fill.json"))
+        .expect("npc_spawns_quest_fill.json");
+    let fill_defs = parse_list(&text, NpcSpawnerDef::from_json).expect("fill file");
+    // (centre X, centre Y, area member templates, fill points per member)
+    let areas: [(f32, f32, &[u32], &[usize]); 43] = [
+        (26507.38, 6533.56, &[8932], &[17]),
+        (23926.48, 6546.64, &[8924], &[10]),
+        (24834.87, 6623.12, &[1009, 8937], &[4, 4]),
+        (29256.24, 7246.86, &[9712], &[1]),
+        (17207.85, 7273.70, &[2908], &[8]),
+        (16902.19, 7347.15, &[2911], &[13]),
+        (24271.67, 7532.54, &[1005], &[7]),
+        (16359.76, 7649.60, &[2942], &[11]),
+        (18581.35, 7660.44, &[2509, 2510], &[1, 0]),
+        (16561.46, 7965.66, &[2914], &[16]),
+        (17195.2, 8022.28, &[2952], &[3]),
+        (16373.63, 8234.48, &[9888], &[5]),
+        (9077.52, 8435.88, &[9375, 9378], &[7, 6]),
+        (16325.51, 8451.69, &[9924], &[8]),
+        (8961.54, 8456.24, &[9379], &[3]),
+        (22980.42, 8950.27, &[4198], &[1]),
+        (9086.47, 9141.55, &[9391], &[5]),
+        (10286.75, 9283.12, &[9408], &[6]),
+        (23829.57, 9473.38, &[4210], &[9]),
+        (9583.21, 9738.76, &[9412, 9414], &[3, 2]),
+        (25972.43, 9771.77, &[1288], &[7]),
+        (12788.93, 10289.86, &[1620, 1621], &[4, 3]),
+        (12612.1, 10321.03, &[8087], &[5]),
+        (12861.5, 10763.69, &[1613, 1762], &[3, 2]),
+        (12336.09, 10800.56, &[1579, 1782, 7955], &[3, 3, 3]),
+        (22892.79, 10869.4, &[5090], &[8]),
+        (14429.13, 11018.75, &[2348, 2366], &[2, 2]),
+        (12870.74, 11209.38, &[8200, 8201], &[1, 1]),
+        (13482.94, 11257.46, &[8084], &[5]),
+        (23407.97, 11262.69, &[3109, 3110], &[14, 3]),
+        (12279.29, 11327.75, &[8002, 8003, 8005, 8006], &[1, 0, 0, 0]),
+        (10994.95, 11528.9, &[534, 535], &[7, 6]),
+        (13535.76, 11626.08, &[8089], &[8]),
+        (12831.75, 11660.22, &[1596], &[6]),
+        (12271.48, 11696.2, &[7995, 7996], &[4, 3]),
+        (10864.08, 11733.22, &[533], &[4]),
+        (14448.22, 11855.96, &[2330], &[17]),
+        (12628.78, 11965.39, &[7774], &[10]),
+        (20381.29, 11987.23, &[10743], &[1]),
+        (15109.13, 12240.38, &[2336], &[9]),
+        (11762.92, 12889.13, &[789], &[1]),
+        (10878.06, 17038.1, &[1990], &[4]),
+        (11936.57, 17847.24, &[1998], &[3]),
+    ];
+    let members: HashSet<u32> = areas
+        .iter()
+        .flat_map(|(_, _, members, _)| members.iter().copied())
+        .collect();
+    for d in &fill_defs {
+        let p = d.base.position;
+        if members.contains(&d.base.unit_id) {
+            fill.push((d.base.unit_id, p.x, p.y));
+        } else {
+            // The upstream fill (before the 2026-11-11 fill) is authored data of its areas.
+            authored.push((d.base.unit_id, p.x, p.y));
+        }
+    }
+    for (ax, ay, area_members, expected) in areas {
+        let in_area = |x: f32, y: f32| (x - ax).hypot(y - ay) <= 350.0;
+        let area_fill: Vec<(u32, f32, f32)> = fill
+            .iter()
+            .copied()
+            .filter(|(unit, x, y)| area_members.contains(unit) && in_area(*x, *y))
+            .collect();
+        let area_authored: Vec<(u32, f32, f32)> = authored
+            .iter()
+            .copied()
+            .filter(|(_, x, y)| in_area(*x, *y))
+            .collect();
+        for (i, (unit, x, y)) in area_fill.iter().enumerate() {
+            for (other, ox, oy) in &area_fill[i + 1..] {
+                let d = (x - ox).hypot(y - oy);
+                assert!(
+                    d >= 8.0,
+                    "fill points of {unit} and {other} at ({x}, {y}) / ({ox}, {oy}) are {d:.2} m apart"
+                );
+            }
+            for (other, ox, oy) in &area_authored {
+                let d = (x - ox).hypot(y - oy);
+                assert!(
+                    d >= 8.0,
+                    "fill point of {unit} at ({x}, {y}) is {d:.2} m from authored point of {other} at ({ox}, {oy})"
+                );
+            }
+        }
+        for (unit, count) in area_members.iter().zip(expected) {
+            let got = area_fill.iter().filter(|(u, _, _)| u == unit).count();
+            assert_eq!(
+                got, *count,
+                "fill points of {unit} in the area around ({ax}, {ay})"
+            );
+        }
+    }
 }
 
 /// The authored Mistfiend (NPC 4227) cave placements of the shipped `main_world` files with the
