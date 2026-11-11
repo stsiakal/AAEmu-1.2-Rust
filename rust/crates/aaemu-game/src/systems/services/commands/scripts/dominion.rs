@@ -327,7 +327,12 @@ impl Command for Dominion {
         let manager = &server.systems.housing.dominions;
         if args.is_empty() || args[0] == "info" {
             let now = chrono::Utc::now().timestamp();
-            for state in manager.all() {
+            let states = manager.all();
+            if states.is_empty() {
+                CommandManager::send_normal_text(self, out, "No dominions.");
+                return Ok(());
+            }
+            for state in states {
                 let calendar = crate::systems::social::dominion::snapshot(server, &state, now)
                     .map(|data| {
                         (
@@ -700,6 +705,14 @@ mod tests {
     const ZONE: u32 = 25;
     const DEFENSE_SEAL: u32 = 21313;
     const OFFENSE_SEAL: u32 = 21317;
+
+    #[tokio::test]
+    async fn info_without_dominions_says_so() {
+        let server = harness::server();
+        let gm = harness::pc(&server, 1, "Gm", 100.0, 100.0);
+        let (_, out) = harness::run(&server, &gm.p, "dominion info").await;
+        assert_eq!(out, [harness::normal("dominion", "No dominions.")]);
+    }
 
     struct Fixture {
         server: Arc<GameServer>,
