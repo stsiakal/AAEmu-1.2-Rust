@@ -84,9 +84,10 @@ pub struct Doodad {
     pub puzzle_group: i32,
     /// `Spawner?.Id` (0 = none).
     pub spawner_id: u32,
-    /// Level-design logic family id of this placement (the 1.2 client level editor's
-    /// `doodad.xml` `Family_Id`, e.g. Sharpwind's 50001-50008; 0 = none). `DoodadFuncPulse` /
-    /// `DoodadFuncLogic` address other doodads by it (see `systems::npcs::doodad::logic`).
+    /// Level-design logic family id of this placement (the `Family_Id` of the 10.x client level
+    /// editor's `doodad.xml`, `ArcheAge Returns` r575; not in r208022 / r223748; e.g.
+    /// Sharpwind's 50001-50008; 0 = none). `DoodadFuncPulse` / `DoodadFuncLogic` address other
+    /// doodads by it (see `systems::npcs::doodad::logic`).
     pub family_id: u32,
     /// `(world id, spawn key)` of a world-spawned doodad whose growth state is persisted in
     /// `doodad_spawn_states` (`systems::npcs::doodad::natural`); `None` = not tracked.
@@ -351,10 +352,12 @@ pub struct DoodadPhaseState {
     /// cannot emit.
     pub pending_output: Option<bool>,
     pub pending_output_generation: u64,
-    /// `DoodadFuncPulseTrigger` rows (func ids) that already fired in this phase; cleared when
-    /// the phase changes. The C# `PulseTriggered` lived on the shared func list (a port bug);
-    /// here it is per doodad so instances of one template do not suppress each other.
-    pub pulse_triggered: std::collections::HashSet<u32>,
+    /// The flag this doodad's own `DoodadFuncPulse` sent during the current phase entry (`None` =
+    /// nothing sent): a `DoodadFuncPulseTrigger` of the same group fires only on a pulse of its
+    /// own flag. Reset at the start of every phase entry (`phase::do_phase_funcs`); no shipped
+    /// group has two `DoodadFuncPulse` rows. Replaces the C# `PulseTriggered`, which lived on the
+    /// shared func list (one doodad's trigger suppressed every instance of the template).
+    pub pulsed: Option<bool>,
     /// `ToNextPhase`.
     pub to_next_phase: bool,
     /// A `DoodadFuncLootItem` row missed its percent roll during the current `Use` pass.

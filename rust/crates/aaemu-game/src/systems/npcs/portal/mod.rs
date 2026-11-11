@@ -1003,7 +1003,7 @@ pub fn use_portal_with_preference(
     } else {
         player.data().set_disabled_set_position(true);
     }
-    crate::world::session::send_teleport_unit(
+    crate::world::session::send_teleport_unit_ending_trade(
         server,
         player,
         SCTeleportUnitPacket {
@@ -1020,7 +1020,16 @@ pub fn use_portal_with_preference(
 /// `WorldManager.ResendVisibleObjectsToCharacter(character)`: every object of the neighbouring
 /// regions is shown again (`AddVisibleObject(character)`); doodads are batched into
 /// `SCDoodadsCreatedPacket`s.
+///
+/// Every caller is a client world wipe (cut-scene end, teleport ended, in-place zone load), which
+/// also drops the far quest-map markers; this repaint covers only the neighbourhood, so the
+/// quest-map range option is told to stream its markers again.
 pub fn resend_visible_objects_to_character(server: &GameServer, player: &PlayerRef) {
+    server
+        .systems
+        .quests
+        .quest_map
+        .client_world_reset(player.character_id);
     let instance_id = player.data().unit.transform.instance_id;
     let Some(world) = server.world.world(instance_id) else {
         return;
@@ -1167,7 +1176,7 @@ pub fn navi_teleport(server: &GameServer, player: &PlayerRef, obj_id: u32) {
         return;
     }
     run_navi_func(server, &doodad, player, &func);
-    session::begin_teleport(server, player, pos.x, pos.y, pos.z);
+    session::begin_teleport_ending_trade(server, player, pos.x, pos.y, pos.z);
     player.send(packets::SCNaviTeleportPacket {
         x: pos.x,
         y: pos.y,
@@ -1280,7 +1289,7 @@ pub fn use_teleport(
             return; // NotEnoughMoney is sent by ChangeMoney
         }
     }
-    crate::world::session::send_teleport_unit(
+    crate::world::session::send_teleport_unit_ending_trade(
         server,
         player,
         SCTeleportUnitPacket {
