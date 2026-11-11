@@ -4888,6 +4888,66 @@ is no longer mirrored (see "Known deviations", dead NPC returned and healed).
   pulse_triggers_require_matching_signal_and_do_not_affect_other_objects}`,
   `npcs::spawn_tests::real_data_sharpwind_water_network_placements` and (gated by
   `AAEMU_COMPACT_DB`) `doodad::phase::tests::real_compact_db_sharpwind_water_network_rows`.
+* systems::npcs (start-active spawners / Sharpwind NPC spawn data, 2026-11-11): a plain
+  `npc_spawns.json` row (no `NpcSpawnerIds`) expands into **every** game-data spawner that lists
+  the NPC as a member (`SpawnManager::AddNpcSpawner` / `get_spawner_ids`), and neither the C#
+  nor the Rust read `npc_spawners.activation_state`. So the event-only Sharpwind spawners and
+  the cutscene actors were created at instance start: Nerta 11362/12146 and Okape 12188 existed
+  from t=0 (their OnSpawn skills fired with nobody there), the slimes 11361 and the researchers
+  12153/12155 stood in the instance, and Alistair 12108/12109 spawned twice (the regular
+  spawners 13382-13386 plus the cutscene actors 13387/13388 at the same place). **Deviation
+  from the C# (narrow rule, `spawn_manager::spawner_skip`):** a plain row skips (a) a category-0
+  (`NORMAL`) spawner whose name or comment carries the level editor's `연출` ("staging") marker
+  in **every** world (cutscene actors), and (b) an `activation_state = 'f'` spawner **only in
+  `instance_*` worlds except `instance_library`**. Event rows (`NpcSpawnerIds`) still register
+  their spawner for the effect, and nothing else changes. **Why not global (review, 2026-11-11):**
+  'f' does not mean "absent at start" in 1.2. The removed C# never gated spawning on it, and the
+  open worlds prove it: `arche_mall_world`'s 42 rows are all-'f' always-present vendors
+  (Wardrobe Stylist 13639, Fairmoon Clerks 13642/13644/13646, Veroe Weapons Dealer 13645,
+  Premium Potion Merchant 14068, ...), `racing_test_world` has the same 48, and `main_world`'s
+  247 all-'f' rows include quest givers (Liteia 13559, Baron Alfonso 13560, Bard Pagos 13561,
+  Pavitra's Spirit 10393, Arcane Soul 13725, Century Root 7152, the three Alliance
+  Quartermasters 13649/13652/13663 and the five capital Arena Managers 13792). A global rule
+  emptied the two mall worlds and removed those `main_world` NPCs. `instance_library` is
+  excluded too: its activating indun action is `IndunActionNpcSpawner`, which only logs in the
+  C# and here, only 3 of its 49 'f' spawner ids carry a `game_schedule_spawners` binding, and
+  no `npc_spawner_spawn_effects` / `quest_components.npc_spawner_id` row names the other 46, so
+  skipping would leave the whole dungeon without its 143 all-'f' rows. The `'f'` part of the
+  rule is direct in Sharpwind (its event spawners are activated by `NpcSpawnerSpawnEffect`
+  skills that name the spawner id, e.g. Vera's death effect 24094 -> 94694, which is tested);
+  the other instance worlds mark the skipped rows `비활성_...` ("inactive") but their indun
+  scripts are not implemented yet (`IndunActionNpcSpawner` only logs), so skipping keeps them
+  dormant instead of standing in the instance until those scripts arrive. That retail also
+  starts these spawners inactive is **Inferred** (no 1.2 server capture). Caveat for later:
+  `instance_training_camp`'s Red/Blue Army Defense Cannons 13347/13348 (4 rows),
+  `instance_burntcastle_armory`'s Bloodhand Watcher 3086, `instance_nachashgar`'s Jehsen 14413
+  and `instance_immortal_isle`'s Bloated Corpse 13713 are not named by any spawn effect,
+  schedule or quest component either; if they turn out to be permanent they need an explicit
+  exception (the review flagged the cannons as probably permanent battlefield defences).
+  **Open item (reported, not changed):** `get_spawner_ids` is keyed by `member_id` only (the C#
+  behaviour), so 7 `main_world` rows also expand into `"NpcGroup"` spawners whose group id
+  collides with the NPC id (NPC 42 -> 9129, NPC 45 -> 3832); filtering by `member_type` is a
+  separate fix. The gated real-data test counts every skipped expansion per world: `main_world`
+  0 'f' / 4 cutscene (spawner 3709 뱀의틈연출), `arche_mall_world` 0/0, `racing_test_world` 0/0,
+  `instance_library` 0/0, Sharpwind 0 'f' / 9 cutscene (the Alistair and trigger cutscene
+  actors; every Sharpwind plain row keeps a spawner), `instance_hadir_farm` 102 'f' / 0,
+  `instance_nachashgar` 9/0, `instance_cradle_of_destruction` 5/0, `instance_training_camp` 4/0
+  (4 rows with no spawner left), `instance_burntcastle_armory` 2/3, `instance_immortal_isle`
+  and `_easy` 1/0 each, the remaining instances 0/0.
+  **Sharpwind data (`npc_spawns.json`):** removed the plain rows of 11362 x2 (Nerta boss),
+  11361 x16 (slimes), 12188 (Okape), 12146 (cutscene Nerta), 12153 x4 / 12155 (researchers,
+  now spawned by the trigger spheres) and the 3 stray 11106 rows at (199.8, 180.4, ...);
+  added the 7 invisible "Spawn Slave" trigger NPCs 12113-12119 and the 32 level-placement event
+  rows (`NpcSpawnerIds` = the level's `spawnerId`, e.g. Vera's death effect 24094 -> 94694 for
+  the boss Nerta). **Inferred (10.x level, 1.2 templates):** the added placement positions
+  (`npc_spawners.g` `spawnerId`/`spawnerType` of zone 262). Tests (new module
+  `npcs::sharpwind_spawn_tests`): `plain_rows_skip_cutscene_everywhere_and_inactive_at_start_in_dungeons`
+  (CI) and (gated by `AAEMU_COMPACT_DB`)
+  `real_data_sharpwind_instance_creation_spawns_the_authored_npcs`,
+  `real_data_sharpwind_vera_effect_spawns_one_nerta`,
+  `real_data_start_active_rule_counts_per_world` and
+  `real_data_open_worlds_keep_inactive_at_start_npcs` (guards the mall vendors and the
+  `main_world` quest givers).
 * systems::npcs (Sharpwind scripted doodad placements, 2026-11-11): the scripted doodads of the
   Nerta door chain (spec item 5), the two powder-keg rock walls (items 6 and 9), the stalactite
   corridor (item 10) and the Okape exit / secret chest / attack ban (item 12) are now placed in
