@@ -666,6 +666,10 @@ pub(crate) fn is_retryable_transaction_error(error: &sqlx::Error) -> bool {
 /// Runs `op` again while MySQL rolls it back with a deadlock / lock wait timeout, up to
 /// `max_attempts` calls in total. Both errors roll the whole statement back, so `op` merely
 /// repeats the same write; a short pause lets the other transaction finish.
+///
+/// Only for **autocommit single statements** on the pool: inside an open transaction 1213 has
+/// rolled back the whole transaction and 1205 only the last statement, so repeating one
+/// statement there would silently lose the earlier ones.
 async fn retry_transaction<T, F, Fut>(max_attempts: u32, mut op: F) -> sqlx::Result<T>
 where
     F: FnMut() -> Fut,
@@ -687,20 +691,25 @@ where
     }
 }
 
-/// Attempts per `add_divine_clock_time` statement: the periodic save holds `accounts` rows for
-/// up to a few seconds, so two quick retries are enough to outlast it.
+/// Attempts per `add_divine_clock_time` statement (the first call plus two retries). A retried
+/// statement does not need to outlast the periodic save: it blocks inside MySQL on the rows the
+/// save still holds until the save commits (up to `innodb_lock_wait_timeout`, then 1205 and the
+/// next attempt). The retry only recovers the statement from a rollback.
 const ADD_DIVINE_CLOCK_ATTEMPTS: u32 = 3;
 
 /// Adds `delta` seconds to the divine clock of every account in `account_ids` with one atomic
 /// statement. `divine_clock_time` is `INT UNSIGNED`: the sum saturates at `u32::MAX` instead of
 /// wrapping like the C# `uint` (a strict-mode overflow would otherwise fail the whole batch).
 ///
-/// The ids are written in ascending order because InnoDB locks the rows of
-/// `WHERE account_id IN (...)` in primary-key order. The periodic save flushes one
-/// `accounts.labor` row per character (ordered by account id in `SaveManager`); a save and this
-/// 5 s online-tracking statement that take the rows in opposite orders deadlock (MySQL 1213),
-/// which rolled these clock updates back on the cloud bot server. A deadlock whose victim is
-/// this statement is retried, so the sample is not lost.
+/// InnoDB locks the rows of `WHERE account_id IN (...)` in primary-key order whatever the bind
+/// order, so sorting the ids here only makes the statement deterministic (and the dedup removes
+/// a duplicate id that would make the per-account lock in `services/accounts.rs` wait on
+/// itself). The lock-order fix proper is in `SaveManager`: the periodic save flushes one
+/// `accounts.labor` row per character, now ordered by account id, so the save and this 5 s
+/// online-tracking statement take the rows in the same order. Before that they could take them
+/// in opposite orders and deadlock (MySQL 1213), which rolled these clock updates back on the
+/// cloud bot server. A deadlock whose victim is this statement is retried, so the sample is not
+/// lost.
 pub async fn add_divine_clock_time(pool: &MySqlPool, account_ids: &[u32], delta: u32) {
     if account_ids.is_empty() || delta == 0 {
         return;
@@ -794,78 +803,6 @@ pub async fn load_login_characters(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Test-server accounts get their starting Credits/Loyalty from the `Credits.Default` /
-    /// `Loyalty.Default` configuration (the shipped values are 0). The game creates the account
-    /// row on first login, so the grant happens exactly once per account; a later login reads
-    /// the stored values and never adds them again. Gated by `AAEMU_TEST_MYSQL` and using a
-    /// connection-local temporary `accounts` table, so no persisted data is touched.
-    #[tokio::test]
-    #[ignore = "requires private MySQL3317 via AAEMU_TEST_MYSQL; uses a connection-local accounts table"]
-    async fn private_mysql_first_login_grants_starting_credits_once() {
-        use std::str::FromStr;
-
-        use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
-
-        let Ok(url) = std::env::var("AAEMU_TEST_MYSQL") else {
-            return;
-        };
-        let options = MySqlConnectOptions::from_str(&url).expect("valid private MySQL URL");
-        assert_eq!(
-            options.get_port(),
-            3317,
-            "Only private MySQL3317 is allowed"
-        );
-        assert!(matches!(options.get_host(), "127.0.0.1" | "localhost"));
-        let pool = MySqlPoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .unwrap();
-        sqlx::query(
-            "CREATE TEMPORARY TABLE accounts ( \
-                 account_id INT NOT NULL PRIMARY KEY, \
-                 access_level INT NOT NULL DEFAULT 0, \
-                 labor SMALLINT NOT NULL DEFAULT 0, \
-                 credits INT NOT NULL DEFAULT 0, \
-                 loyalty INT NOT NULL DEFAULT 0, \
-                 last_updated DATETIME NULL, last_login DATETIME NULL, \
-                 last_labor_tick DATETIME NULL, last_credits_tick DATETIME NULL, \
-                 last_loyalty_tick DATETIME NULL, last_daily_reward DATETIME NULL, \
-                 loyalty_hour_day INT NOT NULL DEFAULT 0, \
-                 loyalty_hour_seconds INT NOT NULL DEFAULT 0, \
-                 loyalty_hour_taken INT NOT NULL DEFAULT 0, \
-                 loyalty_hour_updated DATETIME NULL, \
-                 pay_method INT NOT NULL DEFAULT 0, pay_location INT NOT NULL DEFAULT 0, \
-                 pay_start BIGINT NOT NULL DEFAULT 0, pay_end BIGINT NOT NULL DEFAULT 0, \
-                 premium_point INT NOT NULL DEFAULT 0)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let mut config = AppConfig::default();
-        config.credits.default = 1_000_000;
-        config.loyalty.default = 5_000;
-
-        // First login: the insert runs and stores the configured starting values. The C# return
-        // value of this call keeps the all-zero defaults, so read the row back.
-        let first = try_get_account_details(&pool, &config, 4242).await.unwrap();
-        assert_eq!(first.credits, 0);
-        let (credits, loyalty): (i32, i32) =
-            sqlx::query_as("SELECT credits, loyalty FROM accounts WHERE account_id = 4242")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!((credits, loyalty), (1_000_000, 5_000));
-
-        // Later logins must not grant them again.
-        for _ in 0..2 {
-            let again = try_get_account_details(&pool, &config, 4242).await.unwrap();
-            assert_eq!(again.credits, 1_000_000);
-            assert_eq!(again.loyalty, 5_000);
-        }
-    }
 
     #[derive(Debug)]
     struct TestDatabaseError(&'static str);
@@ -1179,5 +1116,77 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+    }
+
+    /// Test-server accounts get their starting Credits/Loyalty from the `Credits.Default` /
+    /// `Loyalty.Default` configuration (the shipped values are 0). The game creates the account
+    /// row on first login, so the grant happens exactly once per account; a later login reads
+    /// the stored values and never adds them again. Gated by `AAEMU_TEST_MYSQL` and using a
+    /// connection-local temporary `accounts` table, so no persisted data is touched.
+    #[tokio::test]
+    #[ignore = "requires private MySQL3317 via AAEMU_TEST_MYSQL; uses a connection-local accounts table"]
+    async fn private_mysql_first_login_grants_starting_credits_once() {
+        use std::str::FromStr;
+
+        use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
+
+        let Ok(url) = std::env::var("AAEMU_TEST_MYSQL") else {
+            return;
+        };
+        let options = MySqlConnectOptions::from_str(&url).expect("valid private MySQL URL");
+        assert_eq!(
+            options.get_port(),
+            3317,
+            "Only private MySQL3317 is allowed"
+        );
+        assert!(matches!(options.get_host(), "127.0.0.1" | "localhost"));
+        let pool = MySqlPoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TEMPORARY TABLE accounts ( \
+                 account_id INT NOT NULL PRIMARY KEY, \
+                 access_level INT NOT NULL DEFAULT 0, \
+                 labor SMALLINT NOT NULL DEFAULT 0, \
+                 credits INT NOT NULL DEFAULT 0, \
+                 loyalty INT NOT NULL DEFAULT 0, \
+                 last_updated DATETIME NULL, last_login DATETIME NULL, \
+                 last_labor_tick DATETIME NULL, last_credits_tick DATETIME NULL, \
+                 last_loyalty_tick DATETIME NULL, last_daily_reward DATETIME NULL, \
+                 loyalty_hour_day INT NOT NULL DEFAULT 0, \
+                 loyalty_hour_seconds INT NOT NULL DEFAULT 0, \
+                 loyalty_hour_taken INT NOT NULL DEFAULT 0, \
+                 loyalty_hour_updated DATETIME NULL, \
+                 pay_method INT NOT NULL DEFAULT 0, pay_location INT NOT NULL DEFAULT 0, \
+                 pay_start BIGINT NOT NULL DEFAULT 0, pay_end BIGINT NOT NULL DEFAULT 0, \
+                 premium_point INT NOT NULL DEFAULT 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut config = AppConfig::default();
+        config.credits.default = 1_000_000;
+        config.loyalty.default = 5_000;
+
+        // First login: the insert runs and stores the configured starting values. The C# return
+        // value of this call keeps the all-zero defaults, so read the row back.
+        let first = try_get_account_details(&pool, &config, 4242).await.unwrap();
+        assert_eq!(first.credits, 0);
+        let (credits, loyalty): (i32, i32) =
+            sqlx::query_as("SELECT credits, loyalty FROM accounts WHERE account_id = 4242")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!((credits, loyalty), (1_000_000, 5_000));
+
+        // Later logins must not grant them again.
+        for _ in 0..2 {
+            let again = try_get_account_details(&pool, &config, 4242).await.unwrap();
+            assert_eq!(again.credits, 1_000_000);
+            assert_eq!(again.loyalty, 5_000);
+        }
     }
 }
