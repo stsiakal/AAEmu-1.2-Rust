@@ -189,11 +189,7 @@ fn range_damage_multiplier(
     if let Some(stored) = source.range_multiplier {
         return stored;
     }
-    let Some(skill_id) = source
-        .skill()
-        .map(|s| s.template.id)
-        .or(source.source_skill_id)
-    else {
+    let Some(skill_id) = source.skill().map(|s| s.template.id) else {
         return 1.0;
     };
     range_multiplier_for_skill(server, caster, trg, skill_id)
@@ -933,6 +929,14 @@ pub(super) fn damage_with_aoe(
             .ext
             .npcs()
             .npc_damage_received(server, n, &caster, value);
+    }
+    // 10.x aggro-link guard help (Z:823528-823950) runs on the victim's hostile-aggro event.
+    // An NPC victim reaches it from its own AI (`update_aggro_help`); players, mates and slaves
+    // have no victim AI, so the damage applies it here (the caller-side gate re-checks
+    // `system_factions.guard_help` before scanning around the victim). Misses, immunity and
+    // other no-damage paths returned above, and a zero hit never pulls a guard.
+    if trg.as_npc().is_none() && value > 0 {
+        crate::systems::ai::behaviors::update_guard_help(server, &trg, &caster);
     }
     buffs::fire_unit_event(server, caster.obj_id(), BuffEventTriggerKind::Attack, 0);
     buffs::fire_unit_event(server, trg.obj_id(), BuffEventTriggerKind::Attacked, value);
