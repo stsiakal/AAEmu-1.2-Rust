@@ -49,6 +49,8 @@ mod sphere_doodad_tests;
 #[cfg(test)]
 mod sphere_fill_tests;
 #[cfg(test)]
+mod sphere_skill_tests;
+#[cfg(test)]
 mod tests;
 
 use std::collections::{HashMap, HashSet, VecDeque};
