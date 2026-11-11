@@ -13,7 +13,9 @@ use crate::systems::npcs::area_trigger::{AreaShape, AREA_SHAPE_CUBOID};
 use crate::systems::npcs::doodad::data::DoodadData;
 use crate::systems::npcs::doodad::logic;
 use crate::systems::npcs::doodad::manager;
-use crate::systems::npcs::doodad::spawner::{DoodadSpawner, DoodadSpawnerDef, SpawnerBase};
+use crate::systems::npcs::doodad::spawner::{
+    parse_list, DoodadSpawner, DoodadSpawnerDef, SpawnerBase,
+};
 use crate::systems::npcs::doodad::templates::*;
 use crate::test_support::*;
 use crate::world::{PlayerRef, WorldInstance};
@@ -312,6 +314,16 @@ fn ratio_respawn(id: u32, ratio: i32, spawn_doodad_id: u32) -> FuncTemplate {
 /// A real spawner for `unit_id` in the test world; `id > 0` because `RatioRespawn` ignores
 /// spawners without an index.
 fn new_spawner(unit_id: u32, id: u32) -> Arc<DoodadSpawner> {
+    new_spawner_with(unit_id, id, None, 0)
+}
+
+/// [`new_spawner`] with the spawn row's `RelatedIds` and `FamilyId`.
+fn new_spawner_with(
+    unit_id: u32,
+    id: u32,
+    related_ids: Option<Vec<u32>>,
+    family_id: u32,
+) -> Arc<DoodadSpawner> {
     Arc::new(DoodadSpawner::new(
         DoodadSpawnerDef {
             base: SpawnerBase {
@@ -329,8 +341,8 @@ fn new_spawner(unit_id: u32, id: u32) -> Arc<DoodadSpawner> {
             },
             scale: 1.0,
             count: 1,
-            related_ids: None,
-            family_id: 0,
+            related_ids,
+            family_id,
             respawn_doodad_template_id: 0,
         },
         Some(0),
@@ -339,6 +351,15 @@ fn new_spawner(unit_id: u32, id: u32) -> Arc<DoodadSpawner> {
 
 fn group(d: &DoodadRef) -> u32 {
     d.data().func_group_id
+}
+
+/// `manager::create` (an obj id from the id manager) placed at `x`, spawned, then `InitDoodad`.
+fn place(f: &Fx, template: u32, x: f32) -> DoodadRef {
+    let d = manager::create(&f.server, &f.world, 0, template, None, true).unwrap();
+    d.data().transform.set_xyz(x, 100.0, 100.0);
+    manager::spawn(&f.server, &f.world, &d);
+    manager::init_doodad(&f.server, &f.world, &d);
+    d
 }
 
 #[tokio::test]
@@ -449,6 +470,55 @@ async fn family_pulses_route_by_the_level_design_family_and_owner_scope() {
     logic::emit(&ctx, None, false);
     assert_eq!(group(&receiver), 20);
     assert_eq!(group(&late_receiver), 20);
+}
+
+/// A spawner's `RelatedIds` is an authored wire from that placement to the named template, like
+/// a client wire: it must not go through the subscriber-family source filter. Shipped shape
+/// (Howling Abyss 2 6345 -> 6346 and 18 more pairs): the source's group pulses true, the target's
+/// start group holds a `DoodadFuncLogicFamilySubscriber` and a true `DoodadFuncPulseTrigger`, and
+/// neither placement row carries a `FamilyId`.
+#[tokio::test]
+async fn spawner_related_ids_reach_a_subscribed_target_without_family_ids() {
+    let b = Builder::default()
+        .template(100, &[(10, 1)])
+        .phase_func(
+            10,
+            FuncTemplate::Pulse(DoodadFuncPulse { id: 1, flag: true }),
+        )
+        .template(101, &[(20, 1), (21, 2)])
+        .phase_func(
+            20,
+            FuncTemplate::LogicFamilySubscriber(DoodadFuncLogicFamilySubscriber {
+                id: 2,
+                family_id: 500,
+            }),
+        )
+        .phase_func(
+            20,
+            FuncTemplate::PulseTrigger(DoodadFuncPulseTrigger {
+                id: 3,
+                flag: true,
+                next_phase: 21,
+            }),
+        );
+    let mut f = fx(b);
+    let target = f.doodad(101);
+    let source = new_spawner_with(100, 600, Some(vec![101]), 0)
+        .spawn(&f.server, 0)
+        .expect("the source spawns");
+    assert_eq!((source.data().family_id, target.data().family_id), (0, 0));
+    assert_eq!(
+        group(&target),
+        20,
+        "spawning the source pulses nothing (no caster)"
+    );
+    let ctx = DoodadCtx::new(&f.server, f.world.clone(), source.clone());
+    logic::emit(&ctx, Some(&f.caster()), true);
+    assert_eq!(
+        group(&target),
+        21,
+        "the RelatedIds signal reaches the target's trigger"
+    );
 }
 
 /// The Sharpwind Mines water chain over a synthetic copy of the shipped rows: switches 5064
@@ -717,9 +787,9 @@ async fn sharpwind_switches_raise_the_lake_through_the_family_network() {
     assert_eq!(group(&lake), 13159, "the raised water2 phase is reached");
 }
 
-/// Greptile PR #108 finding 1: with 1 s delays, outputs at 0 ms (true), 200 ms (false) and
-/// 400 ms (true) must emit once, at 1400 ms, with the final value; the replaced outputs cannot
-/// fire at their own (earlier) due times.
+/// With 1 s delays, outputs at 0 ms (true), 200 ms (false) and 400 ms (true) must emit once, at
+/// 1400 ms, with the final value; the replaced outputs cannot fire at their own (earlier) due
+/// times.
 #[tokio::test]
 async fn replaced_logic_output_emits_once_with_the_last_value() {
     let b = Builder::default()
@@ -774,7 +844,7 @@ async fn replaced_logic_output_emits_once_with_the_last_value() {
         manager::init_doodad(&f.server, &f.world, &d);
         d
     };
-    // `None` caster: the phase-entry `PulseTrigger` rows only react to a character, so the
+    // A phase-entry `PulseTrigger` never fires without a pulse of its own group, so the
     // receiver's groups advance once per received signal.
     let source = make(100, 40_000, 101.0);
     let receiver = make(101, 500, 102.0);
@@ -826,8 +896,8 @@ async fn replaced_logic_output_emits_once_with_the_last_value() {
     );
 }
 
-/// Greptile PR #108 finding 2: a wire linked while a result is still pending receives nothing
-/// until the delayed emit; on the emit it receives the value once.
+/// A wire linked while a result is still pending receives nothing until the delayed emit; on
+/// the emit it receives the value once.
 #[tokio::test]
 async fn a_wire_linked_during_the_logic_delay_receives_nothing_until_the_emit() {
     let b = Builder::default()
@@ -867,8 +937,7 @@ async fn a_wire_linked_during_the_logic_delay_receives_nothing_until_the_emit() 
     let f = fx(b);
     let make = |template: u32, x: f32| {
         let d = manager::create(&f.server, &f.world, 0, template, None, true).unwrap();
-        // `link` checks `owner_id`; a real player-owned doodad would also resolve the player as
-        // the init caster and fire the receiver's phase-entry pulse trigger.
+        // `link` requires the player to own both doodads.
         d.data().owner_id = f.player.character_id;
         d.data().transform.set_xyz(x, 100.0, 100.0);
         manager::spawn(&f.server, &f.world, &d);
@@ -899,8 +968,8 @@ async fn a_wire_linked_during_the_logic_delay_receives_nothing_until_the_emit() 
     assert_eq!(group(&subscriber), 21, "the delayed emit reaches the wire");
 }
 
-/// Greptile PR #108 finding 2: `subscribe` replays only the last emitted value, never a result
-/// that is still waiting for its delay.
+/// `subscribe` replays only the last emitted value, never a result that is still waiting for
+/// its delay.
 #[tokio::test]
 async fn subscribe_replays_only_the_emitted_logic_value() {
     let b = Builder::default()
@@ -968,6 +1037,315 @@ async fn subscribe_replays_only_the_emitted_logic_value() {
     );
     f.advance(5_000);
     assert_eq!(group(&receiver), 21, "subscribe replays nothing again");
+}
+
+/// A gate that already emitted false, whose inputs flip to true and back to false inside the 1 s
+/// delay, has nothing left to say: the pending true is cancelled and the false is not emitted a
+/// second time. The receiver counts the false signals it gets (each `PulseTrigger(false)` moves
+/// it one group on), so a repeated false would show as a second step.
+#[tokio::test]
+async fn a_pending_logic_output_that_returns_to_the_emitted_value_is_cancelled() {
+    let b = Builder::default()
+        .template(100, &[(10, 1)])
+        .phase_func(
+            10,
+            FuncTemplate::Logic(DoodadFuncLogic {
+                id: 1,
+                operation_id: 3,
+                delay_id: 1,
+            }),
+        )
+        .phase_func(
+            10,
+            FuncTemplate::LogicFamilyProvider(DoodadFuncLogicFamilyProvider {
+                id: 2,
+                family_id: 500,
+            }),
+        )
+        .template(101, &[(20, 1), (21, 2), (22, 2)])
+        .phase_func(
+            20,
+            FuncTemplate::PulseTrigger(DoodadFuncPulseTrigger {
+                id: 3,
+                flag: false,
+                next_phase: 21,
+            }),
+        )
+        .phase_func(
+            21,
+            FuncTemplate::PulseTrigger(DoodadFuncPulseTrigger {
+                id: 4,
+                flag: false,
+                next_phase: 22,
+            }),
+        )
+        .template(102, &[(30, 1)]);
+    let f = fx(b);
+    let source = place(&f, 100, 101.0);
+    let receiver = place(&f, 101, 102.0);
+    receiver.data().family_id = 500;
+    let driver = place(&f, 102, 103.0);
+    let ctx = DoodadCtx::new(&f.server, f.world.clone(), driver);
+
+    logic::receive(&ctx, &source, None, false, true);
+    f.advance(1_000);
+    assert_eq!(source.data().phase.logic_output, Some(false));
+    assert_eq!(group(&receiver), 21, "the first false is delivered");
+
+    logic::receive(&ctx, &source, None, true, true);
+    assert_eq!(source.data().phase.pending_output, Some(true));
+    f.advance(200);
+    let generation = source.data().phase.pending_output_generation;
+    logic::receive(&ctx, &source, None, false, true);
+    assert_eq!(
+        source.data().phase.pending_output,
+        None,
+        "the inputs returned to the emitted value: nothing is pending"
+    );
+    assert_ne!(
+        source.data().phase.pending_output_generation,
+        generation,
+        "the cancelled output's task no longer matches"
+    );
+
+    f.advance(2_000);
+    assert_eq!(source.data().phase.logic_output, Some(false));
+    assert_eq!(
+        group(&receiver),
+        21,
+        "neither the cancelled true nor a repeated false reaches the receiver"
+    );
+}
+
+/// The spawn row's `FamilyId` reaches the doodad: `DoodadSpawner::new` keeps it, `spawn` copies
+/// it to `Doodad::family_id` and the event copy of the spawner keeps it; a row without one
+/// spawns a doodad of family 0.
+#[tokio::test]
+async fn a_spawner_gives_its_family_id_to_the_doodad_it_spawns() {
+    let f = fx(Builder::default().template(100, &[(10, 1)]));
+    let spawner = new_spawner_with(100, 600, None, 50_002);
+    assert_eq!(spawner.family_id, 50_002);
+    let doodad = spawner.spawn(&f.server, 0).expect("the spawner spawns");
+    assert_eq!(doodad.data().family_id, 50_002);
+    assert_eq!(
+        spawner.event_copy(0).family_id,
+        50_002,
+        "the event copy keeps the placement's family"
+    );
+    let plain = new_spawner(100, 601).spawn(&f.server, 0).expect("spawns");
+    assert_eq!(plain.data().family_id, 0);
+}
+
+/// `DoodadFuncPulse` runs only with a caster (C# `if (caster is not null)`): a world spawn enters
+/// its start group without one, so a spawn-time `Pulse(false)` reaches no receiver (this one's
+/// trigger waits for false) and leaves the source's output untouched; the same group entered
+/// with a character does pulse.
+#[tokio::test]
+async fn a_pulse_without_a_caster_emits_nothing() {
+    let b = Builder::default()
+        .template(100, &[(10, 1)])
+        .phase_func(
+            10,
+            FuncTemplate::Pulse(DoodadFuncPulse { id: 1, flag: false }),
+        )
+        .template(101, &[(20, 1), (21, 2)])
+        .phase_func(
+            20,
+            FuncTemplate::PulseTrigger(DoodadFuncPulseTrigger {
+                id: 2,
+                flag: false,
+                next_phase: 21,
+            }),
+        );
+    let mut f = fx(b);
+    let receiver = f.doodad(101);
+    let source = new_spawner_with(100, 600, Some(vec![101]), 0)
+        .spawn(&f.server, 0)
+        .expect("the source spawns");
+    assert_eq!(
+        group(&receiver),
+        20,
+        "a spawn-time Pulse(false) pulses nothing"
+    );
+    assert_eq!(source.data().phase.logic_output, None);
+    assert_eq!(source.data().phase.pulsed, None);
+
+    let ctx = DoodadCtx::new(&f.server, f.world.clone(), source.clone());
+    do_change_phase(&ctx, Some(&f.caster()), 10);
+    assert_eq!(source.data().phase.logic_output, Some(false));
+    assert_eq!(group(&receiver), 21, "with a caster the same group pulses");
+}
+
+/// A deleted doodad takes no part in the family network: `subscribe` does not replay the output
+/// of a deleted provider (a late subscriber stays put) and `emit` does not reach a deleted family
+/// target. `receive` refuses a deleted target as well, so the `emit` half pins the outcome rather
+/// than its own filter.
+#[tokio::test]
+async fn deleted_doodads_take_no_part_in_family_routing() {
+    let b = Builder::default()
+        .template(100, &[(10, 1)])
+        .phase_func(
+            10,
+            FuncTemplate::LogicFamilyProvider(DoodadFuncLogicFamilyProvider {
+                id: 1,
+                family_id: 500,
+            }),
+        )
+        .template(101, &[(20, 1), (21, 2)])
+        .phase_func(
+            20,
+            FuncTemplate::LogicFamilySubscriber(DoodadFuncLogicFamilySubscriber {
+                id: 2,
+                family_id: 7,
+            }),
+        )
+        .phase_func(
+            20,
+            FuncTemplate::PulseTrigger(DoodadFuncPulseTrigger {
+                id: 3,
+                flag: true,
+                next_phase: 21,
+            }),
+        );
+    let f = fx(b);
+    let source = place(&f, 100, 101.0);
+    source.data().family_id = 7;
+    let live = place(&f, 101, 102.0);
+    let gone = place(&f, 101, 103.0);
+    live.data().family_id = 500;
+    gone.data().family_id = 500;
+    gone.data().phase.deleted = true;
+
+    logic::emit(
+        &DoodadCtx::new(&f.server, f.world.clone(), source.clone()),
+        None,
+        true,
+    );
+    assert_eq!(group(&live), 21);
+    assert_eq!(group(&gone), 20, "a deleted target receives nothing");
+
+    let adopter = place(&f, 101, 104.0);
+    assert_eq!(
+        group(&adopter),
+        21,
+        "a late subscriber adopts the live source's output"
+    );
+    source.data().phase.deleted = true;
+    let late = place(&f, 101, 105.0);
+    assert_eq!(
+        group(&late),
+        20,
+        "the output of a deleted provider is not replayed"
+    );
+}
+
+/// `clear_links` (a deleted doodad, a cleanup) drops a pending `DoodadFuncLogic` output: it is
+/// cleared and the generation moves on, so the scheduled task cannot emit afterwards.
+#[tokio::test]
+async fn clear_links_cancels_a_pending_logic_output() {
+    let b = Builder::default()
+        .template(100, &[(10, 1)])
+        .phase_func(
+            10,
+            FuncTemplate::Logic(DoodadFuncLogic {
+                id: 1,
+                operation_id: 3,
+                delay_id: 1,
+            }),
+        )
+        .phase_func(
+            10,
+            FuncTemplate::LogicFamilyProvider(DoodadFuncLogicFamilyProvider {
+                id: 2,
+                family_id: 500,
+            }),
+        )
+        .template(101, &[(20, 1), (21, 2)])
+        .phase_func(
+            20,
+            FuncTemplate::PulseTrigger(DoodadFuncPulseTrigger {
+                id: 3,
+                flag: true,
+                next_phase: 21,
+            }),
+        )
+        .template(102, &[(30, 1)]);
+    let f = fx(b);
+    let source = place(&f, 100, 101.0);
+    let receiver = place(&f, 101, 102.0);
+    receiver.data().family_id = 500;
+    let driver = place(&f, 102, 103.0);
+    let ctx = DoodadCtx::new(&f.server, f.world.clone(), driver);
+
+    logic::receive(&ctx, &source, None, true, true);
+    let generation = source.data().phase.pending_output_generation;
+    assert_eq!(source.data().phase.pending_output, Some(true));
+    logic::clear_links(&DoodadCtx::new(&f.server, f.world.clone(), source.clone()));
+    assert_eq!(source.data().phase.pending_output, None);
+    assert_ne!(
+        source.data().phase.pending_output_generation,
+        generation,
+        "the scheduled output's task no longer matches"
+    );
+    f.advance(2_000);
+    assert_eq!(source.data().phase.logic_output, None);
+    assert_eq!(group(&receiver), 20, "the cleared output never emits");
+}
+
+/// Family routing needs the `FamilyId` of the placement rows: a provider family names the
+/// receiver *family*, not a template, so a source whose group provides 500 and a target whose
+/// group subscribes to 500 do not meet while both placements carry no `FamilyId` (the shipped
+/// Nachashgar rooms 4 / 6 / 7 pairs such as 6643 -> 6646 are of this kind: main matched them by
+/// template, the logic network does not).
+#[tokio::test]
+async fn no_family_id_on_the_placement_means_no_family_routing() {
+    let b = Builder::default()
+        .template(100, &[(10, 1)])
+        .phase_func(
+            10,
+            FuncTemplate::LogicFamilyProvider(DoodadFuncLogicFamilyProvider {
+                id: 1,
+                family_id: 500,
+            }),
+        )
+        .template(101, &[(20, 1), (21, 2)])
+        .phase_func(
+            20,
+            FuncTemplate::LogicFamilySubscriber(DoodadFuncLogicFamilySubscriber {
+                id: 2,
+                family_id: 500,
+            }),
+        )
+        .phase_func(
+            20,
+            FuncTemplate::PulseTrigger(DoodadFuncPulseTrigger {
+                id: 3,
+                flag: true,
+                next_phase: 21,
+            }),
+        );
+    let f = fx(b);
+    let source = place(&f, 100, 101.0);
+    let target = place(&f, 101, 102.0);
+    let ctx = DoodadCtx::new(&f.server, f.world.clone(), source.clone());
+    logic::emit(&ctx, Some(&f.caster()), true);
+    assert_eq!(
+        group(&target),
+        20,
+        "the provider and subscriber rows alone do not route"
+    );
+
+    // An identified source does not make a template match either: the target is addressed by
+    // its own placement's family.
+    source.data().family_id = 500;
+    logic::emit(&ctx, Some(&f.caster()), true);
+    assert_eq!(group(&target), 20, "the target's placement has no family");
+
+    // With the family ids on both placements (500 names the receiver, the subscribed 500 the
+    // source) the same rows connect.
+    target.data().family_id = 500;
+    logic::emit(&ctx, Some(&f.caster()), true);
+    assert_eq!(group(&target), 21);
 }
 
 #[tokio::test]
@@ -2408,23 +2786,223 @@ async fn pulse_triggers_require_matching_signal_and_do_not_affect_other_objects(
         );
     let mut f = fx(b);
     let d = f.doodad(TEMPLATE);
+    // Entering a phase registers a listener; a character's presence is not a pulse.
     assert_eq!(group(&d), 10);
     let caster = f.caster();
     let ctx = DoodadCtx::new(&f.server, f.world.clone(), d.clone());
-    // The spawn init runs the entry phase without a caster: no fire.
     do_change_phase(&ctx, None, 10);
     assert_eq!(group(&d), 10);
-    // A character-caused entry fires the trigger (C# `if (caster is not Character) return true`).
+    // Entering the phase fires nothing with a character caster either: only a received signal
+    // or the pulse of the trigger's own group is a pulse (the previous rule fired on every
+    // character-caused entry and bounced toggles, see the `toggle` / Sal Temple tests).
     do_change_phase(&ctx, Some(&caster), 10);
-    assert_eq!(group(&d), 11, "a character-caused phase entry fires it");
-    f.use_(&d); // 11 -> 10: a fresh entry re-arms the row and fires again
+    assert_eq!(
+        group(&d),
+        10,
+        "a character-caused phase entry is not a pulse"
+    );
+    super::super::logic::receive(&ctx, &d, Some(&caster), true, false);
     assert_eq!(group(&d), 11);
+    f.use_(&d); // 11 -> 10: the entry does not fire the row again, stays in 10
+    assert_eq!(group(&d), 10);
     let other = manager::create(&f.server, &f.world, 0x501, TEMPLATE, None, true).unwrap();
+    let other_ctx = DoodadCtx::new(&f.server, f.world.clone(), other.clone());
+    do_change_phase(&other_ctx, Some(&caster), 10);
+    assert_eq!(group(&other), 10);
     // A received signal only fires on the authored flag value.
     super::super::logic::receive(&ctx, &other, Some(&caster), false, false);
     assert_eq!(group(&other), 10);
     super::super::logic::receive(&ctx, &other, Some(&caster), true, false);
     assert_eq!(group(&other), 11);
+}
+
+/// A `DoodadFuncPulseTrigger` fires on a received signal or on the pulse its own group sent in
+/// this phase entry, never because a player caster travelled along a signal chain. Toggle shape
+/// (63 template pairs, e.g. Sal Temple's Ice Trap 4751): `A: PulseTrigger(true -> B)`,
+/// `B: PulseTrigger(false -> A)`. The signals true, false, true (all carrying the player caster,
+/// as every signal of a player-started chain does) must leave it in B, A, B.
+#[tokio::test]
+async fn a_toggle_pair_follows_its_signals_when_the_chain_carries_a_player_caster() {
+    let b = Builder::default()
+        .template(100, &[(10, 1)])
+        .template(101, &[(20, 1), (21, 2)])
+        .phase_func(
+            20,
+            FuncTemplate::PulseTrigger(DoodadFuncPulseTrigger {
+                id: 1,
+                flag: true,
+                next_phase: 21,
+            }),
+        )
+        .phase_func(
+            21,
+            FuncTemplate::PulseTrigger(DoodadFuncPulseTrigger {
+                id: 2,
+                flag: false,
+                next_phase: 20,
+            }),
+        );
+    let f = fx(b);
+    let source = place(&f, 100, 101.0);
+    let toggle = place(&f, 101, 102.0);
+    let ctx = DoodadCtx::new(&f.server, f.world.clone(), source);
+    let caster = f.caster();
+    assert_eq!(group(&toggle), 20);
+    logic::receive(&ctx, &toggle, Some(&caster), true, true);
+    assert_eq!(group(&toggle), 21, "the true signal switches it on");
+    logic::receive(&ctx, &toggle, Some(&caster), false, true);
+    assert_eq!(
+        group(&toggle),
+        20,
+        "the false signal switches it off, for good"
+    );
+    logic::receive(&ctx, &toggle, Some(&caster), true, true);
+    assert_eq!(group(&toggle), 21);
+}
+
+/// Jolly Roger Tower 3382 group 7885 shape: `Pulse(false)` + `PulseTrigger(true -> X)`. The
+/// group's own pulse is false and the trigger waits for true, so a character-caused entry must
+/// not move the doodad on.
+#[tokio::test]
+async fn a_false_pulse_does_not_fire_the_true_trigger_of_its_own_group() {
+    let b = Builder::default()
+        .template(TEMPLATE, &[(10, 1), (11, 2), (12, 2)])
+        .fake_use(10, 1, 11)
+        .phase_func(
+            11,
+            FuncTemplate::Pulse(DoodadFuncPulse { id: 5, flag: false }),
+        )
+        .phase_func(
+            11,
+            FuncTemplate::PulseTrigger(DoodadFuncPulseTrigger {
+                id: 6,
+                flag: true,
+                next_phase: 12,
+            }),
+        );
+    let mut f = fx(b);
+    let d = f.doodad(TEMPLATE);
+    f.use_(&d);
+    assert_eq!(
+        group(&d),
+        11,
+        "a false pulse is not the true trigger's signal"
+    );
+}
+
+/// Sharpwind switch 13161 shape, rows in the shipped `actual_func_id` order (trigger 274 before
+/// pulse 287): a character-caused entry pulses true and the group's own true trigger then takes
+/// the doodad to its final phase. Entered without a caster (a world spawn) nothing pulses, so
+/// the trigger of the same group stays armed.
+#[tokio::test]
+async fn a_true_pulse_fires_the_true_trigger_of_its_own_group() {
+    let b = Builder::default()
+        .template(TEMPLATE, &[(10, 1), (11, 2), (12, 2)])
+        .fake_use(10, 1, 11)
+        .phase_func(
+            11,
+            FuncTemplate::PulseTrigger(DoodadFuncPulseTrigger {
+                id: 6,
+                flag: true,
+                next_phase: 12,
+            }),
+        )
+        .phase_func(
+            11,
+            FuncTemplate::Pulse(DoodadFuncPulse { id: 5, flag: true }),
+        );
+    let mut f = fx(b);
+    let d = f.doodad(TEMPLATE);
+    f.use_(&d);
+    assert_eq!(group(&d), 12, "the use pulses true and its trigger fires");
+
+    let spawned = place(&f, TEMPLATE, 130.0);
+    let ctx = DoodadCtx::new(&f.server, f.world.clone(), spawned.clone());
+    do_change_phase(&ctx, None, 11);
+    assert_eq!(group(&spawned), 11, "no caster, no pulse, no fire");
+}
+
+/// Sal Temple Palace Cellar with the shipped group shapes: using the Ice Machine 4752
+/// (`RelatedIds [4751]`) starts timers of 2.7 s / 4.3 s / 2.7 s that all carry the player caster,
+/// `Pulse(true)` in 11800 and `Pulse(false)` back in the start group 11798. The Ice Trap 4751
+/// (`11795: PulseTrigger(true -> 11796)`, `11796: PulseTrigger(false -> 11795)`) goes on at the
+/// true pulse and has to stay off after the false one: its entry into 11795 by that signal is not
+/// a pulse (the previous rule fired it again and switched the ice field on for good).
+#[tokio::test]
+async fn sal_temple_ice_trap_stays_off_after_the_ice_machines_false_pulse() {
+    let b = Builder::default()
+        .template(4752, &[(11798, 1), (11799, 2), (11800, 2), (11801, 2)])
+        .fake_use(11798, 2335, 11799)
+        .phase_func(
+            11798,
+            FuncTemplate::Pulse(DoodadFuncPulse {
+                id: 259,
+                flag: false,
+            }),
+        )
+        .phase_func(
+            11798,
+            FuncTemplate::LogicFamilyProvider(DoodadFuncLogicFamilyProvider {
+                id: 419,
+                family_id: 30_014,
+            }),
+        )
+        .phase_func(11799, timer(4565, 2_700, 11800))
+        .phase_func(
+            11800,
+            FuncTemplate::Pulse(DoodadFuncPulse {
+                id: 260,
+                flag: true,
+            }),
+        )
+        .phase_func(
+            11800,
+            FuncTemplate::LogicFamilyProvider(DoodadFuncLogicFamilyProvider {
+                id: 420,
+                family_id: 30_014,
+            }),
+        )
+        .phase_func(11800, timer(4566, 4_300, 11801))
+        .phase_func(11801, timer(4567, 2_700, 11798))
+        .template(4751, &[(11795, 1), (11796, 2)])
+        .phase_func(
+            11795,
+            FuncTemplate::PulseTrigger(DoodadFuncPulseTrigger {
+                id: 252,
+                flag: true,
+                next_phase: 11796,
+            }),
+        )
+        .phase_func(
+            11796,
+            FuncTemplate::PulseTrigger(DoodadFuncPulseTrigger {
+                id: 253,
+                flag: false,
+                next_phase: 11795,
+            }),
+        );
+    let mut f = fx(b);
+    let trap = f.doodad(4751);
+    let machine = new_spawner_with(4752, 700, Some(vec![4751]), 0)
+        .spawn(&f.server, 0)
+        .expect("the Ice Machine spawns");
+    assert_eq!((group(&machine), group(&trap)), (11798, 11795));
+
+    f.use_(&machine);
+    assert_eq!(group(&machine), 11799);
+    f.advance(2_700);
+    assert_eq!(group(&machine), 11800);
+    assert_eq!(group(&trap), 11796, "the true pulse switches the trap on");
+    f.advance(4_300);
+    assert_eq!(group(&machine), 11801);
+    assert_eq!(group(&trap), 11796);
+    f.advance(2_700);
+    assert_eq!(group(&machine), 11798);
+    assert_eq!(
+        group(&trap),
+        11795,
+        "the false pulse switches the trap off and it stays off"
+    );
 }
 
 #[tokio::test]
@@ -2571,6 +3149,36 @@ async fn real_compact_db_template_2336() {
     f.advance(30_000);
     assert_eq!(group(&d), 4651);
     assert_eq!(f.phase_packets(), vec![4651]);
+}
+
+/// Howling Abyss 2 "Strange Device" 6345 -> "Iron Gate" 6346 with the real compact data: the
+/// spawn rows carry `RelatedIds [6346]` and no `FamilyId`, the gate's start group 16787 holds a
+/// `DoodadFuncLogicFamilySubscriber` (30200) and a `DoodadFuncPulseTrigger` (true -> 16788), and a
+/// character using the device (skill 21394 -> group 16786, `DoodadFuncPulse` true) must open it.
+#[tokio::test]
+#[ignore]
+async fn real_compact_db_related_ids_signal_opens_the_howling_abyss_2_gate() {
+    let Ok(path) = std::env::var("AAEMU_COMPACT_DB") else {
+        return;
+    };
+    let conn =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let data = DoodadData::load_from(&conn).unwrap();
+    let f = fx(Builder {
+        data,
+        ..Default::default()
+    });
+    let gate = new_spawner(6346, 700)
+        .spawn(&f.server, 0)
+        .expect("spawns the gate");
+    let device = new_spawner_with(6345, 701, Some(vec![6346]), 0)
+        .spawn(&f.server, 0)
+        .expect("spawns the device");
+    assert_eq!((group(&device), group(&gate)), (16785, 16787));
+    manager::use_doodad(&f.server, &f.world, &device, Some(&f.caster()), 21394, 0);
+    assert_eq!(group(&device), 16786);
+    assert_eq!(group(&gate), 16788, "the used device opens the gate");
 }
 
 /// Weather marker 2768 (func group 7055 respawns into 2768 / 3085 / 3086 / 3225 / 3226 at 20% each
@@ -3167,9 +3775,10 @@ mod natural_flow {
     }
 }
 
-/// The shipped `compact.sqlite3` rows the Sharpwind chain depends on: the switch's table order
-/// (Pulse before its PulseTrigger, the 2026-11-11 loader deviation), the gate family wiring, the
-/// lake's 5 s + 22 s water-volume sequence and the water volume's 22 m / 22 s.
+/// The shipped `compact.sqlite3` rows the Sharpwind chain depends on: the switch's rows in the
+/// loader's `actual_func_id` order (PulseTrigger 274, Pulse 287, provider 444; the executor runs
+/// the trigger last, see `phase::do_phase_funcs`), the gate family wiring, the lake's 5 s + 22 s
+/// water-volume sequence and the water volume's 22 m / 22 s.
 #[tokio::test]
 #[ignore]
 async fn real_compact_db_sharpwind_water_network_rows() {
@@ -3184,8 +3793,8 @@ async fn real_compact_db_sharpwind_water_network_rows() {
         assert!(data.template(id).is_some(), "missing template {id}");
     }
 
-    // Switch 5064: start group 13160 (false pulse + provider), used group 13161 in *table* order
-    // (Pulse 287, provider 444 -> 50005, PulseTrigger 274 -> final 13163).
+    // Switch 5064: start group 13160 (false pulse + provider), used group 13161 in the loader's
+    // `actual_func_id` order (PulseTrigger 274 -> final 13163, Pulse 287, provider 444 -> 50005).
     let start: Vec<(u32, &str)> = data
         .phase_funcs(13160)
         .iter()
@@ -3313,4 +3922,97 @@ async fn real_compact_db_sharpwind_water_network_rows() {
             other => panic!("{other:?}"),
         }
     }
+}
+
+/// The shipped Sharpwind water chain driven from the shipped data: the real compact DB and the
+/// shipped `doodad_spawns.json` (22 rows, 11 of them the water network with their `FamilyId`s).
+/// A character uses the three "Blocked Geyser" switches (skill 18321); the gates, the five
+/// streams and the lake follow through the family network on the virtual clock, and the lake
+/// reaches its raised phase 13159 (1 s gate delay, 5 s pre-roll, 22 s rise). Each switch's own
+/// `Final` removes it 1 s after its use and must not undo its gate input.
+#[tokio::test]
+#[ignore]
+async fn real_data_sharpwind_shipped_rows_raise_the_lake() {
+    let Ok(path) = std::env::var("AAEMU_COMPACT_DB") else {
+        return;
+    };
+    let spawn_file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("app/Data/Worlds/instance_cuttingwind_deadmine/doodad_spawns.json");
+    let Ok(text) = std::fs::read_to_string(spawn_file) else {
+        return;
+    };
+    let conn =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let data = DoodadData::load_from(&conn).unwrap();
+    let f = fx(Builder {
+        data,
+        ..Default::default()
+    });
+    let defs = parse_list(&text, DoodadSpawnerDef::from_json).expect("doodad_spawns.json");
+    assert_eq!(defs.len(), 22, "the shipped Sharpwind rows");
+    for (i, def) in defs.into_iter().enumerate() {
+        let template = def.base.unit_id;
+        assert!(
+            Arc::new(DoodadSpawner::new(def, Some(0)))
+                .spawn(&f.server, 0)
+                .is_some(),
+            "row {i} (template {template}) spawns"
+        );
+    }
+    let of = |template: u32| -> Vec<DoodadRef> {
+        let mut found: Vec<_> = f
+            .world
+            .all_doodads()
+            .into_iter()
+            .filter(|d| d.data().template_id == template)
+            .collect();
+        found.sort_by_key(|d| d.obj_id);
+        found
+    };
+    let (switches, lake) = (
+        [5064u32, 5068, 5069].map(|t| of(t).pop().expect("a switch is placed")),
+        of(5063).pop().expect("the lake is placed"),
+    );
+    let (streams_a, streams_b) = (of(5072), of(5073));
+    assert_eq!((streams_a.len(), streams_b.len()), (3, 2));
+    assert_eq!(
+        switches.each_ref().map(group),
+        [13160, 13175, 13178],
+        "the switches start in their start groups"
+    );
+    assert_eq!(group(&lake), 13157);
+
+    let use_switch = |switch: &DoodadRef| {
+        manager::use_doodad(&f.server, &f.world, switch, Some(&f.caster()), 18321, 0);
+    };
+    // Switches 5064 and 5068 feed gate 5070 (AND, 1 s): after the second one, the 5072 streams
+    // run; gate 5071 still waits for switch 5069.
+    use_switch(&switches[0]);
+    assert_eq!(group(&switches[0]), 13163, "the used switch's final phase");
+    f.advance(1_000);
+    assert!(
+        switches[0].data().phase.deleted,
+        "the switch's Final removed it"
+    );
+    assert!(streams_a.iter().all(|s| group(s) == 13183));
+    use_switch(&switches[1]);
+    f.advance(1_000);
+    assert!(
+        streams_a.iter().all(|s| group(s) == 13184),
+        "gate 5070 opens the 5072 streams although switch 5064 is gone: {:?}",
+        streams_a.iter().map(group).collect::<Vec<_>>()
+    );
+    assert!(streams_b.iter().all(|s| group(s) == 13185));
+    assert_eq!(group(&lake), 13157);
+
+    // Switch 5069 completes gate 5071: the 5073 streams erupt and the lake starts its sequence.
+    use_switch(&switches[2]);
+    f.advance(1_000);
+    assert!(streams_b.iter().all(|s| group(s) == 13186));
+    assert_eq!(group(&lake), 14184);
+    f.advance(5_000);
+    assert_eq!(group(&lake), 13158, "the 5 s pre-roll ends");
+    f.advance(22_000);
+    assert_eq!(group(&lake), 13159, "the lake is raised");
 }

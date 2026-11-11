@@ -910,16 +910,6 @@ struct AuthoredCandidate {
     radius: f32,
 }
 
-/// Snapshot of one warmed entry outside the warm set, taken before the sweep's world reads.
-#[derive(Debug)]
-struct ColdWarmEntry {
-    expires_at: Option<Instant>,
-    id: u32,
-    spawner: Arc<NpcSpawner>,
-    resident: bool,
-    map_only: bool,
-}
-
 /// One tracked warm placement of the activation registry.
 #[derive(Debug, Clone)]
 struct WarmEntry {
@@ -930,10 +920,6 @@ struct WarmEntry {
     /// a mixed placement still expires its nonresident members per live NPC. Gated by
     /// `World.NpcResidentServiceNpcs` at booking and at reclamation time.
     resident: bool,
-    /// Prepared by the quest-map range option while outside every player's warm ring. Once no
-    /// viewer streams its NPCs any more it is reclaimed even when its members are resident
-    /// service templates: nothing near it needs the service, it only fed a far map marker.
-    map_only: bool,
     /// Stable retention deadline, booked once when the placement dropped out of the warm set
     /// (`None` while it is warm or resident). Independent of later queue rebuilds / unchanged
     /// player revisions.
@@ -1167,8 +1153,44 @@ impl SpawnManager {
         index.built = true;
     }
 
+    /// Tracks a placement that the quest-map range option prepared far from every player: the
+    /// activation pass registers only the placements it examined itself, so without this entry
+    /// the retention sweep never reclaims the NPCs the option created (they would leak until
+    /// restart while `World.NpcResidentServiceNpcs` is off). A placement that is already tracked
+    /// keeps its entry; while a player streams one of its NPCs the sweep keeps it warm
+    /// (`activation_sweep`).
+    pub fn note_prepared(&self, server: &GameServer, spawner: &Arc<NpcSpawner>) {
+        if self
+            .activation
+            .lock()
+            .expect("spawn manager poisoned")
+            .warmed
+            .contains_key(&spawner.id)
+        {
+            return;
+        }
+        // Classified like the activation pass does, before taking the activation guard again.
+        let residents = server.systems.npcs.spawns.resident_npcs(server);
+        let resident = server.config.world.npc_resident_service_npcs
+            && spawner_is_resident(server, residents, spawner);
+        self.activation
+            .lock()
+            .expect("spawn manager poisoned")
+            .warmed
+            .entry(spawner.id)
+            .or_insert(WarmEntry {
+                spawner: spawner.clone(),
+                resident,
+                expires_at: None,
+            });
+    }
+
     /// Ordinary placements that can provide a quest marker within `radius` metres of
     /// `(center_x, center_y)`, nearest first. `radius` may be infinite (the Unlimited option).
+    ///
+    /// Placements filed (by their authored position) in `skip_regions` are left out and do not
+    /// count against `limit`: the caller passes the player's own neighbourhood, which the region
+    /// path already streams, so it must neither be prepared for a marker nor use up the limit.
     ///
     /// Only placements whose members are all safe quest givers / reporters are returned, so a
     /// monster camp with one quest NPC is not spawned for a map marker. `limit` bounds the work
@@ -1179,6 +1201,7 @@ impl SpawnManager {
         center_x: f32,
         center_y: f32,
         radius: f32,
+        skip_regions: &HashSet<(i32, i32)>,
         limit: usize,
     ) -> Vec<Arc<NpcSpawner>> {
         self.ensure_quest_giver_index(server);
@@ -1196,6 +1219,9 @@ impl SpawnManager {
         let mut found: Vec<(f32, u32, Arc<NpcSpawner>)> = Vec::new();
         let mut seen: HashSet<u32> = HashSet::new();
         let mut visit = |region: (i32, i32)| {
+            if skip_regions.contains(&region) {
+                return;
+            }
             let Some(spawners) = index.regions.get(&region) else {
                 return;
             };
@@ -1233,36 +1259,6 @@ impl SpawnManager {
             found.truncate(limit);
         }
         found.into_iter().map(|(_, _, s)| s).collect()
-    }
-
-    /// Registers placements the quest-map option prepared for far markers. They may sit outside
-    /// every player's warm ring, so the activation phase never examined them; without a
-    /// [`WarmEntry`] the sweep would never reclaim their NPCs after streaming stops. An entry
-    /// the activation phase already tracks keeps its booking (only ordinary placements that are
-    /// not currently warm become `map_only`).
-    pub fn track_quest_map_placements(&self, server: &GameServer, spawners: &[Arc<NpcSpawner>]) {
-        if spawners.is_empty() {
-            return;
-        }
-        let residents = server.systems.npcs.spawns.resident_npcs(server);
-        let resident_gate = server.config.world.npc_resident_service_npcs;
-        let prepared: Vec<(Arc<NpcSpawner>, bool)> = spawners
-            .iter()
-            .map(|spawner| {
-                let resident = resident_gate && spawner_is_resident(server, residents, spawner);
-                (spawner.clone(), resident)
-            })
-            .collect();
-        let mut state = self.activation.lock().expect("spawn manager poisoned");
-        for (spawner, resident) in prepared {
-            let map_only = !state.warm_ids.contains(&spawner.id);
-            state.warmed.entry(spawner.id).or_insert(WarmEntry {
-                spawner,
-                resident,
-                map_only,
-                expires_at: None,
-            });
-        }
     }
 
     // ----- AddNpcSpawner -----
@@ -3470,7 +3466,6 @@ impl SpawnManager {
                 WarmEntry {
                     spawner,
                     resident,
-                    map_only: false,
                     expires_at: None,
                 },
             );
@@ -3496,7 +3491,7 @@ impl SpawnManager {
         let retention = Duration::from_secs(server.config.world.npc_warm_retention_seconds);
         // Snapshot the two halves before taking the activation guard; the object-data /
         // population reads below happen without it.
-        let mut cold: Vec<ColdWarmEntry> = Vec::new();
+        let mut cold: Vec<(Option<Instant>, u32, Arc<NpcSpawner>, bool)> = Vec::new();
         let mut warm: Vec<u32> = Vec::new();
         {
             let state = self.activation.lock().expect("spawn manager poisoned");
@@ -3504,13 +3499,7 @@ impl SpawnManager {
                 if state.warm_ids.contains(id) {
                     warm.push(*id);
                 } else {
-                    cold.push(ColdWarmEntry {
-                        expires_at: entry.expires_at,
-                        id: *id,
-                        spawner: entry.spawner.clone(),
-                        resident: entry.resident,
-                        map_only: entry.map_only,
-                    });
+                    cold.push((entry.expires_at, *id, entry.spawner.clone(), entry.resident));
                 }
             }
         }
@@ -3527,11 +3516,7 @@ impl SpawnManager {
         }
         // Oldest booking first: a placement that dropped out never loses its stable deadline,
         // and budget-starved passes continue with the same oldest entrants next time.
-        cold.sort_by(|a, b| {
-            a.expires_at
-                .cmp(&b.expires_at)
-                .then_with(|| a.id.cmp(&b.id))
-        });
+        cold.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         // A placement whose NPCs are streamed by a far quest-map viewer is still warm even when
         // it sits outside every player's warm ring; reclaiming it would only make the map
         // refresh rebuild it (cold-reclaim churn).
@@ -3541,14 +3526,7 @@ impl SpawnManager {
         let mut bookings: Vec<(u32, Instant)> = Vec::new();
         let mut keep_warm: Vec<u32> = Vec::new();
         let mut drop_entries: Vec<u32> = Vec::new();
-        for ColdWarmEntry {
-            expires_at,
-            id,
-            spawner,
-            resident,
-            map_only,
-        } in cold
-        {
+        for (expires_at, id, spawner, resident) in cold {
             if !streamed.is_empty()
                 && spawner
                     .spawned_npcs()
@@ -3561,14 +3539,11 @@ impl SpawnManager {
                 keep_warm.push(id);
                 continue;
             }
-            // A map-only placement fed a far marker and nothing near it needs the service, so
-            // its resident templates do not exempt it from the reclaim.
-            let effective_gate = resident_gate && !map_only;
             // The homogeneous residency fast path is re-validated against the live members: a
             // placement whose classification is cached from an earlier pass must not stay
             // skipped once a runtime-owned (never resident) member appears.
             let resident_skip = resident
-                && effective_gate
+                && resident_gate
                 && !spawner_has_nonresident_live_npc(server, residents, &spawner);
             if spawner.can_despawn_npcs(server) {
                 // Authored schedule / management removal keeps its own lifecycle: it wins over
@@ -3585,7 +3560,7 @@ impl SpawnManager {
                 };
                 if now >= deadline && *budget > 0 {
                     let removed =
-                        spawner.reclaim_cold_npcs(server, *budget, residents, effective_gate);
+                        spawner.reclaim_cold_npcs(server, *budget, residents, resident_gate);
                     *budget -= removed as i64;
                     stats.reclaimed += removed;
                 }
@@ -3639,8 +3614,10 @@ fn spawner_is_resident(
 }
 
 /// Whether an ordinary placement may be prepared for the quest-map range option: every
-/// authored member is a safe quest giver / reporter (nonaggressive, not creator-only) and at
-/// least one member carries a quest role. Mixed camps with hostile members are excluded.
+/// authored member is a plain `Npc` row naming a safe quest giver / reporter (nonaggressive, not
+/// creator-only) and at least one member carries a quest role. Mixed camps with hostile members
+/// are excluded, and so are `NpcGroup` rows: their `member_id` is a group id, not an NPC
+/// template id (the spawner spawns the whole group), even when the number is also an NPC id.
 fn spawner_is_quest_map_candidate(
     server: &GameServer,
     residents: &ResidentNpcTemplates,
@@ -3650,6 +3627,8 @@ fn spawner_is_quest_map_candidate(
     let members = spawner.spawnable_npcs();
     let member_ids: Vec<u32> = if members.is_empty() {
         vec![spawner.unit_id]
+    } else if members.iter().any(|m| m.member_type != "Npc") {
+        return false;
     } else {
         members.iter().map(|m| m.member_id).collect()
     };

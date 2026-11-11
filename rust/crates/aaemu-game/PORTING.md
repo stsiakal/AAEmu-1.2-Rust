@@ -529,7 +529,7 @@ buff unchanged, absolute-value inference, real-compact loader for the three colu
 | `NpcSpawner`, `NpcSpawnerNpc`, `DoodadSpawner`, `Spawner<T>` | `npc/spawner.rs`, `doodad/spawner.rs` | done | Schedules / time windows / population caches, respawn + despawn timing, exact-identity reconciliation of direct deletes (see deviations). Ordinary populations keep the authored `Count` / `min_population` baseline (default 1) and per-slot respawn deadlines (see deviations). AI home position / follow path / simulation through `server.systems.hooks.ai` (`systems::ai`). |
 | `SpawnManager` (one per instance) + `WorldManager.ActiveRegionTick` spawner part | `spawn_manager.rs` | done | main_world: 25 118 NPC entries -> 24 047 ordinary placements / 38 174 spawner clones (1 011 duplicates and 60 event entries filtered, 0 missing templates), 42 649 doodads, 69 transfers, 14 gimmicks, 5 slaves, 0 parse errors. Ordinary spawning is a bounded per-instance 64 m region-index activation pass (`World.NpcPrewarmRegionMargin` / `World.NpcSpawnTickMs` / `World.NpcSpawnsPerTick`) with warm retention and resident-service retention (`World.NpcWarmRetentionSeconds` / `World.NpcResidentServiceNpcs`; see deviations). Persistent doodads from MySQL. Transfers / slaves: `systems::vehicles`; houses and their doodads: `systems::housing`; trial court doodads / NPCs linked after the spawns (`TrialManager.Initialize*`). |
 | `DoodadManager.Load` (templates, func groups, funcs, phase funcs, all 121 func template tables) | `doodad/data.rs`, `doodad/templates.rs` | done | 7 124 templates, 13 974 funcs, 24 465 phase funcs (counts match the DB). |
-| `Doodad` phase machine (`Use`, `DoFunc`, `DoPhaseFuncs`, `DoChangePhase`, `InitDoodad`, `OnSkillHit`, `FuncGroupId` setter, ToD triggers), 42 phase funcs, func tasks, `DoodadManager` runtime (Create, CreatePlayerDoodad, ChangeDoodadData, coffers), persistence (`doodads` table) | `doodad/{phase,phase_funcs,tasks,manager,db,logic}.rs` | partial | Serialized interactions, per-object counters, generation and handle guards for timers, ToD transitions, ordered MySQL persistence. Authored logic/family pulses, spawn management groups and moving gimmicks are implemented (phase funcs load in `actual_func_id` order with the `PulseTrigger` rows deferred by the executor, see the Sharpwind water entry; `DoodadFuncLogic` supports all eight authored delays 1 s–30 min; the doodad spawn row carries the level-design `FamilyId`). FlowGraph runs in the client. Spawn groups 73–76 lack authored membership in shipped data. |
+| `Doodad` phase machine (`Use`, `DoFunc`, `DoPhaseFuncs`, `DoChangePhase`, `InitDoodad`, `OnSkillHit`, `FuncGroupId` setter, ToD triggers), 42 phase funcs, func tasks, `DoodadManager` runtime (Create, CreatePlayerDoodad, ChangeDoodadData, coffers), persistence (`doodads` table) | `doodad/{phase,phase_funcs,tasks,manager,db,logic}.rs` | partial | Serialized interactions, per-object counters, generation and handle guards for timers, ToD transitions, ordered MySQL persistence. Authored logic/family pulses, spawn management groups and moving gimmicks are implemented (phase funcs load in `actual_func_id` order with the `PulseTrigger` rows deferred by the executor, see the Sharpwind water entry; `DoodadFuncLogic` supports the delays 1 s / 5 s / 10 s (ids 1–3, evidenced) and an inferred 30 s–30 min (ids 4–8); the doodad spawn row carries the level-design `FamilyId`). FlowGraph runs in the client. Spawn groups 73–76 lack authored membership in shipped data. |
 | `blocked_child_doodads` (buff id -> child doodad template id) | `systems/skills/data/mod.rs` (loader), `doodad/{phase,interactions,packets}.rs`, `npcs/{bridges,portal/mod}.rs`, `economy/store.rs` (use entry guards) | added | The C# did not load this table; the 1.2 client does (`dll.c` `39a0c158` / `39a0c460`: `SELECT owner_type, owner_id, doodad_id FROM blocked_child_doodads`). The two rows are buff 6064 -> doodad 6560 (fishing boat crane) and buff 6245 -> doodad 3446 (backpack storage box). While such a buff is active on the child doodad's parent unit, a player's use is refused with the existing `NO_INTERACTION_AVAILABLE` error (no new packet) and `Character.SkillCancelled`, so a running cast refunds its item / labor cost. Only `owner_type = 'Buff'` is handled (the only evidenced value; other / NULL values are skipped at debug, NULL ids too). Covered player entries: `Doodad.Use` (skills `InteractionEffect` / `ScopedFEffect`, `CSHang`, harpoon, loot bag; `funcs::use_func` is reached through it), world interactions (`execute_interaction_with`, incl. the `CSLootOpenBag` recover path and `CheckGrowth`), `CSChangeDoodadPhase`, the `CSBuyCoinItem` and `CSBuyItems` purchase paths, and navi open / teleport. Doodads without a parent are unchanged and internal phase changes (timers, ToD, func chaining, instance events, GM phase commands, crime-evidence loot) are not gated. Who casts 6064 / 6245 in the live flow is UNKNOWN. Tests: `blocked_child_tests` (refused with the buff, allowed without / unrelated buff, parentless doodad) and gated `blocked_child_doodads_real_compact_db`. |
 | 79 non-phase funcs, 41 world interactions (`execute_interaction` for the skills InteractionEffect), coffers, bond / seats | `doodad/funcs/`, `doodad/interactions.rs`, `doodad/coffer.rs` | done | Items, loot, coffers through the economy `EconomyBridge`; skills, quests, housing through the bridges; instance funcs (`systems::instances`), `BindSlave` (`systems::vehicles`). Sticky parents are not modelled. The funcs that stay trace-only (`DoodadFuncBankUi` / `_AuctionUi` / `_StoreUi` / `_CofferPerm` / `_RenewItem`, `Climb`, `CraftStart/Act/GetItem/Cancel/Info/Pack`, `InsertCounter`, `StampMaker`, `UccImprint`) are **client-driven**: the 1.2 client loads `doodad_func_bank_uis`, `_auction_uis`, `_store_uis`, `_coffer_perms` and `_renew_items` itself (`strings.txt:13498-13557`), so there is no server answer to add (do not reopen). |
 | `doodad_funcs.perm_id` (`DoodadFuncPermission`) | `doodad/permission.rs`, `doodad/phase.rs`, `doodad/interactions.rs`, `doodad/funcs/skills.rs`, `housing/dominion/larceny.rs`, `permission_tests.rs` | added | The C# read `Doodad.FuncPermission` only in `CharacterCraft` (its enum was a guess) and never enforced it in `Doodad.Use`; the 1.2 client filters every interaction entry by `FUN_393b3300(func->perm, doodad, ...)`, so a direct `CSStartSkill` / `CSLootOpenBag` bypassed the filter. Decoded and enforced: 0 any (13 228 rows), 1 owner, 2 owner or family, 3 expedition membership with the role right (`FUN_392f8af0`: leader `0xff` or the role policy's `siege_master` byte) and the doodad's expedition (`+0x350`) is mine or 0, with **no owner shortcut**, 4 owner or party/raid, 5 owner or raid, 6 same account, 7 the doodad's zone **group** is owned by my player-founded nation (dominion owner expedition through `FUN_392f8180`; `zones.faction_id` is not read), 8 a house of mine is in the doodad's zone **group**, other values deny (client default). Evidence: the data patterns (territory statues 7229-7234 and QA doodads 7251 "이 존이 내 국가" (perm 7) / 7252 "이 존에 내 집" (perm 8), beds/fences/livestock perm 1, the single perm-2 QA uproot, the perm-3 siege-declaration backpack, perm-5 storage box / fish crane, perm-6 farm bench / cushions), the decompile (`FUN_393b3300`; family map `FUN_39302aa0`/`FUN_39300340`, expedition role policy `FUN_392f8af0`/`FUN_398a40c0`, raid `FUN_39308dd0`, account `FUN_393b32c0`, zone nation `FUN_39053360`/`FUN_392fa6b0`/`FUN_392f3510`/`FUN_3983a730`/`FUN_392f8180`, zone house `FUN_3932aaf0`/`FUN_397a6c60`) and the C# history (`git log -S Perm`: only `CharacterCraft`). Deviation: the C# enum's names are wrong (3 is expedition, not owner-only; 1 is owner-only) and value 7 was missing. The owner is the owning character (CHARACTER owner, house owner, slave owner). `perm 0` is not an owner rule: the shipped player crop groups carry perm 0 on water 13625 and uproot 13789 (98 groups bind both), so a house garden stays behind the house permission (unchanged) and a public farm behind the guard time (unchanged). Gate: `phase::use_doodad` (the skill-bound func before `do_func`, the skill-less loot rows one by one) plus the direct `CheckGrowth` and `RecoverItem` branches; a refusal sends `interaction_permission_deny` 232 and cancels the cast so its cost is refunded. Siege larceny: the window never grants the uproot skill 13789 (produce only), and the `funcs::skills::use_` window fallback has the same exclusion; most group-5 (baby livestock) and 4594 rows are perm 1, so the window does not grant them either, matching the client filter. **perm 7 / EuAuroria:** with player nations off no player passes `FUN_392fa6b0`, so the territory-statue buffs (statues 7229-7234, buffs 23681 and 23684-23688) are unusable under that profile; that is the client rule, not a regression. **SYSTEM-owned rows (public-farm release):** `PublicFarmTick` turns an expired public-farm crop into owner type SYSTEM; its perm-1 rows (livestock group 5 care/loot among them) then refuse everyone, and the client hides the same rows because its owner lookup returns null. **perm 3 inference:** the client's doodad `+0x350` is the field `Doodad.Write` sends as 0 (C# `stream.Write(0); // family TODO`), so the server resolves it from the dominion declaration's attacker expedition (the only perm-3 row is the camp 4307 recover and the camp is that declaration's HQ); the policy byte at `+0x90` is `siege_master` (decoded from `FUN_392faa00`'s column mapping: `expedition_management` ALB columns 6 = join_siege at `+0x91`, 7 = siege_master at `+0x90`). A chained loot iteration (an earlier row already ran and advanced the phase) skips a denied row silently instead of refusing and refunding a finished cast. Tests: `doodad/permission_tests` (every value, owner/family/guild-role-right/team/raid/account/nation/zone-resident, system- and slave-owned doodads, uproot vs water, the 232 + cast cancel, no owner shortcut for perm 3, the territory-owner nation, the chained skip, the direct recover and CheckGrowth paths, house permission on top of perm 0) and `dominion/larceny_tests::the_window_grants_produce_but_not_the_uproot`; each denial test was mutation-checked against the disabled/old rule. |
@@ -1311,7 +1311,7 @@ Economy hooks (`server.systems.housing.hooks`): installed by `economy::bridges::
 | `QuestManagerEvents` + other C# entry points (OnItemUse, OnKill, cinema, mate level) | `events.rs` | done | Public event API; nested calls from hooks are queued. |
 | `QuestManager` evaluation queue / timers / daily reset task | `mod.rs` | done | `QuestManagerRunQueueTask` as a 1 ms tokio task; timers as tokio tasks; daily reset at 00:00 UTC. |
 | `UnitRequirementsGameData` (`CanComponentRun`, `CanTriggerSphere`) + `UnitReqs.Validate` | `unit_reqs.rs` | done | `ReqSubject` / `ReqEnv` traits (owner = locked character, target = snapshot). `CanUseSkill` is the skills subsystem's (can reuse `validate`). |
-| "Quest Details Map Display" range (`/questmap`) | `systems/quests/quest_map.rs`, `systems/npcs/spawn_manager.rs` (`quest_giver_spawners_near`), `systems/services/commands/scripts/quest_map.rs` | added (driver + server; 3.5 option semantics) | The 1.2 client computes given-quest map markers per streamed unit (`ClientUnit::UpdateQuestMark` `FUN_39359c60`, event `0x34`, decompile `x2game.dll.c:693168`) and has no distance option. The 3.5 option `option_map_given_quest_distance` (slot x 100 m, 4.0 = unlimited; 10.x `sub_396433C0`) is reproduced as a per-character range sent by the injected driver through a level-0 `/questmap <100\|200\|300\|0>` chat command. The server streams safe quest giver / reporter NPCs (nonaggressive, not creator-only; ordinary placements with no hostile member) within the range, capped at 256 extra NPCs per character and 32 NPC preparations per tick; Unlimited scans the quest-giver placement index and takes the nearest 256 (deviation: not the whole continent, to bound client units and packets). Accepted quest objectives are already map-wide via `X2Map:AddNotifyQuestInfo` (static quest data, `FUN_392b6ac0`). The range is not persisted server-side; the client stores the option (`OL_CHARACTER`) and the driver re-sends it on world entry. Tests: `quest_map`, `quest_giver_index`, `questmap_*`. |
+| "Quest Details Map Display" range (`/questmap`) | `systems/quests/quest_map.rs`, `systems/npcs/spawn_manager.rs` (`quest_giver_spawners_near`), `systems/services/commands/scripts/quest_map.rs` | added (Rust only: driver + server) | **Inferred (no 1.2 server evidence):** the 1.2 server never streams units beyond the ordinary 2-region neighbourhood; streaming quest givers further away for a per-character range is a Rust deviation, opt-in and a strict no-op at the default 100 m. The 3.5 slot semantics (`option_map_given_quest_distance`: slot x 100 m, 4.0 = unlimited; 10.x `sub_396433C0`) come from a 10.x decompile that cannot be checked here; only the option name is verifiable (`x2game-dev.dll.strings.txt` of the 10.x client). The 1.2 client computes a given-quest map mark per streamed unit (`ClientUnit::UpdateQuestMark`, x2game.dll r208022 dump, `FUN_39359c60` = VA `0x39359C60`, event `0x34` at VA `0x39359E90`; hand-decoded) and has no distance option, so the range is applied by the server: the injected driver sends a level-0 `/questmap <100\|200\|300\|0>` chat command on world entry and when the option is saved. Beyond the player's own 2-region window the server streams quest giver / reporter NPCs within the range: at most the 256 nearest per character (`MAX_EXTRA_NPCS`; a nearer NPC replaces a farther streamed one, so Unlimited is "the 256 nearest", not every quest giver), chosen among the nearest 264 placements; the player's own neighbourhood is left out of the candidate placements, so it is neither prepared for the option nor counted. A candidate is an ordinary placement whose members are all plain `Npc` rows of a quest giver / reporter template (`ConAcceptNpc`, `ConAcceptNpcEmotion`, `ConReportNpc`) that is nonaggressive and not creator-only (the predicate of the resident rule): templates with `aggression = 't'` are never streamed (820 of the 3,131 quest-NPC placement entries of `main_world`, 26 %), so Unlimited is not every quest giver, and a marker is streamed for every candidate whether or not the player can take its quests (the client decides what it draws). The 100 m and 200 m steps are almost no-ops: the ordinary window already reaches at least 128 m on every side (2 regions of 64 m, up to 192 m), so only 300 m and Unlimited matter. Preparing far placements takes at most 32 NPC preparations per quest-map tick (a `/questmap` change that refreshes at once gets its own 32); a change to a wider range refreshes at once at most once per second per character, a faster one is applied by the next tick, and a repeated range does nothing. A placement whose NPC a player streams stays warm (the retention sweep skips it); `SpawnManager::note_prepared` registers the placements the option prepared, so they are reclaimed once streaming stops while `World.NpcResidentServiceNpcs` is off (with the default `true` quest givers are resident anyway). The streamed set is what the server believes the client has, and the client loses units behind its back, so it is corrected from three sides: it is forgotten, without packets, when the client's world is wiped (cut-scene end, zone load, teleport ended: `client_world_reset`) and streamed again by the next tick; the region visibility path logs every NPC unit it removes from a client (`Player::note_region_removed_npc`: the newest 4,096 ids per player, appended with the region grid held, a leaf lock that is never held while taking another), and the next refresh applies that log first and runs at once, so a marker that the player's walk through the NPC's ordinary neighbourhood (or the NPC's walk out of it) took off the client is streamed again; a deleted, dying or dead NPC is removed from far viewers, also one that retires between a refresh's packets and its commit (looked at again once it is tracked). Accepted quest objectives are already map-wide via `X2Map:AddNotifyQuestInfo` (static quest data; `FUN_392b6ac0` was not tied to that Lua name). The range is not persisted server-side; the client stores the option (`OL_CHARACTER`) and the driver re-sends it on world entry. Tests: `quest_map`, `quest_giver_index`, `questmap_*`, `region_removed`. |
 | `SphereQuestManager`, `SphereQuest*`, `SphereGameData` (spheres, sphere_quests, `IsInsideAreaSphere`, `GetSphereIdFromQuest`) | `spheres.rs`, `data.rs` | done | `quest_sign_sphere.g` of `main_world`; one manager per server (500 ms tick). Other `sphere_*` tables not loaded (unused by quests). |
 | `AreaSphere` unit requirement (kind 35) of skills and quest components | `spheres.rs` (`inside_requirement_sphere`), `bridges.rs`, `engine.rs` (`EnvView`) | added | The C# `IsInsideAreaSphere` only tests the client sign spheres of the sphere's `sphere_quests` quest. 147 skill rows use kind 35; when that quest has no sign sphere at the requirement's place the skill can never be used. Tester report: quest 2273 "March of Respect" could not place its Ritual Offering Bundle (item 18638, skill 15204, `or_unit_reqs`: sphere 1152 OR doodad 3339 within `value2` / 1000 = 0.001 m): sphere 1152 ("Q2273...") links to quest 2907 (`sphere_quests` 660), which has no sign sphere at Prince Reander's Monument. The requirement now also passes inside the sphere's own `sphere_area_fill.json` area (1152: radius 6 m around the altar), for `SphereQuest` spheres only; the areas are not world-filtered (the callers have a position only; sphere ids are unique). Abandoning the quest destroying the bundle is the data (supply act 1822: `destroy_when_drop`). Test: `quests::tests::requirement_sphere_falls_back_to_the_shipped_area`. |
 | Imported quest sign spheres (`quest_sign_sphere_fill.json`) | `spheres.rs` (`load_sign_sphere_fill`), `mod.rs` (start), `app/Data/Worlds/*/quest_sign_sphere_fill.json`; converter `rust/tools/quest_sign_sphere_import/` | added | The 19 quests of `Docs/wiki/Quest-Audit.md` whose objective sphere has no 1.2 client sign sphere (1012, 1024, 1033, 1039, 1372, 1392, 1398, 1400, 1650, 1897, 5272, 5439, 5716, 5898, 5979, 6039, 6050, 6213, 6216). One offline converter reads the 10.x `world_server/quest_area_sphere.g` (`stype` = `spheres.id`) and the 10.x client `client/quest_sign_sphere.g` (`qtype` / `ctype`), both zone-local in the source, and writes **8 spheres in 7 quests** in world coordinates (`source_zone_origin * 1024 + local`, z as is; the loader uses fill rows as world and adds no origin): 1650 (main_world 142), 5716 (main_world 186), 5979 (instance_training_camp 198, two areas), 6039 / 6050 (instance_prologue 300), 6213 (main_world 144), 6216 (main_world 158). The other 12 quests are dropped with a reason: 1012 / 1024 / 1033 / 1039 because the 10.x `spheres` row was reused for another quest (`sphere_mapping_mismatch`; e.g. 10.x sphere 945 -> quest 5804 while 1.2 uses it for 1033), 1400 because its 10.x component id differs (7021/36416 vs the 1.2 7020), and 1372 / 1392 / 1398 / 1897 / 5272 / 5439 / 5898 because their sphere ids have no block in the 10.x files at all. 5716's second block is dropped because it lies in zone 159 while the quest is authored in zone 186; 6039 / 6050's second files are dropped because zone 348 does not exist in 1.2. Guards: the 10.x and 1.2 `spheres` / `sphere_quests` rows must name the same detail and quest, the 1.2 component must have a `QuestActObjSphere` / `QuestActCheckSphere` act for the same `sphere_id`, the zone must belong to the named 1.2 world and be open (`zones.closed = 'f'`), a 1.2 client sphere for the same (quest, component) is never overridden, and a 1.2 `mission_mission0.xml` `AreaSphere` with the same `value1` within 1.5 m must agree on the radius. The loader repeats the runtime guards, loads the file after the client spheres and rejects duplicates; the quest sphere triggers compare the sphere's `world_id` with the player's world (a main_world area no longer fires inside an instance). The 10.x client sign sphere file contributed no kept entry (its only matching old quests are in zones closed in 1.2), and the 10 contexts without components are untouched. Location note: the active manager/loader is `systems/quests/spheres.rs`; the world-side copy `systems/npcs/sphere_quest.rs` is not started (`start` is a no-op), so the fill is wired into the active path. |
@@ -2960,22 +2960,33 @@ is no longer mirrored (see "Known deviations", dead NPC returned and healed).
   sender faction stays in the sender block. Channel copies substitute the actual `ChatChannel` sub
   type / faction while keeping the requested chat type (zone Shout / Trade / LFG and raid /
   raid-leader included).
-* systems::economy: **Trade cancel reasons and server-initiated cancels (2026-11-10).**
+* systems::economy: **Trade cancel reasons and server-initiated cancels (2026-11-11).**
   `SCTradeCanceled` always prints ui_text 569 `canceled` ("거래가 취소되었습니다.", "Trade
   canceled.") through the client's Lua `TRADE_CANCELED` handler (`trade.alb` proto 30 calls the
   message function with `true`); only reason 5 (`TCR_OPEND_MONEY_WINDOW`) additionally shows
   error 538 `trade_target_is_not_possible_state` (causedByMe false) or 539
   `cant_trade_with_other_view` (true) in `FUN_394ff1f0`. The client's own reasons are 0 normal,
   1 partner missing and 2 at `>= sqrt(25) = 5` m (`X2::GameClient::UpdateTradeChecks`,
-  `FUN_394fd9a0`), and 5 for another exclusive window. The port keeps 0 for internal
-  cancellations, uses 1 for leave-world, 2 for its own 5 m check, and 0 for death / loading zone
-  change (the client suppresses its own line on `ENTERED_LOADING`); `CSCancelTrade` reasons pass
-  through, so the client's 5 keeps its 538/539 text. Death, a server-forced teleport (portal,
-  GM move, instance/world load or resurrection displacement, same zone group included) and
-  movement out of range now end the trade for both players; a plain zone-group crossing on foot
-  keeps it. The teleport cancel runs when the teleport is **issued**, at both load chokes:
+  `FUN_394fd9a0`), 3 and 4 for two state changes (`FUN_394fd760`, states `0x10` and `0x3b`), and
+  5 for another exclusive window. The port keeps 0 for internal cancellations, including
+  leave-world, death and teleports, and uses 1 and 2 only in its own copy of the
+  `UpdateTradeChecks` rule; `CSCancelTrade` reasons pass through, so the client's 5 keeps its
+  538/539 text. On `ENTERED_LOADING` the client hides the trade window without the chat line;
+  the window's `OnHide` handler calls `X2Trade:CancelTrade(TCR_NORMAL)` (`trade.alb` protos 44
+  -> 6 -> 19), which sends `CSCancelTrade(0)` while the client's trade state is active, and
+  `UpdateTradeChecks` ends a trade within 1 s. **Inferred (no 1.2 server evidence):** the server
+  rules below (that the 1.2 server ended trades on death, teleports and distance, and the
+  reasons it uses): they make the end of a trade independent of the client (no modified or
+  headless client, no 1 s window keeps one open). Not verified: that `Show(false)` raises
+  `OnHide` synchronously and that `SCTeleportUnit` raises `ENTERED_LOADING`. Death, a
+  server-forced teleport (portal, GM move, instance/world load or resurrection displacement,
+  same zone group included) and movement out of range end the trade for both players; a plain
+  zone-group crossing on foot keeps it. The teleport cancel runs when the teleport is
+  **issued**, at both load chokes:
   `world::session::teleport_character` (instance/world loads, resurrection, trial), the
-  zone-access return transport (its own hook) and `world::session::begin_teleport` (every
+  zone-access return transport (its own hook) and `world::session::begin_teleport_ending_trade`
+  / `send_teleport_unit_ending_trade` (`begin_teleport` / `send_teleport_unit` keep their
+  signatures, CONTRIBUTING-PORT section 3; every server-side
   `SCTeleportUnit` sender —
   same-instance portal, NPC teleporter, dominion headquarters / siege area, instant game,
   GM `/move` / nudge / sphere / jail, move-guard correction, deck standers, skill displacements
@@ -2984,8 +2995,14 @@ is no longer mirrored (see "Known deviations", dead NPC returned and healed).
   `UpdateTradeChecks` (`FUN_394fd9a0`) every 1000 ms (`trade::check_running_trades`, started by
   `trade::start_checks`): a missing partner / another instance cancels with 1, `>= 5` m with 2.
   That covers players carried by a vehicle or mate and seat-bound players whose own movement
-  packets `world::session::move_unit` ignores (Greptile findings on PR #106). Hooks only cancel
-  when a trade exists; a second hook call after `teleport_character` is a no-op. Tests:
+  packets `world::session::move_unit` ignores (up to 1 s late, like the client's own cadence).
+  The check works on a snapshot of the table and cancels only the very trade it saw (id and a
+  never-reused generation): freed trade ids are reused at once, so the id alone could name a
+  newer trade.
+  Hooks only cancel when a trade exists; a second hook call after `teleport_character` is a
+  no-op. The hooks and the periodic check take the entry out under the manager mutex and send
+  after dropping it (leaf rule); the older trade operations still send under it. Tests:
+  `the_periodic_check_does_not_cancel_a_newer_trade_that_reused_the_id`,
   `moving_out_of_range_cancels_with_the_client_checks_reason`,
   `a_death_cancels_a_running_trade_for_both_players`,
   `crossing_a_zone_group_border_keeps_a_running_trade`,
@@ -4844,29 +4861,63 @@ is no longer mirrored (see "Known deviations", dead NPC returned and healed).
   places the triggers itself and asserts the five slime spawners and Okape's spawner.
 * systems::npcs (Sharpwind "water rises" geyser network, 2026-11-11): the missing placements and
   the logic network are now in place, so clearing the Blocked Geysers raises the lake.
-  **Placements (data):** the 1.2 client level editor data (10.x client pak
-  `game/worlds/instance_cuttingwind_deadmine/cells/000_000/editor/02_01/doodad.xml`, subcell
-  origin +256 m; the level is the same as 1.2 - the five stream rows match the old server rows
-  to <0.6 m and the z values match) places `5064`/`5068`/`5069` "Blocked Geyser" switches at
-  (678.33, 338.67, 143.87) / (672.68, 317.62, 143.79) / (691.12, 317.28, 143.60), invisible
-  water gates `5070`/`5071` at (681.18, 342.82, 143.99) / (684.98, 341.37, 144.03), water
-  streams `5072` x3 / `5073` x2 at (687.91, 333.87, 143.96) / (692.93, 326.99, 143.71) /
+  **Placements (data):** the 10.x client level editor `doodad.xml` (`ArcheAge Returns 10.0.2.13
+  r575`, `game/worlds/instance_cuttingwind_deadmine/cells/000_000/editor/02_01/doodad.xml`,
+  6437 B, MD5 74CFA418149294B9A36E4675CC119299, subcell origin +256 m; it is in neither r208022
+  nor r223748 and only its pak catalogue entry is on this machine, so the coordinates and family
+  ids below could not be re-read from the file) places `5064`/`5068`/`5069` "Blocked Geyser"
+  switches at (678.33, 338.67, 143.87) / (672.68, 317.62, 143.79) / (691.12, 317.28, 143.60),
+  invisible water gates `5070`/`5071` at (681.18, 342.82, 143.99) / (684.98, 341.37, 144.03),
+  water streams `5072` x3 / `5073` x2 at (687.91, 333.87, 143.96) / (692.93, 326.99, 143.71) /
   (684.83, 314.11, 143.86) / (670.13, 330.63, 143.99) / (697.69, 319.18, 143.85), and the lake
-  `5063` at (650.86, 292.16, 143.28), each with the editor `Family_Id` (50001-50008). The old
-  `doodad_spawns.json` had five `5064` rows at exactly the five *stream* positions (the AAEmu
-  hand-add of 2023, commit `853fa8543`); they are now the authored `5072`/`5073` templates, and
-  the three switches, the two gates and the lake are added. **Network:** the editor family id is
-  the doodad's identity (`Doodad::family_id`, spawn row `FamilyId`; the C# JSON model never had
-  it). A `DoodadFuncLogicFamilyProvider { family_id }` row names the **receiver** families of
-  the doodad's signal; a `DoodadFuncLogicFamilySubscriber { family_id }` row names the **source**
+  `5063` at (650.86, 292.16, 143.28), each with the editor `Family_Id` (50001-50008). The level
+  is the same as 1.2: the heightmap, object, brush, entities and navmesh files of the instance
+  have identical size and MD5 in the r223748 pak and the 10.x r575 pak (r208022 has the same
+  sizes; pak catalogue comparison), the 1.2 prefab `cuttingwind.water1` lake polygon contains
+  all 11 water placements, and five old server rows already stood at the stream positions. The
+  old `doodad_spawns.json` had five `5064` rows (the AAEmu hand-add of 2023, commit
+  `853fa8543`, with the wrong template) with the same yaws 0.03-0.71 m from the five stream
+  positions (row 1, (697.2, 319.7), is 0.71 m from (697.69, 319.18); the others are 0.03 / 0.17
+  / 0.27 / 0.15 m, z within 0.16 m): they show that five doodads stood there, not what the
+  editor file contains. **All five old rows change template, 5064 -> 5072 / 5073** (the
+  authored positions replace them), and the three switches, the two gates and the lake are
+  added. **Network:** the editor family id is the doodad's identity (`Doodad::family_id`, spawn
+  row `FamilyId`; the C# JSON model never had it). A `DoodadFuncLogicFamilyProvider { family_id }`
+  row names the **receiver** families of the doodad's signal; a `DoodadFuncLogicFamilySubscriber { family_id }` row names the **source**
   families its `DoodadFuncLogic` accepts (each subscribed family is one input, missing = false).
-  Thus 5064 (50002) and 5068 (50003) feed gate 5070 (50005), whose AND (delay 1 = 1 s) emits to
-  50006 (gate 5071) and 50007 (5072); gate 5071 ANDs 5069 (50004) with gate 5070 (50005) and
-  emits to 50001 (lake 5063) and 50008 (5073). The switches' `DoodadFuncPulse(flag)` now runs
-  only for a character-caused phase (the C# `if (caster is not null)`), and their
-  `DoodadFuncPulseTrigger` fires on a character-caused phase entry (the C# `Use`), so using a
-  switch pulses the network and then reaches its `DoodadFuncFinal` (13163/13177/13180, the rock
-  disappears after 1 s). The lake then runs 13157 -pulse-> 14184 -5 s timer-> 13158
+  **Inferred (no 1.2 server evidence):** that every other chain reads the two tables this way;
+  only Sharpwind's graph closes (every id 50001-50008 has exactly one carrier, provider labels
+  are receiver ids, subscriber labels are sender ids), and the template-level reading `main` used
+  (provider family == subscriber family) is incoherent for it. Thus 5064 (50002) and 5068
+  (50003) feed gate 5070 (50005), whose AND (delay 1 = 1 s) emits to 50006 (gate 5071) and 50007
+  (5072); gate 5071 ANDs 5069 (50004) with gate 5070 (50005) and
+  emits to 50001 (lake 5063) and 50008 (5073). A signal from the spawner's `RelatedIds` is an
+  explicit authored route like a client wire and bypasses that subscriber source filter (the
+  shipped rows of Howling Abyss, Howling Abyss 2 and Immortal Isle carry no `FamilyId`).
+  **Family routing therefore needs the `FamilyId` of the placement rows:** a level whose rows
+  carry none has no family routing (`RelatedIds` and client wires still work). The 6
+  template-level pairs of `instance_nachashgar` rooms 4 / 6 / 7 that `main` connected by
+  matching a provider family of one template against a subscriber family of another (6643 ->
+  6646 via 50103, 6724 -> 6727 via 50108, 6647 -> 6643 via 50100, 6727 -> 6729 via 50111,
+  6737 -> 6739 via 50115, 6641 -> 6644 via 50102; no `RelatedIds`, no `FamilyId` in those rows)
+  are inert now. `zones.closed` is `t` for both `instance_nachashgar` (zone 192) and
+  `instance_nachashgar_easy` (zone 204) in the r208022 compact DB, so no player is affected in
+  1.2. No template-level fallback was added: Sharpwind never needs one, and the template
+  reading is not evidenced for the other chains (test
+  `no_family_id_on_the_placement_means_no_family_routing`). The
+  switches' `DoodadFuncPulse(flag)` now runs only when the phase is entered with a caster (the C#
+  `if (caster is not null)`), and a `DoodadFuncPulseTrigger` also fires on the pulse its own
+  group's `DoodadFuncPulse` sent in the same phase entry when the flags match, so using a switch
+  pulses the network and then reaches its `DoodadFuncFinal` (13163/13177/13180, the rock
+  disappears after 1 s). A phase entered by a signal or a timer fires no trigger by itself (the
+  player caster travels along both): Sal Temple's Ice Machine 4752 -> Ice Trap 4751 toggle
+  (`PulseTrigger(t -> 11796)` / `PulseTrigger(f -> 11795)`) switches off at the false pulse and
+  stays off, and Jolly Roger Tower 3382 group 7885 (`Pulse(f)` + `PulseTrigger(t -> 8260)`) stays
+  put. **Inferred (no 1.2 server evidence):** this trigger rule. The AAEmu C#
+  `DoodadFuncPulseTrigger.Use` returns `true` for a non-character caster and otherwise fires a
+  `Flag == true` row whose shared `PulseTriggered` flag is false (reset only by a source
+  `DoodadFuncPulse(true)` for its `RelatedIds` targets), i.e. on the first character-caused
+  entry, which would bounce every toggle here. The lake then runs 13157 -pulse-> 14184 -5 s timer-> 13158
   (`DoodadFuncWaterVolume` 22 m / 22 s + 22 s timer) -> 13159 (`cuttingwind.water2`, whose
   client prefab is the same water volume raised by +22.000046 m; the client's water volume
   provides the swim/buoyancy that lifts the party, so no server position lift is needed).
@@ -4876,18 +4927,55 @@ is no longer mirrored (see "Known deviations", dead NPC returned and healed).
   funcs; in the C# execution order the switch's `PulseTrigger` (274) ran before its `Pulse`
   (287) and stopped the sequence, so the signal was never sent. The 10.x zone loader
   (`LoadDoodadPhaseFuncDescs`, `sub_39BE6B30`) selects the table without `ORDER BY`, i.e. row
-  order, which also runs the pulse first. (2) `DoodadFuncLogic`
-  delays are implemented for all eight authored enum values (1 s .. 30 min); the old code
-  refused anything but 1 s and emitted immediately. (3) per-doodad `pulse_triggered` state (the
-  C# flag lived on the shared func list, so one doodad's trigger suppressed every instance's).
-  **INFERRED:** the five stream positions and the three switch/gate/lake positions are the
-  10.x editor placements, not a 1.2 server DB export (no such export exists here); the level
-  file positions are confirmed by the five pre-existing stream rows. Tests:
-  `doodad::phase::tests::{sharpwind_switches_raise_the_lake_through_the_family_network,
+  order, which also runs the pulse first (the SQL string without `ORDER BY` is in the 10.x
+  dedicated-server DLL, but the loader function itself is not decompiled on this machine:
+  **Inferred (no 1.2 server evidence)** that it runs the pulse first). (2) `DoodadFuncLogic`
+  delays: ids 1 / 2 / 3 = 1 s / 5 s / 10 s are the only ids in the shipped rows (74
+  `doodad_func_logics` rows: 61 / 6 / 7) and are evidenced by the QA gate template names
+  1754-1773 ("(1초)" / "(5초)" / "(10초)", e.g. 1754 "로직게이트 and (5초)" has delay 2);
+  **Inferred (no 1.2 server evidence):** ids 4..8 = 30 s / 1 min / 5 min / 10 min / 30 min (no
+  shipped row uses them and no `enum_doodad_logic_delays` table exists in the r208022, r223748,
+  AAEmu CN or MailRU r243378 compact DB). The old code refused anything but 1 s and emitted
+  immediately; the nine placed delay-1 gates (main_world 815, 1589, 2167, 2171, 2172; Howling
+  Abyss 3788, 5603; Howling Abyss 2 6364, 6418) now emit after 1 s instead of immediately (the 13
+  delay-2 / delay-3 QA gate templates are not placed). (3) the per-doodad, per-entry `pulsed` flag
+  replaces the C# `PulseTriggered`, which lived on the shared func list (one doodad's trigger
+  suppressed every instance of the template). (4) a `DoodadFuncLogic` result that returns to the
+  value it already emitted before its delay ends is cancelled instead of emitted a second time
+  (the downstream `PulseTrigger` rows would run twice); a pending result that differs from the
+  emitted one still emits after its delay, replaced ones never do. **Inferred (no 1.2 server
+  evidence):** this inertial output rule.
+  **Inferred (no 1.2 server evidence):** the five stream positions and the three
+  switch/gate/lake positions are the 10.x editor placements, not a 1.2 server DB export (no
+  such export exists here); the five pre-existing stream rows only show that five doodads stood
+  at those positions. Tests: `doodad::phase::tests::{
+  sharpwind_switches_raise_the_lake_through_the_family_network,
   family_pulses_route_by_the_level_design_family_and_owner_scope,
-  pulse_triggers_require_matching_signal_and_do_not_affect_other_objects}`,
+  spawner_related_ids_reach_a_subscribed_target_without_family_ids,
+  no_family_id_on_the_placement_means_no_family_routing,
+  a_spawner_gives_its_family_id_to_the_doodad_it_spawns,
+  pulse_triggers_require_matching_signal_and_do_not_affect_other_objects,
+  a_toggle_pair_follows_its_signals_when_the_chain_carries_a_player_caster,
+  a_false_pulse_does_not_fire_the_true_trigger_of_its_own_group,
+  a_true_pulse_fires_the_true_trigger_of_its_own_group,
+  sal_temple_ice_trap_stays_off_after_the_ice_machines_false_pulse,
+  a_pulse_without_a_caster_emits_nothing,
+  replaced_logic_output_emits_once_with_the_last_value,
+  a_pending_logic_output_that_returns_to_the_emitted_value_is_cancelled,
+  a_wire_linked_during_the_logic_delay_receives_nothing_until_the_emit,
+  subscribe_replays_only_the_emitted_logic_value,
+  deleted_doodads_take_no_part_in_family_routing,
+  clear_links_cancels_a_pending_logic_output}`,
+  `doodad::logic::tests::{authored_logic_operations_cover_true_false_and_mixed_inputs,
+  logic_delay_table_follows_the_qa_names_and_the_inferred_ids}`,
   `npcs::spawn_tests::real_data_sharpwind_water_network_placements` and (gated by
-  `AAEMU_COMPACT_DB`) `doodad::phase::tests::real_compact_db_sharpwind_water_network_rows`.
+  `AAEMU_COMPACT_DB` = a copy of the r208022 `compact.sqlite3`) `doodad::phase::tests::{
+  real_compact_db_sharpwind_water_network_rows,
+  real_compact_db_related_ids_signal_opens_the_howling_abyss_2_gate,
+  real_data_sharpwind_shipped_rows_raise_the_lake}` (the last drives the shipped
+  `doodad_spawns.json` rows through the three switches to the raised lake): `cargo test -p
+  aaemu-game --lib -- --ignored real_compact_db_sharpwind real_compact_db_related_ids
+  real_data_sharpwind`.
 * systems::npcs (start-active spawners / Sharpwind NPC spawn data, 2026-11-11): a plain
   `npc_spawns.json` row (no `NpcSpawnerIds`) expands into **every** game-data spawner that lists
   the NPC as a member (`SpawnManager::AddNpcSpawner` / `get_spawner_ids`), and neither the C#
