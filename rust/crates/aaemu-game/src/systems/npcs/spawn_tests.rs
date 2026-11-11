@@ -406,10 +406,8 @@ async fn npc_spawn_death_despawn_respawn_timing() {
     drop(player);
 }
 
-/// `npc_spawners.save_indun = 't'` (the authored dungeon spawners, e.g. Sharpwind's slimes):
-/// a dead member stays dead for the instance run - no respawn deadline and no periodic refill.
-#[tokio::test]
-async fn save_indun_spawner_does_not_respawn_a_dead_member() {
+/// A server whose spawner template 10 (NPC 500) is authored `npc_spawners.save_indun = 't'`.
+fn save_indun_server() -> Arc<GameServer> {
     let mut data = GameData::empty();
     let mut t10 = template(10, 1);
     t10.save_indun = true;
@@ -421,24 +419,43 @@ async fn save_indun_spawner_does_not_respawn_a_dead_member() {
     let server = Arc::new(test_server_with(data));
     server.set_self();
     *server.systems.npcs.spawns.test_backend.lock().unwrap() = Some(Arc::new(Backend));
-    let m = manager(&server);
+    server
+}
+
+/// A player standing in the world instance `world` (any instance, not just 0) at `(x, y)`.
+fn spawn_player_in(
+    server: &Arc<GameServer>,
+    world: &Arc<WorldInstance>,
+    client: &TestClient,
+    (x, y): (f32, f32),
+) -> PlayerRef {
+    let mut character = test_character(1, "P", x, y);
+    character.obj_id = 5000;
+    let player = Player::new(character, client.conn.handle());
+    server.world.try_add_character(&player);
+    world.spawn(&player, &server.view_ctx());
+    player
+}
+
+/// `npc_spawners.save_indun = 't'` (the authored dungeon spawners, e.g. Sharpwind's slimes):
+/// inside a live dungeon a dead member stays dead for the run - no respawn deadline and no
+/// periodic refill. The dungeon is a *system* one, which the one-run rule for the un-authored
+/// placements leaves alone, so only the authored flag can freeze the placement here.
+#[tokio::test]
+async fn save_indun_spawner_does_not_respawn_a_dead_member() {
+    let server = save_indun_server();
+    let world = dungeon_world(&server, 100, true, false);
+    let m = server.systems.npcs.spawns.get_or_create(&world);
     assert_eq!(
         m.add_npc_spawner(&server, npc_def(500, 500.0, 500.0)),
         Ok(1)
     );
-    let spawner = m
-        .get_all_spawners()
-        .values()
-        .flatten()
-        .next()
-        .unwrap()
-        .clone();
+    let spawner = only_spawner(&m);
     assert!(spawner.template().unwrap().save_indun);
 
     let client = TestClient::new(&server, 1, 1);
-    let player = spawn_player(&server, &client, test_character(1, "P", 510.0, 500.0), 5000);
+    let player = spawn_player_in(&server, &world, &client, (510.0, 500.0));
     spawn_manager::active_region_tick(&server);
-    let world = server.world.world(0).unwrap();
     let npcs = world.all_npcs();
     assert_eq!(npcs.len(), 1);
     let npc = npcs[0].clone();
@@ -476,15 +493,58 @@ async fn save_indun_spawner_does_not_respawn_a_dead_member() {
     drop(player);
 }
 
-/// [`server`] with a fresh world instance + spawn manager and a registered live `Dungeon`
-/// (`is_system` / `client_driven` as given). The placement uses template 10 (`save_indun =
-/// 'f'`), so only the run kind decides.
-fn instance_server(
+/// The authored `save_indun` means "save in dungeon": in the open world (no `Dungeon`, so no
+/// run) the member respawns as usual. A quest NPC whose only spawner row is `'t'` (the
+/// Privateer Lieutenant / Quartermaster, Irene Royster) must not be gone until a restart.
+#[tokio::test]
+async fn save_indun_spawner_still_respawns_outside_a_dungeon() {
+    let server = save_indun_server();
+    let m = manager(&server);
+    assert_eq!(
+        m.add_npc_spawner(&server, npc_def(500, 500.0, 500.0)),
+        Ok(1)
+    );
+    let spawner = only_spawner(&m);
+    assert!(spawner.template().unwrap().save_indun);
+
+    let client = TestClient::new(&server, 1, 1);
+    let _player = spawn_player(&server, &client, test_character(1, "P", 510.0, 500.0), 5000);
+    spawn_manager::active_region_tick(&server);
+    let world = server.world.world(0).unwrap();
+    let npc = world.all_npcs().first().cloned().expect("spawned");
+    {
+        let mut d = npc.data();
+        d.unit.hp = 0;
+        d.dead_time_ms = crate::world::now_ms();
+    }
+    spawn_manager::on_npc_died(&server, &npc);
+    assert_eq!(
+        m.pending_respawns().len(),
+        1,
+        "outside a dungeon save_indun keeps the respawn deadline"
+    );
+    assert!(!spawner.saved_death());
+
+    advance(11);
+    m.check_respawns_tick(&server);
+    spawn_manager::active_region_tick(&server);
+    assert!(
+        world
+            .all_npcs()
+            .iter()
+            .any(|n| !n.data().unit.is_dead() && n.data().unit.template_id == 500),
+        "the open-world member respawns"
+    );
+}
+
+/// A fresh world instance `id` on `server` with a registered live `Dungeon` (`is_system` /
+/// `client_driven` as given): the runtime answer the one-run freeze asks for.
+fn dungeon_world(
+    server: &Arc<GameServer>,
     id: u32,
     is_system: bool,
     client_driven: bool,
-) -> (Arc<GameServer>, Arc<WorldInstance>) {
-    let server = server();
+) -> Arc<WorldInstance> {
     let template = server
         .game_data
         .worlds
@@ -493,32 +553,47 @@ fn instance_server(
         .clone();
     let world = server.world.create_world_instance(Arc::new(template), id);
     crate::systems::instances::dungeon::register_test_dungeon(
-        &server,
+        server,
         &world,
         is_system,
         client_driven,
     );
+    world
+}
+
+/// [`server`] with a fresh [`dungeon_world`]. The placement uses template 10 (`save_indun =
+/// 'f'`), so only the run kind decides.
+fn instance_server(
+    id: u32,
+    is_system: bool,
+    client_driven: bool,
+) -> (Arc<GameServer>, Arc<WorldInstance>) {
+    let server = server();
+    let world = dungeon_world(&server, id, is_system, client_driven);
     (server, world)
 }
 
-/// Spawns NPC 500 in `world`, kills it and returns (manager, spawner, world).
+/// Spawns NPC 500 of a fresh spawn-file placement in `world` and returns (manager, spawner, npc).
+fn spawn_one_placement(
+    server: &Arc<GameServer>,
+    world: &Arc<WorldInstance>,
+) -> (Arc<SpawnManager>, Arc<NpcSpawner>, NpcRef) {
+    let m = server.systems.npcs.spawns.get_or_create(world);
+    assert_eq!(m.add_npc_spawner(server, npc_def(500, 500.0, 500.0)), Ok(1));
+    let spawner = only_spawner(&m);
+    assert!(spawner.is_placement());
+    spawner.do_spawn(server);
+    let npc = world.all_npcs().first().cloned().expect("spawned");
+    (m, spawner, npc)
+}
+
+/// Spawns NPC 500 in `world`, kills it and returns (manager, spawner).
 fn kill_one_placement(
     server: &Arc<GameServer>,
     world: &Arc<WorldInstance>,
 ) -> (Arc<SpawnManager>, Arc<NpcSpawner>) {
-    let m = server.systems.npcs.spawns.get_or_create(world);
-    assert_eq!(m.add_npc_spawner(server, npc_def(500, 500.0, 500.0)), Ok(1));
-    let spawner = m
-        .get_all_spawners()
-        .values()
-        .flatten()
-        .next()
-        .unwrap()
-        .clone();
-    assert!(spawner.is_placement());
+    let (m, spawner, npc) = spawn_one_placement(server, world);
     assert!(!spawner.template().unwrap().save_indun);
-    spawner.do_spawn(server);
-    let npc = world.all_npcs().first().cloned().expect("spawned");
     {
         let mut d = npc.data();
         d.unit.hp = 0;
@@ -587,6 +662,126 @@ async fn client_driven_instance_placement_still_respawns() {
         "the prologue keeps its respawn deadline"
     );
     assert!(!spawner.saved_death());
+}
+
+/// A scripted removal of a living NPC that finished its walk (`Simulation.StopMove` ->
+/// `despawn_with_respawn`) is not a death: the placement of a per-run dungeon keeps its respawn.
+#[tokio::test]
+async fn scripted_walk_removal_in_a_dungeon_keeps_the_respawn() {
+    let (server, world) = instance_server(100, false, false);
+    let (m, spawner, npc) = spawn_one_placement(&server, &world);
+    spawner.despawn_with_respawn(&server, &npc);
+    assert!(!spawner.saved_death());
+    assert_eq!(
+        m.pending_respawns().len(),
+        1,
+        "a living NPC that walked off is respawned"
+    );
+}
+
+/// `KillNpcWithoutCorpse` claims the NPC's life (`scripted_removed`) before it removes it, and
+/// counts as a kill for the monster hunt: inside a per-run dungeon that kill is final.
+#[tokio::test]
+async fn claimed_scripted_removal_in_a_dungeon_freezes_the_placement() {
+    let (server, world) = instance_server(100, false, false);
+    let (m, spawner, npc) = spawn_one_placement(&server, &world);
+    assert!(crate::systems::npcs::npc::death::claim_scripted_removal(
+        &npc
+    ));
+    spawner.despawn_with_respawn(&server, &npc);
+    assert!(spawner.saved_death());
+    assert!(
+        m.pending_respawns().is_empty(),
+        "a scripted kill in a dungeon run schedules no respawn"
+    );
+
+    advance(11);
+    m.check_respawns_tick(&server);
+    spawner.do_spawn(&server);
+    assert!(
+        world.all_npcs().is_empty(),
+        "neither the timer nor a refill brings it back"
+    );
+}
+
+/// The scripted-removal path keeps the dungeon-only rule of the authored `save_indun`: outside a
+/// dungeon the claimed removal of such an NPC is respawned as usual.
+#[tokio::test]
+async fn claimed_scripted_removal_of_a_save_indun_npc_outside_a_dungeon_respawns() {
+    let server = save_indun_server();
+    let world = server.world.world(0).unwrap();
+    let (m, spawner, npc) = spawn_one_placement(&server, &world);
+    assert!(spawner.template().unwrap().save_indun);
+    assert!(crate::systems::npcs::npc::death::claim_scripted_removal(
+        &npc
+    ));
+    spawner.despawn_with_respawn(&server, &npc);
+    assert!(!spawner.saved_death());
+    assert_eq!(
+        m.pending_respawns().len(),
+        1,
+        "the open world has no run to freeze"
+    );
+}
+
+/// A frozen placement keeps its survivors: when the players leave, the distance reclaim of the
+/// cold placement must not remove the living members of a placement one member of which died
+/// (nothing refills a frozen placement, so the room would stay empty for the rest of the run).
+#[tokio::test]
+async fn frozen_placement_survivors_are_not_reclaimed_when_the_players_leave() {
+    let mut t = template(10, 3);
+    t.min_population = 3;
+    let server = activation_server(t);
+    let world = dungeon_world(&server, 100, false, false);
+    let m = server.systems.npcs.spawns.get_or_create(&world);
+    let mut def = npc_def(500, 100.0, 100.0);
+    def.count = 3;
+    assert_eq!(m.add_npc_spawner(&server, def), Ok(1));
+    let spawner = only_spawner(&m);
+    let client = TestClient::new(&server, 1, 1);
+    let player = spawn_player_in(&server, &world, &client, (100.0, 100.0));
+    let living = || {
+        world
+            .all_npcs()
+            .iter()
+            .filter(|n| !n.data().unit.is_dead())
+            .count()
+    };
+
+    assert_eq!(activate(&server).created, 3);
+    assert_eq!(living(), 3);
+
+    // One member dies: the placement is frozen for the run, its two survivors stay.
+    let dead = world.all_npcs().first().cloned().expect("spawned");
+    {
+        let mut d = dead.data();
+        d.unit.hp = 0;
+        d.dead_time_ms = crate::world::now_ms();
+    }
+    spawn_manager::on_npc_died(&server, &dead);
+    assert!(spawner.saved_death());
+    assert_eq!(living(), 2);
+
+    // The player walks away and the retention interval (60 s) passes.
+    player.data().unit.transform.set_xyz(1200.0, 1200.0, 100.0);
+    world.add_visible_object(&player, &server.view_ctx());
+    activate(&server); // books the stable countdown
+    advance(60);
+    let stats = activate(&server);
+    assert_eq!(stats.reclaimed, 0, "a frozen placement is never reclaimed");
+    m.check_respawns_tick(&server);
+    assert_eq!(
+        living(),
+        2,
+        "the survivors are still alive after the retention"
+    );
+
+    // Coming back finds them where they were; nothing is refilled or duplicated.
+    player.data().unit.transform.set_xyz(100.0, 100.0, 100.0);
+    world.add_visible_object(&player, &server.view_ctx());
+    let stats = activate(&server);
+    assert_eq!(stats.created, 0, "the frozen placement is not refilled");
+    assert_eq!(living(), 2);
 }
 
 #[tokio::test]
@@ -3584,7 +3779,7 @@ fn quest_fill_npcs_reach_the_area_spawner_minimum() {
 /// `npc_spawns_quest_fill.json` points bring the spawn points of its area spawner members to the
 /// spawner's authored `min_population` (and not above its `maxPopulation` where the fill applied).
 /// Points are counted within 350 m of the area centre, distinct per template (the loader drops
-/// rows of the same template within 2 m, so the stacked Schima Rogue rows count once). Four areas
+/// rows of the same template within 2 m, so the stacked Schima Rogue rows count once). Three areas
 /// already held their `min_population` and were left alone: the Poacher 2514 camp (4 >= 4), the
 /// Wild Fangs Poacher 9201 camp (5 points, already above its max 3) and the Pavitra's Fall site
 /// 12814 (15 = min; its Death Shroud 2906 share is 3 of the authored mix, so quest 943's 8 kills
@@ -3749,6 +3944,14 @@ fn quest_fill_reported_areas_reach_the_area_spawner_minimum() {
             "Crazed Disciple, quest 1415",
         ),
     ];
+    // The owner-requested hunt top-up (`quest_fill_reported_hunts_hold_a_quests_kills`) lifts two
+    // filled areas above their authored `maxPopulation`: the Fire Elemental Explorers to 15 for
+    // quest 3862's 15 kills, and the seabugs / turtles to 8 + 8.
+    let hunt_top_up = |spawner: u32| match spawner {
+        7933 => 15,
+        5585 => 16,
+        _ => 0,
+    };
     for (spawner, min, max, filled, units, x, y, what) in areas {
         let count = near(units, x, y);
         assert!(
@@ -3756,11 +3959,126 @@ fn quest_fill_reported_areas_reach_the_area_spawner_minimum() {
             "spawner {spawner} {what}: {count} points within 350 m, min_population {min}"
         );
         if filled {
+            let cap = max.max(hunt_top_up(spawner));
             assert!(
-                count <= max,
+                count <= cap,
                 "spawner {spawner} {what}: {count} points within 350 m, max_population {max}"
             );
         }
+    }
+}
+
+/// The owner's follow-up on the 2026-11-11 Haranya hunt reports (Mahadevi / Solis / Falcorth):
+/// with several players levelling at once, an area that holds only the spawner's
+/// `min_population` still bottlenecks. Each reported hunt area now holds at least the quest's
+/// kill count of its NPC, but never fewer than 8 or more than 15 (`clamp(kills, 8, 15)`);
+/// NPCs that only count toward a 26-30 kill group hunt get 15. Points are counted as in
+/// `quest_fill_reported_areas_reach_the_area_spawner_minimum` (350 m, distinct within 2 m).
+/// An owner-requested deviation: the extra points go past the authored spawner counts.
+#[test]
+fn quest_fill_reported_hunts_hold_a_quests_kills() {
+    use crate::systems::npcs::doodad::spawner::{parse_list, NpcSpawnerDef};
+
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("app/Data/Worlds/main_world");
+    let mut points: Vec<(u32, f32, f32, f32)> = Vec::new();
+    for file in [
+        "npc_spawns.json",
+        "npc_spawns_10x.json",
+        "npc_spawns_quest_fill.json",
+    ] {
+        let Ok(text) = std::fs::read_to_string(dir.join(file)) else {
+            return;
+        };
+        for d in parse_list(&text, NpcSpawnerDef::from_json).expect(file) {
+            let p = d.base.position;
+            points.push((d.base.unit_id, p.x, p.y, p.z));
+        }
+    }
+    let distinct_near = |unit: u32, x: f32, y: f32| {
+        let mut seen: Vec<(f32, f32, f32)> = Vec::new();
+        for &(u, px, py, pz) in &points {
+            if u != unit || (px - x).hypot(py - y) > 350.0 {
+                continue;
+            }
+            if seen.iter().any(|&(sx, sy, sz)| {
+                (sx - px).abs() < 2.0 && (sy - py).abs() < 2.0 && (sz - pz).abs() < 2.0
+            }) {
+                continue;
+            }
+            seen.push((px, py, pz));
+        }
+        seen.len()
+    };
+    // (NPC, the largest kill count of its hunts, area centre, report item)
+    let hunts: [(u32, usize, f32, f32, &str); 12] = [
+        (4210, 5, 23829.6, 9473.4, "Schima Rogue, quest 1367"),
+        (
+            2514,
+            15,
+            20090.4,
+            8364.9,
+            "Poacher, quests 861 (8) / 2703 (15)",
+        ),
+        (9201, 20, 19886.1, 8649.6, "Poacher, quest 3307"),
+        (
+            2510,
+            5,
+            18581.4,
+            7660.4,
+            "Mahadevi Seabug, quests 2711/2902",
+        ),
+        (
+            2509,
+            8,
+            18581.4,
+            7660.4,
+            "Tropical Turtle, quest 2901 (8 horns)",
+        ),
+        (2906, 8, 17178.5, 8356.8, "Death Shroud, quest 943"),
+        (2907, 8, 17178.5, 8356.8, "Headless Knight, quest 943"),
+        (
+            2952,
+            15,
+            17195.2,
+            8022.3,
+            "Fire Elemental Explorer, quest 3862",
+        ),
+        (
+            2914,
+            30,
+            16561.5,
+            7965.7,
+            "Earth Elemental Seeker, group hunt 2774",
+        ),
+        (
+            9924,
+            30,
+            16325.5,
+            8451.7,
+            "Ghostly Soldier, group hunt 3866",
+        ),
+        (
+            2911,
+            30,
+            16902.2,
+            7347.2,
+            "Armored Crayfish, group hunt 3861",
+        ),
+        (
+            2942,
+            24,
+            16359.8,
+            7649.6,
+            "Saffron Thief, quests 947 (12) / 2776 (24)",
+        ),
+    ];
+    for (unit, kills, x, y, what) in hunts {
+        let want = kills.clamp(8, 15);
+        let got = distinct_near(unit, x, y);
+        assert!(
+            got >= want,
+            "{what}: {got} points within 350 m, want clamp({kills}, 8, 15) = {want}"
+        );
     }
 }
 
@@ -3770,7 +4088,8 @@ fn quest_fill_reported_areas_reach_the_area_spawner_minimum() {
 /// another fill point or to an authored point of its area is still a stacked spawn in practice.
 /// The first version of the fill left Giant Direwolf 1009 on Shadowhawk Assassin 8937, Mahadevi
 /// Gorilla 9375 on Elephant 9378, and Cruel Overseer 1579 on its camp members; this test pins the
-/// regenerated points of all 43 areas, their per-template counts, and the 8 m spacing (X/Y).
+/// regenerated points of all 43 areas (and the 3 areas of the owner-requested hunt top-up), their
+/// per-template counts, and the 8 m spacing (X/Y).
 #[test]
 fn quest_fill_points_keep_eight_metres_from_each_other_and_the_authored_points() {
     use crate::systems::npcs::doodad::spawner::{parse_list, NpcSpawnerDef};
@@ -3789,21 +4108,21 @@ fn quest_fill_points_keep_eight_metres_from_each_other_and_the_authored_points()
         .expect("npc_spawns_quest_fill.json");
     let fill_defs = parse_list(&text, NpcSpawnerDef::from_json).expect("fill file");
     // (centre X, centre Y, area member templates, fill points per member)
-    let areas: [(f32, f32, &[u32], &[usize]); 43] = [
+    let areas: [(f32, f32, &[u32], &[usize]); 46] = [
         (26507.38, 6533.56, &[8932], &[17]),
         (23926.48, 6546.64, &[8924], &[10]),
         (24834.87, 6623.12, &[1009, 8937], &[4, 4]),
         (29256.24, 7246.86, &[9712], &[1]),
         (17207.85, 7273.70, &[2908], &[8]),
-        (16902.19, 7347.15, &[2911], &[13]),
+        (16902.19, 7347.15, &[2911], &[14]),
         (24271.67, 7532.54, &[1005], &[7]),
-        (16359.76, 7649.60, &[2942], &[11]),
-        (18581.35, 7660.44, &[2509, 2510], &[1, 0]),
+        (16359.76, 7649.60, &[2942], &[14]),
+        (18581.35, 7660.44, &[2509, 2510], &[5, 5]),
         (16561.46, 7965.66, &[2914], &[16]),
-        (17195.2, 8022.28, &[2952], &[3]),
+        (17195.2, 8022.28, &[2952], &[13]),
         (16373.63, 8234.48, &[9888], &[5]),
         (9077.52, 8435.88, &[9375, 9378], &[7, 6]),
-        (16325.51, 8451.69, &[9924], &[8]),
+        (16325.51, 8451.69, &[9924], &[14]),
         (8961.54, 8456.24, &[9379], &[3]),
         (22980.42, 8950.27, &[4198], &[1]),
         (9086.47, 9141.55, &[9391], &[5]),
@@ -3833,6 +4152,11 @@ fn quest_fill_points_keep_eight_metres_from_each_other_and_the_authored_points()
         (11762.92, 12889.13, &[789], &[1]),
         (10878.06, 17038.1, &[1990], &[4]),
         (11936.57, 17847.24, &[1998], &[3]),
+        // The owner-requested hunt top-up (`quest_fill_reported_hunts_hold_a_quests_kills`): the
+        // two Poacher camps and the Pavitra's Fall site, which the first fill left alone.
+        (20090.4, 8364.9, &[2514], &[11]),
+        (19886.1, 8649.6, &[9201], &[10]),
+        (17178.5, 8356.8, &[2906, 2907], &[5, 4]),
     ];
     let members: HashSet<u32> = areas
         .iter()
