@@ -19,12 +19,22 @@
 //! choice as the authority's `tick_dual` (calendar / GM test clock for a calendar
 //! materialisation, the real clock for a GM schedule).
 //!
-//! `can_attack` runs for every hit, so the rule reads the per-zone [`SiegeAreaCache`] (one
-//! small copy, rebuilt once a second) instead of cloning a `DominionState`; the cheap party
-//! check runs before any world / position lookup.
+//! A party is the set of **participants** of one side (`participants::participant_side`): a
+//! roster entry whose member still belongs to the side's expedition. A guild member who never
+//! joined the roster, or left it, is in no party.
 //!
-//! The rule sits in `skills::relation::can_attack` after the Peace, no-PvP and own-mount
-//! refusals, so it can never make an attack possible where those protections refuse it.
+//! The rule sits in the relation engine, `skills::relation::relation_to`
+//! (`BaseUnit.GetRelationStateTo`), not in `can_attack`: the skill target filters, the effect
+//! loop (`friendly` / `non_friendly` effects), the crime check of the damage effect, the PvP
+//! honor and `can_attack` all read the relation from there, so two guilds of one nation are
+//! hostile for all of them and not only for the attack permission. `can_attack` keeps its Peace,
+//! no-PvP and own-mount refusals ahead of the relation, so the rule can never make an attack
+//! possible where those protections refuse it.
+//!
+//! `relation_to` runs for every effect of every skill, so the rule reads the per-zone
+//! [`SiegeAreaCache`] (one small copy, rebuilt once a second) instead of cloning a
+//! `DominionState`; it returns before it touches a unit while no siege has an area, and the
+//! cheap party check runs before any world / position lookup.
 
 use chrono::Utc;
 
@@ -33,6 +43,8 @@ use crate::systems::housing::dominion::siege_area::SiegeArea;
 use crate::systems::housing::dominion::state::SiegeSide;
 use crate::systems::skills::geometry::Target;
 use crate::systems::skills::relation::owner_character;
+use crate::systems::skills::types::RelationState;
+use crate::world::PlayerRef;
 
 /// One unit's siege party: its side and the expedition that side names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +60,17 @@ pub enum SiegeRelation {
     Hostile,
 }
 
+impl SiegeRelation {
+    /// The relation state `BaseUnit.GetRelationStateTo` reports for the pair.
+    pub fn relation_state(self) -> RelationState {
+        match self {
+            Self::Friendly => RelationState::Friendly,
+            Self::Neutral => RelationState::Neutral,
+            Self::Hostile => RelationState::Hostile,
+        }
+    }
+}
+
 /// The pure party rule of `sub_39CC3110`.
 pub fn classify(me: Party, target: Party) -> SiegeRelation {
     if me.expedition_id == target.expedition_id {
@@ -59,35 +82,35 @@ pub fn classify(me: Party, target: Party) -> SiegeRelation {
     }
 }
 
-fn party(area: &SiegeArea, expedition_id: u32) -> Option<Party> {
-    if expedition_id == 0 {
-        return None;
-    }
-    if expedition_id == area.defender_expedition_id {
-        Some(Party {
-            side: SiegeSide::Defender,
-            expedition_id,
-        })
-    } else if expedition_id == area.attacker_expedition_id {
-        Some(Party {
-            side: SiegeSide::Attacker,
-            expedition_id,
-        })
-    } else {
-        None
-    }
+/// The siege party of a unit's owner character: its side and expedition when the character is a
+/// participant of the siege (`participants::participant_side`, through the snapshot of the last
+/// sweep), `None` for anybody else: no roster entry, or a roster entry whose member left the
+/// side's expedition since.
+fn party(server: &GameServer, area: &SiegeArea, owner: &PlayerRef) -> Option<Party> {
+    let expedition_id = owner.data().unit.expedition_id;
+    let side = server.systems.housing.siege_areas.participant_side(
+        area,
+        owner.character_id,
+        expedition_id,
+    )?;
+    Some(Party {
+        side,
+        expedition_id,
+    })
 }
 
 /// The siege relation between two units, or `None` when the siege rule does not apply (no
 /// running siege, either unit outside the area, or either unit in no siege party). `None`
 /// means the caller keeps its normal faction / zone decision.
 pub fn relation(server: &GameServer, me: &Target, target: &Target) -> Option<SiegeRelation> {
+    // No siege has an area (the usual case): nothing to look at.
+    if server.systems.housing.siege_areas.is_empty() {
+        return None;
+    }
     let me_object = me.as_obj()?;
     let target_object = target.as_obj()?;
     let me_owner = owner_character(server, me_object)?;
     let target_owner = owner_character(server, target_object)?;
-    let me_expedition = me_owner.data().unit.expedition_id;
-    let target_expedition = target_owner.data().unit.expedition_id;
     let me_transform = me_object.transform();
     let target_transform = target_object.transform();
     if me_transform.instance_id != target_transform.instance_id {
@@ -115,8 +138,8 @@ pub fn relation(server: &GameServer, me: &Target, target: &Target) -> Option<Sie
     ) {
         return None;
     }
-    let me_party = party(&area, me_expedition)?;
-    let target_party = party(&area, target_expedition)?;
+    let me_party = party(server, &area, &me_owner)?;
+    let target_party = party(server, &area, &target_owner)?;
     // Only a pair that is bound by the siege rule pays for the area / position test.
     let me_world = server.world.world_of(me_object)?;
     let target_world = server.world.world_of(target_object)?;
@@ -128,10 +151,4 @@ pub fn relation(server: &GameServer, me: &Target, target: &Target) -> Option<Sie
         return None;
     }
     Some(classify(me_party, target_party))
-}
-
-/// `Some(true)` = the siege rule makes the pair attackable, `Some(false)` = it makes them
-/// friendly / neutral, `None` = the normal rules still decide.
-pub fn siege_can_attack(server: &GameServer, me: &Target, target: &Target) -> Option<bool> {
-    relation(server, me, target).map(|relation| relation == SiegeRelation::Hostile)
 }

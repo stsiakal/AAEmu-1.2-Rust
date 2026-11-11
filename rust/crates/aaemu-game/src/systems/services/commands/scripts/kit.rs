@@ -196,7 +196,10 @@ impl Command for AddKit {
         }
 
         if items_added > 0 {
-            // C# sends the summary for self as well; only the target notification is for others.
+            // Deviation: the C# `Kit.cs` guards both summary messages with `character.Id !=
+            // targetPlayer.Id`, so it says nothing when you kit yourself; the port always tells
+            // the sender what was added (a silent success reads as a failure to a tester). Only
+            // the notification to the target is for others (PORTING.md, commands section).
             ctx.character.send_message(&format!(
                 "[Items] added {items_added} items to {}'s inventory",
                 name_of(&target)
@@ -310,6 +313,8 @@ mod tests {
             "vocation_mining",
             "tradepack_materials",
             "seeds",
+            "saplings",
+            "livestock",
             "regrade_test",
             "lunagem_set",
             "gear_10",
@@ -348,6 +353,30 @@ mod tests {
                 count, 1,
                 "kit item {} ({:?}) is not in compact",
                 entry.item_id, entry.kitnames
+            );
+        }
+        // Every kit must fit an empty 50-slot bag: an entry is added all-or-nothing into the
+        // free slots and there is no mail fallback, so a bigger kit hands out a partial set.
+        // Slots = sum over the entries of ceil(count / max_stack_size).
+        let mut slots: std::collections::BTreeMap<String, i64> = Default::default();
+        for entry in &kit.itemkits {
+            let max_stack: i64 = conn
+                .query_row(
+                    "SELECT max_stack_size FROM items WHERE id = ?1",
+                    [entry.item_id],
+                    |r| r.get(0),
+                )
+                .expect("items lookup");
+            let stack = max_stack.max(1);
+            let needed = (i64::from(entry.item_count) + stack - 1) / stack;
+            for name in &entry.kitnames {
+                *slots.entry(name.clone()).or_default() += needed;
+            }
+        }
+        for (name, needed) in &slots {
+            assert!(
+                *needed <= 50,
+                "kit {name} needs {needed} bag slots, a fresh bag has 50"
             );
         }
     }

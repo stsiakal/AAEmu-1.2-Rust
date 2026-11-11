@@ -1,11 +1,12 @@
 //! Siege-area eviction: a non-participant inside the circle of a running siege is moved to
-//! the nearest safe resurrection point with the client's `SIEGE_NOT_PARTICIPANT` (446).
-//! Mutation check: without `evict_non_participants` (or with the participant test removed)
-//! the outsider receives no teleport and the assertions fail.
+//! the nearest safe resurrection point outside the area, after the client's
+//! `SIEGE_NOT_PARTICIPANT` (446) error. Mutation check: without `evict_non_participants` (or
+//! with the participant test removed) the outsider receives no teleport and the assertions
+//! fail.
 
-use super::hostility::siege_can_attack;
 use super::runtime;
 use super::siege_area::evict_non_participants;
+use super::siege_fixtures::{join_expedition, leave_expedition};
 use super::state::SiegeSide;
 use crate::data::world_data::{Portal, Zone};
 use crate::data::GameData;
@@ -14,7 +15,7 @@ use crate::models::slave::Slave;
 use crate::opcodes::sc;
 use crate::server::GameServer;
 use crate::systems::housing::data::{GuardTowerSetting, HousingTemplate};
-use crate::systems::skills::geometry::Target;
+use crate::systems::social::chat::GM_ACCESS_LEVEL;
 use crate::systems::vehicles::data::attach_point;
 use crate::test_support::{spawn_player, test_character, test_server_with, TestClient, TEST_ZONE};
 use crate::world::{Entity, PlayerRef, WorldObject};
@@ -37,6 +38,11 @@ struct Fixture {
 }
 
 fn fixture(active: bool) -> Fixture {
+    fixture_with(active, &[(86, RETURN_POINT)])
+}
+
+/// The fixture with the given respawn points `(portal id, (x, y, z))` in `TEST_ZONE`.
+fn fixture_with(active: bool, return_points: &[(u32, (f32, f32, f32))]) -> Fixture {
     let mut data = GameData::empty();
     data.zones.zones.insert(
         TEST_ZONE,
@@ -60,26 +66,31 @@ fn fixture(active: bool) -> Fixture {
             ..Default::default()
         },
     );
-    data.systems.npcs.portal.respawns.portals.push(Portal {
-        id: 86,
-        name: "test return point".into(),
-        zone_id: TEST_ZONE,
-        x: RETURN_POINT.0,
-        y: RETURN_POINT.1,
-        z: RETURN_POINT.2,
-        ..Default::default()
-    });
+    for &(id, (x, y, z)) in return_points {
+        data.systems.npcs.portal.respawns.portals.push(Portal {
+            id,
+            name: format!("test return point {id}"),
+            zone_id: TEST_ZONE,
+            x,
+            y,
+            z,
+            ..Default::default()
+        });
+    }
     let server = test_server_with(data);
     crate::systems::skills::install_hooks(&server);
     let mut attacker_client = TestClient::new(&server, 1, 1001);
     let mut outsider_client = TestClient::new(&server, 2, 1002);
     let make_player = |id, name, expedition, x, y, client: &TestClient| {
         let mut c = test_character(id, name, x, y);
-        c.unit.expedition_id = expedition;
         c.unit.hp = 1_000;
         c.unit.max_hp = 1_000;
         c.is_online = true;
-        spawn_player(&server, client, c, 0x100 + id)
+        let player = spawn_player(&server, client, c, 0x100 + id);
+        if expedition != 0 {
+            join_expedition(&server, expedition, &player);
+        }
+        player
     };
     let attacker = make_player(
         1,
@@ -138,17 +149,28 @@ fn fixture(active: bool) -> Fixture {
     }
 }
 
+/// `(error message, x, y, z)` of an `SCTeleportUnitPacket` body.
+fn decode_teleport(body: &[u8]) -> (i16, f32, f32, f32) {
+    let error = i16::from_le_bytes([body[1], body[2]]);
+    let position: [u8; 9] = body[3..12].try_into().expect("position");
+    let (x, y, z) = aaemu_commons::helpers::decode_position(&position);
+    (error, x, y, z)
+}
+
+/// The forced move `(error, x, y, z)` lands on the given spot (decoded floats: a tolerance).
+fn assert_at(moved: &(i16, f32, f32, f32), x: f32, y: f32) {
+    assert!(
+        (moved.1 - x).abs() < 0.01 && (moved.2 - y).abs() < 0.01,
+        "expected ({x}, {y}), got {moved:?}"
+    );
+}
+
 fn teleports(client: &mut TestClient) -> Vec<(i16, f32, f32, f32)> {
     client
         .drain()
         .into_iter()
         .filter(|(op, _)| *op == sc::SCTeleportUnitPacket)
-        .map(|(_, body)| {
-            let error = i16::from_le_bytes([body[1], body[2]]);
-            let position: [u8; 9] = body[3..12].try_into().expect("position");
-            let (x, y, z) = aaemu_commons::helpers::decode_position(&position);
-            (error, x, y, z)
-        })
+        .map(|(_, body)| decode_teleport(&body))
         .collect()
 }
 
@@ -204,25 +226,92 @@ fn move_to(fixture: &Fixture, player: &PlayerRef, (x, y): (f32, f32)) {
         .add_visible_object(&object, &fixture.server.view_ctx());
 }
 
+/// The opcode of every frame the client received, in order.
+fn opcodes(client: &mut TestClient) -> Vec<u16> {
+    client.drain().into_iter().map(|(op, _)| op).collect()
+}
+
 #[tokio::test]
 async fn a_non_participant_inside_the_circle_is_moved_to_the_return_point() {
     let mut f = fixture(true);
     evict_non_participants(&f.server);
-    let outsider = teleports(&mut f.outsider_client);
-    assert_eq!(outsider.len(), 1, "one forced move per eviction");
-    assert_eq!(outsider[0].0, ERROR_SIEGE_NOT_PARTICIPANT);
+    let frames = f.outsider_client.drain();
+    let error_at = frames.iter().position(|(op, body)| {
+        *op == sc::SCErrorMsgPacket
+            && i16::from_le_bytes([body[0], body[1]]) == ERROR_SIEGE_NOT_PARTICIPANT
+    });
+    let teleport_at = frames
+        .iter()
+        .position(|(op, _)| *op == sc::SCTeleportUnitPacket);
     assert!(
-        (outsider[0].1 - RETURN_POINT.0).abs() < 0.01,
-        "got {:?}",
-        outsider[0]
+        error_at.is_some() && teleport_at.is_some() && error_at < teleport_at,
+        "the client's 'Not a siege participant' text comes right before the forced move"
     );
+    let moves: Vec<_> = frames
+        .iter()
+        .filter(|(op, _)| *op == sc::SCTeleportUnitPacket)
+        .map(|(_, body)| decode_teleport(body))
+        .collect();
+    assert_eq!(moves.len(), 1, "one forced move per eviction");
+    // The `SCTeleportUnit` error field stays 0, like at every other sender.
+    assert_eq!(moves[0].0, 0);
+    assert_at(&moves[0], RETURN_POINT.0, RETURN_POINT.1);
+    // The registered attacker is kept and told nothing.
+    assert!(opcodes(&mut f.attacker_client).is_empty());
+}
+
+#[tokio::test]
+async fn the_nearest_return_point_inside_the_area_gives_way_to_the_next_one() {
+    // 87 is the closest respawn point to the outsider but lies inside the circle (the tower is
+    // at 105, 100, the radius 250): the next closest one outside it, 86, is used.
+    let mut f = fixture_with(true, &[(86, RETURN_POINT), (87, (110.0, 100.0, 100.0))]);
+    evict_non_participants(&f.server);
+    let moves = teleports(&mut f.outsider_client);
+    assert_eq!(moves.len(), 1);
+    assert_at(&moves[0], RETURN_POINT.0, RETURN_POINT.1);
+    // A closer point outside the circle wins over a farther one.
+    let mut f = fixture_with(true, &[(86, RETURN_POINT), (88, (400.0, 100.0, 100.0))]);
+    evict_non_participants(&f.server);
+    let moves = teleports(&mut f.outsider_client);
+    assert_eq!(moves.len(), 1);
+    assert_at(&moves[0], 400.0, 100.0);
+}
+
+#[tokio::test]
+async fn without_a_return_point_outside_the_area_the_character_stays_where_it_is() {
+    // Every respawn point lies inside the circle (or there is none): nobody is moved, and the
+    // saved main-world position (the spot of the last instance entry) is no fallback.
+    for points in [&[(87, (110.0, 100.0, 100.0))][..], &[][..]] {
+        let mut f = fixture_with(true, points);
+        let mut stale = crate::models::transform::Transform::default();
+        stale.set_xyz(5_000.0, 5_000.0, 100.0);
+        f.outsider.data().main_world_position = Some(stale);
+        evict_non_participants(&f.server);
+        assert!(
+            opcodes(&mut f.outsider_client).is_empty(),
+            "no error text and no move without a safe point"
+        );
+        assert!(!f.outsider.data().disabled_set_position);
+    }
+}
+
+#[tokio::test]
+async fn a_character_without_a_safe_point_is_warned_about_once_until_it_is_free_again() {
+    let f = fixture_with(true, &[]);
+    let cache = &f.server.systems.housing.siege_areas;
+    let id = f.outsider.character_id;
+    evict_non_participants(&f.server);
+    // The sweep recorded its warning: the next report of the same character is a repeat ...
+    assert!(!cache.first_warning(id));
+    evict_non_participants(&f.server);
+    assert!(!cache.first_warning(id), "still the same stay");
+    // ... until the character is out of the area: the set forgets it, a later stay warns again.
+    move_to(&f, &f.outsider, OUTSIDE);
+    evict_non_participants(&f.server);
     assert!(
-        (outsider[0].2 - RETURN_POINT.1).abs() < 0.01,
-        "got {:?}",
-        outsider[0]
+        cache.first_warning(id),
+        "re-armed once the character was free"
     );
-    // The registered attacker is kept.
-    assert!(teleports(&mut f.attacker_client).is_empty());
 }
 
 #[tokio::test]
@@ -242,7 +331,85 @@ async fn a_non_participant_outside_the_circle_or_outside_the_running_siege_is_ke
 async fn an_unregistered_defender_expedition_member_is_still_evicted() {
     let mut f = fixture(true);
     // A member of the defending guild who never joined the roster is not a participant.
-    f.outsider.data().unit.expedition_id = DEFENDER_EXPEDITION;
+    join_expedition(&f.server, DEFENDER_EXPEDITION, &f.outsider);
+    evict_non_participants(&f.server);
+    assert_eq!(teleports(&mut f.outsider_client).len(), 1);
+}
+
+#[tokio::test]
+async fn an_ex_member_with_a_roster_entry_is_moved_like_any_outsider() {
+    // The snapshot still lists the attacker (it was taken before the leave): the live
+    // expedition of the character decides at once.
+    let mut f = fixture(true);
+    leave_expedition(&f.server, ATTACKER_EXPEDITION, &f.attacker);
+    evict_non_participants(&f.server);
+    assert_eq!(teleports(&mut f.attacker_client).len(), 1);
+
+    // After the next snapshot the shared participant rule leaves them out as well.
+    let mut f = fixture(true);
+    leave_expedition(&f.server, ATTACKER_EXPEDITION, &f.attacker);
+    super::siege_area::refresh(&f.server);
+    let roster = f.server.systems.housing.dominions.get(GROUP).unwrap().siege;
+    assert!(roster.unwrap().participants.contains_key(&1));
+    evict_non_participants(&f.server);
+    assert_eq!(teleports(&mut f.attacker_client).len(), 1);
+}
+
+#[tokio::test]
+async fn a_member_who_joined_after_the_snapshot_is_not_moved() {
+    let mut f = fixture(true);
+    // The outsider joins the attacking guild and the roster after the snapshot of `fixture`.
+    join_expedition(&f.server, ATTACKER_EXPEDITION, &f.outsider);
+    f.server
+        .systems
+        .housing
+        .dominions
+        .register_participant(
+            GROUP,
+            f.outsider.character_id,
+            ATTACKER_EXPEDITION,
+            SiegeSide::Attacker,
+            chrono::Utc::now().timestamp(),
+        )
+        .unwrap();
+    evict_non_participants(&f.server);
+    assert!(
+        teleports(&mut f.outsider_client).is_empty(),
+        "the authority is asked again before anyone is moved"
+    );
+    // The next snapshot agrees.
+    super::siege_area::refresh(&f.server);
+    evict_non_participants(&f.server);
+    assert!(teleports(&mut f.outsider_client).is_empty());
+}
+
+#[tokio::test]
+async fn a_gm_inside_the_circle_is_not_moved() {
+    // One level below the GM threshold is an ordinary outsider ...
+    let mut f = fixture(true);
+    f.outsider.data().access_level = GM_ACCESS_LEVEL - 1;
+    evict_non_participants(&f.server);
+    assert_eq!(teleports(&mut f.outsider_client).len(), 1);
+
+    // ... a GM inspects the lodestone and the camps undisturbed.
+    let mut f = fixture(true);
+    f.outsider.data().access_level = GM_ACCESS_LEVEL;
+    evict_non_participants(&f.server);
+    assert!(teleports(&mut f.outsider_client).is_empty());
+}
+
+#[tokio::test]
+async fn the_switch_off_evicts_nobody() {
+    let mut f = fixture(true);
+    f.server
+        .config
+        .update(|config| config.housing.siege_evict_non_participants = false);
+    evict_non_participants(&f.server);
+    assert!(teleports(&mut f.outsider_client).is_empty());
+    // Back on (the default), the same outsider is moved.
+    f.server
+        .config
+        .update(|config| config.housing.siege_evict_non_participants = true);
     evict_non_participants(&f.server);
     assert_eq!(teleports(&mut f.outsider_client).len(), 1);
 }
@@ -299,16 +466,24 @@ async fn a_mounted_non_participant_is_dismounted_before_the_move() {
         c.attached_point = attach_point::PASSENGER0;
     }
     evict_non_participants(&f.server);
-    assert!(
-        !f.outsider.data().is_riding,
-        "the passenger must be off the seat before the teleport"
-    );
+    assert!(!f.outsider.data().is_riding, "the passenger left the seat");
     assert!(slave
         .data()
         .attached_characters
         .iter()
         .all(|(_, c)| *c != f.outsider.obj_id));
-    assert_eq!(teleports(&mut f.outsider_client).len(), 1);
+    // The order the test names: the client is told that the rider left the vehicle before it
+    // is told to move.
+    let ops = opcodes(&mut f.outsider_client);
+    let detached = ops
+        .iter()
+        .position(|op| *op == sc::SCUnitDetachedPacket)
+        .expect("the rider is detached");
+    let moved = ops
+        .iter()
+        .position(|op| *op == sc::SCTeleportUnitPacket)
+        .expect("the rider is moved");
+    assert!(detached < moved, "dismount first, then the move: {ops:?}");
 }
 
 #[tokio::test]
@@ -321,17 +496,4 @@ async fn a_pending_teleport_or_a_dead_character_is_not_moved_again() {
     f.outsider.data().unit.hp = 0;
     evict_non_participants(&f.server);
     assert!(teleports(&mut f.outsider_client).is_empty());
-}
-
-#[tokio::test]
-async fn the_area_rule_matches_the_hostility_gate() {
-    let f = fixture(true);
-    let outsider = Target::Obj(WorldObject::from(&f.outsider));
-    let attacker = Target::Obj(WorldObject::from(&f.attacker));
-    // Both are inside, but neither the outsider's party gate nor the same-party gate is
-    // hostile: the eviction and the hostility rule share the same cached area.
-    let area = f.server.systems.housing.siege_areas.get(GROUP).unwrap();
-    assert!(area.inside(0, INSIDE.0, INSIDE.1));
-    assert!(!area.inside(0, OUTSIDE.0, OUTSIDE.1));
-    assert_eq!(siege_can_attack(&f.server, &attacker, &outsider), None);
 }
