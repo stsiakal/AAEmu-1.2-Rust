@@ -81,6 +81,7 @@ fn spawn_pillar(
         scale: 1.0,
         count: 1,
         related_ids: None,
+        family_id: 0,
         respawn_doodad_template_id: 0,
     };
     let spawner = Arc::new(DoodadSpawner::new(def, Some(world.id)));
@@ -111,7 +112,7 @@ impl Command for TestHeight {
         let sub = args.get(firstarg).map(String::as_str);
 
         if sub == Some("testpos") {
-            teleport_player(&target_player, 0, TARGET_X, TARGET_Y, TARGET_Z, 0.0);
+            teleport_player(server, &target_player, 0, TARGET_X, TARGET_Y, TARGET_Z, 0.0);
             PlayerCharacter(target_player.clone()).send_message(&format!(
                 "[Move] |cFFFFFFFF{}|r moved to X: {}, Y: {}, Z: {}",
                 name_of(&target_player),

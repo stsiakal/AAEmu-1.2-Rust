@@ -724,7 +724,7 @@ async fn faction_and_zone_chat_identity_and_membership() {
 /// Row 14 ("연주", `chat_type_id` 13) is sendable but has no client display branch
 /// (`chat_msg_event.alb` proto 20 logs "Unknown chat channel"), so the server refuses it.
 #[tokio::test]
-async fn trade_and_group_find_reach_only_their_zone_group_and_performance_is_refused() {
+async fn trade_and_group_find_reach_only_their_zone_group_and_performance_chat_is_dropped() {
     use crate::data::world_data::{Zone, ZoneGroup};
     use crate::data::GameData;
     use crate::test_support::test_server_with;
@@ -772,7 +772,7 @@ async fn trade_and_group_find_reach_only_their_zone_group_and_performance_is_ref
         assert_eq!(b.frames(), vec![(sc::SCChatMessagePacket, want)]);
         assert!(c.frames().is_empty());
     }
-    // Performance chat (13) is refused with a warning: nobody receives it, not even the sender.
+    // Performance chat (13) is dropped with a warning: nobody receives it, not even the sender.
     let (capture, guard) = warn_capture();
     a.send(
         &server,
@@ -785,8 +785,8 @@ async fn trade_and_group_find_reach_only_their_zone_group_and_performance_is_ref
     let log = capture.0.lock().unwrap();
     let log = String::from_utf8_lossy(&log);
     assert!(
-        log.lines().any(|l| l.contains("Refusing chat type 13")),
-        "expected an explicit performance-chat refusal, got: {log}"
+        log.lines().any(|l| l.contains("chat type 13")),
+        "expected a warning that names chat type 13, got: {log}"
     );
 }
 
@@ -1396,6 +1396,169 @@ async fn team_rejection_raid_conversion_offline_and_reconnect() {
     );
     assert!(server.systems.social.teams.active_team(team_id).is_none());
     assert!(!a.p.data().in_party && !b.p.data().in_party);
+}
+
+/// The team manager decides who hears a broadcast, who counts for the auto-disband and who is
+/// eligible for loot from its own copy of `Character.IsOnline` (`TeamMember.online`), without
+/// reading a `Character`. A logout flips the copy, `UpdateAtLogin` restores it and a hard
+/// disconnect clears it. Every assertion reads the copy or what it routes, never the live flag
+/// (which the other offline tests already read).
+#[tokio::test]
+async fn team_member_online_copy_follows_logout_login_and_hard_disconnect() {
+    let server = test_server();
+    let mut a = pc(&server, 1, "Al", 100.0, 100.0);
+    let mut b = pc(&server, 2, "Bob", 110.0, 100.0);
+    settle(&mut [&mut a, &mut b]);
+    let team_id = form_party(&server, &mut a, &mut b).await;
+    let teams = &server.systems.social.teams;
+    let copy = |id: u32| {
+        let team = teams.active_team(team_id).expect("team");
+        let member = team
+            .members
+            .iter()
+            .flatten()
+            .find(|m| m.character.character_id == id)
+            .expect("member")
+            .online;
+        (member, team.members_online_count())
+    };
+    // A team broadcast by the owner: the over-head marker.
+    let marker = || {
+        let mut s = PacketStream::new();
+        s.write_u32(team_id)
+            .write_i32(3)
+            .write_u8(2)
+            .write_bc(0x102);
+        s
+    };
+    let marker_frame = || {
+        vec![(
+            sc::SCOverHeadMarkerSetPacket,
+            body(&SCOverHeadMarkerSetPacket {
+                team_id,
+                index: 3,
+                is_obj_id: true,
+                id: 0x102,
+            }),
+        )]
+    };
+    assert_eq!(copy(1), (true, 2), "a joining member is online");
+    assert_eq!(copy(2), (true, 2));
+    settle(&mut [&mut a, &mut b]);
+
+    // Logout: the copy flips, the count drops and the broadcast skips the member.
+    crate::world::session::set_online(&server, &b.p, false);
+    assert_eq!(copy(2), (false, 1));
+    assert_eq!(copy(1), (true, 1), "the owner is untouched");
+    settle(&mut [&mut a, &mut b]);
+    a.send(&server, cs::CSSetOverHeadMarkerPacket, marker())
+        .await;
+    assert_eq!(a.frames(), marker_frame());
+    assert!(
+        b.frames().is_empty(),
+        "an offline member hears no broadcast"
+    );
+
+    // Login: `UpdateAtLogin` restores the copy and the broadcast reaches the member again.
+    crate::world::session::set_online(&server, &b.p, true);
+    teams.update_at_login(&server, &b.p);
+    assert_eq!(copy(2), (true, 2));
+    settle(&mut [&mut a, &mut b]);
+    a.send(&server, cs::CSSetOverHeadMarkerPacket, marker())
+        .await;
+    assert_eq!(a.frames(), marker_frame());
+    assert_eq!(b.frames(), marker_frame());
+
+    // A hard disconnect goes through the same `SetOffline`.
+    crate::world::session::on_disconnect(&server, &mut b.c.conn).await;
+    assert_eq!(copy(2), (false, 1));
+    settle(&mut [&mut a, &mut b]);
+    a.send(&server, cs::CSSetOverHeadMarkerPacket, marker())
+        .await;
+    assert_eq!(a.frames(), marker_frame());
+    assert!(b.frames().is_empty());
+}
+
+/// `CSMoveTeamMember`: the move is broadcast first (`SCTeamMemberMoved`, inline under the
+/// manager's guard), then the named members leave their old and join their new party chat
+/// channel (character work after the guard). The C# left the old channels before the move and
+/// joined the new ones after the broadcast; the leave now comes after it. The test pins this
+/// order per recipient (nothing pinned it before the lock-order change) and that the chat
+/// follows the slot.
+#[tokio::test]
+async fn moving_a_team_member_broadcasts_before_the_party_chat_changes() {
+    use crate::packets::world::{SCJoinedChatChannelPacket, SCLeavedChatChannelPacket};
+    let server = test_server();
+    let mut a = pc(&server, 1, "Al", 100.0, 100.0);
+    let mut b = pc(&server, 2, "Bob", 110.0, 100.0);
+    settle(&mut [&mut a, &mut b]);
+    let team_id = form_party(&server, &mut a, &mut b).await;
+    let mut s = PacketStream::new();
+    s.write_u32(team_id);
+    a.send(&server, cs::CSConvertToRaidTeamPacket, s).await;
+    settle(&mut [&mut a, &mut b]);
+
+    // The owner moves Bob from slot 1 (party 0) to the empty slot 5 (party 1).
+    let mut s = PacketStream::new();
+    s.write_u32(team_id)
+        .write_u32(2)
+        .write_u32(0)
+        .write_u8(1)
+        .write_u8(5);
+    a.send(&server, cs::CSMoveTeamMemberPacket, s).await;
+    let moved = body(&SCTeamMemberMovedPacket {
+        team_id,
+        id_from: 2,
+        id_to: 0,
+        from: 1,
+        to: 5,
+    });
+    assert_eq!(
+        a.frames(),
+        vec![(sc::SCTeamMemberMovedPacket, moved.clone())],
+        "a bystander only hears the move"
+    );
+    assert_eq!(
+        b.frames(),
+        vec![
+            (sc::SCTeamMemberMovedPacket, moved),
+            (
+                sc::SCLeavedChatChannelPacket,
+                body(&SCLeavedChatChannelPacket {
+                    chat_type: chat_type::PARTY,
+                    sub_type: (team_id << 6) as i16,
+                    faction_id: 0,
+                })
+            ),
+            (
+                sc::SCJoinedChatChannelPacket,
+                body(&SCJoinedChatChannelPacket {
+                    chat_type: chat_type::PARTY,
+                    sub_type: ((team_id << 6) + 1) as i16,
+                    faction_id: 0,
+                })
+            ),
+        ],
+        "the moved member hears the move, then leaves party 1 and joins party 2"
+    );
+
+    // The party chat follows the slot: Bob (party 2) and Al (party 1) no longer share it.
+    b.send(
+        &server,
+        cs::CSSendChatMessagePacket,
+        chat(chat_type::PARTY, "y"),
+    )
+    .await;
+    assert_eq!(b.ops(), vec![sc::SCChatMessagePacket]);
+    assert!(a.ops().is_empty());
+    a.send(
+        &server,
+        cs::CSSendChatMessagePacket,
+        chat(chat_type::PARTY, "x"),
+    )
+    .await;
+    assert_eq!(a.ops(), vec![sc::SCChatMessagePacket]);
+    assert!(b.ops().is_empty());
 }
 
 #[tokio::test]

@@ -46,6 +46,8 @@ mod schedule_tests;
 #[cfg(test)]
 mod sphere_accept_tests;
 #[cfg(test)]
+mod sphere_doodad_tests;
+#[cfg(test)]
 mod sphere_fill_tests;
 #[cfg(test)]
 mod tests;

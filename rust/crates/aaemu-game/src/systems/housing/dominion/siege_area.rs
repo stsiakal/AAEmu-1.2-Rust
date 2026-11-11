@@ -8,32 +8,41 @@
 //! 1.2 data names both radii: `guard_tower_settings.radius_siege` (250 m small / 450 m large
 //! castles) and `radius_offense_hq` (100 / 120 m).
 //!
-//! The removal rule is the owner's source for the 1.2-era siege flow (IGN, 2014-09-26,
-//! "Castles"; Total ArcheAge, 2014-11-20, grade C): "only designated participants can enter"
-//! the perimeter and "those who do not qualify ... are transported out of the siege perimeter
-//! when it begins". The 1.2 client has no separate warning text for it; the error table has
-//! `SIEGE_NOT_PARTICIPANT` 446 (ui_texts 2505 "Not a siege participant"), which the forced
-//! `SCTeleportUnitPacket` carries in its error-message field.
+//! The removal rule is **inferred** from the owner's source for the 1.2-era siege flow (IGN,
+//! 2014-09-26, "Castles"; Total ArcheAge, 2014-11-20, grade C): "only designated participants
+//! can enter" the perimeter and "those who do not qualify ... are transported out of the siege
+//! perimeter when it begins". There is no 1.2 server evidence for it, so it sits behind
+//! `Housing.SiegeEvictNonParticipants`, and GMs are never moved. The 1.2 client has no separate
+//! warning text for it; its error table has `SIEGE_NOT_PARTICIPANT` 446 (ui_texts 2505 "Not a
+//! siege participant"), sent as an `SCErrorMsgPacket` right before the forced move. Whether the
+//! 1.2 client also shows a text for an `SCTeleportUnit` error message is not evidenced, so that
+//! field stays 0.
 //!
 //! The 10.x enum numbers the running siege 3; the 1.2 client numbers it 4 (siege.md 1.2).
 //! Both callers gate on [`SiegeArea::active_at`], which picks the clock exactly like
 //! `DominionManager::tick_dual` does (the calendar / GM test clock for a calendar-materialised
 //! siege, the real clock for a GM schedule), not on a specific period number.
 //!
-//! [`SiegeAreaCache`] is rebuilt once a second by [`refresh`] (the participant tick) so the
+//! [`SiegeAreaCache`] is rebuilt once a second by [`refresh`] (the participant sweep) so the
 //! per-attack hostility check does not clone the authority's `DominionState`: the cache holds
-//! only the siege parties, the window, the two circle centres and the roster ids.
+//! only the siege parties, the window, the two circle centres and the participants. A
+//! participant is whoever `participants::participant_side` accepts at the time of the sweep
+//! (roster entry + current expedition + live expedition); the eviction re-asks the authority
+//! before it moves anyone.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use crate::server::GameServer;
 use crate::systems::economy::error_message;
+use crate::systems::housing::dominion::participants::participant_side;
 use crate::systems::housing::dominion::runtime;
 use crate::systems::housing::dominion::state::{SiegeSide, SiegeStatus, TowerIdentity};
 use crate::systems::skills::packets_special::{
     SCTeleportUnitPacket, TELEPORT_REASON_MOVE_TO_LOCATION,
 };
+use crate::systems::social::chat::GM_ACCESS_LEVEL;
+use crate::systems::social::util::send_error;
 use crate::world::session;
 use crate::world::WorldObject;
 
@@ -67,6 +76,14 @@ pub struct SiegeArea {
 }
 
 impl SiegeArea {
+    /// The expedition the siege record names for `side`.
+    pub fn expedition_of(&self, side: SiegeSide) -> u32 {
+        match side {
+            SiegeSide::Attacker => self.attacker_expedition_id,
+            SiegeSide::Defender => self.defender_expedition_id,
+        }
+    }
+
     /// The clock choice of `DominionManager::tick_dual`: a calendar materialisation follows
     /// the calendar / GM test clock, a GM schedule the real clock.
     pub fn active_at(&self, real_now: i64, calendar_now: i64) -> bool {
@@ -97,11 +114,15 @@ impl SiegeArea {
     }
 }
 
-/// Rebuilt once a second from the authority: the unfinished sieges' areas and rosters.
+/// Rebuilt once a second from the authority: the unfinished sieges' areas and the participants
+/// of each (character id -> side), as `participants::participant_side` saw them.
 #[derive(Debug, Default)]
 pub struct SiegeAreaCache {
     areas: Mutex<BTreeMap<u32, SiegeArea>>,
-    rosters: Mutex<BTreeMap<u32, BTreeSet<u32>>>,
+    participants: Mutex<BTreeMap<u32, BTreeMap<u32, SiegeSide>>>,
+    /// Characters the eviction already warned about ("no safe point"), so the warning is not
+    /// repeated every second for as long as they stand there.
+    warned: Mutex<BTreeSet<u32>>,
 }
 
 impl SiegeAreaCache {
@@ -113,12 +134,49 @@ impl SiegeAreaCache {
             .copied()
     }
 
-    pub fn is_participant(&self, zone_group_id: u32, character_id: u32) -> bool {
-        self.rosters
+    /// No unfinished siege has an area: the hostility rule cannot apply anywhere.
+    pub fn is_empty(&self) -> bool {
+        self.areas
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&zone_group_id)
-            .is_some_and(|ids| ids.contains(&character_id))
+            .is_empty()
+    }
+
+    /// The side of a participant of `area`'s siege, or `None` for anybody else. The snapshot of
+    /// the last sweep says who qualified; the character's live `current_expedition` must still
+    /// be that side's expedition, so a member who just left is no participant at once.
+    pub fn participant_side(
+        &self,
+        area: &SiegeArea,
+        character_id: u32,
+        current_expedition: u32,
+    ) -> Option<SiegeSide> {
+        let side = self
+            .participants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&area.zone_group_id)?
+            .get(&character_id)
+            .copied()?;
+        (current_expedition != 0 && current_expedition == area.expedition_of(side)).then_some(side)
+    }
+
+    /// `true` the first time a character is reported as stuck (no safe point), `false` while it
+    /// stays stuck.
+    pub(super) fn first_warning(&self, character_id: u32) -> bool {
+        self.warned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(character_id)
+    }
+
+    /// Forget every character that is no longer stuck, so a later stay warns again and the set
+    /// cannot grow past the characters currently stuck.
+    fn retain_warned(&self, stuck: &BTreeSet<u32>) {
+        self.warned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|id| stuck.contains(id));
     }
 }
 
@@ -169,12 +227,12 @@ fn area_snapshot(
     })
 }
 
-/// Rebuild the per-zone cache. Called once a second by the participant tick (it clones each
+/// Rebuild the per-zone cache. Called once a second by the participant sweep (it clones each
 /// `DominionState` once then, never per attack), and by tests that drive the rules directly.
 pub fn refresh(server: &GameServer) {
     let states = server.systems.housing.dominions.all();
     let mut areas = BTreeMap::new();
-    let mut rosters = BTreeMap::new();
+    let mut participants = BTreeMap::new();
     for state in states {
         let Some(siege) = state
             .siege
@@ -186,11 +244,24 @@ pub fn refresh(server: &GameServer) {
         let Some(area) = area_snapshot(server, &state) else {
             continue;
         };
+        // A roster entry is not a participant by itself: ask the shared rule whether the
+        // character still belongs to the side's expedition (the manager's word, since the
+        // character may be offline).
+        let roster: BTreeMap<u32, SiegeSide> = siege
+            .participants
+            .values()
+            .filter_map(|entry| {
+                participant_side(
+                    server,
+                    siege,
+                    entry.character_id,
+                    area.expedition_of(entry.side),
+                )
+                .map(|side| (entry.character_id, side))
+            })
+            .collect();
         areas.insert(state.zone_group_id, area);
-        rosters.insert(
-            state.zone_group_id,
-            siege.participants.keys().copied().collect(),
-        );
+        participants.insert(state.zone_group_id, roster);
     }
     let cache = &server.systems.housing.siege_areas;
     *cache
@@ -198,85 +269,108 @@ pub fn refresh(server: &GameServer) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = areas;
     *cache
-        .rosters
+        .participants
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = rosters;
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = participants;
 }
 
-/// The nearest safe resurrection point (`PortalManager.GetClosestReturnPortal`, the same
-/// fallback the ordinary resurrection uses), or the character's saved main-world position,
-/// provided the destination is outside the siege area. `None` when the data has no safe spot.
+/// Whether the authority, asked now, still has `character_id` as a participant of the siege of
+/// `zone_group_id`: the snapshot is up to a second old, and a join that raced the sweep must not
+/// be moved.
+fn is_participant_now(
+    server: &GameServer,
+    zone_group_id: u32,
+    character_id: u32,
+    current_expedition: u32,
+) -> bool {
+    server
+        .systems
+        .housing
+        .dominions
+        .get(zone_group_id)
+        .is_some_and(|state| {
+            state.siege.as_ref().is_some_and(|siege| {
+                participant_side(server, siege, character_id, current_expedition).is_some()
+            })
+        })
+}
+
+/// The nearest safe resurrection point **outside** the siege area
+/// (`PortalManager.GetClosestReturnPortal`, the same table and filters the ordinary
+/// resurrection uses, but the closest point that lies outside the area, not the closest point
+/// refused when it happens to lie inside). `None` when no such point exists, in which case the
+/// character is left where it stands: the character's saved `main_world_position` is no
+/// fallback, it is the spot of the last instance entry and so an arbitrary old place, and
+/// `SCTeleportUnit` is a same-instance move that cannot leave an instance anyway.
 fn safe_destination(
     server: &GameServer,
     player: &crate::world::PlayerRef,
     area: &SiegeArea,
     instance_id: u32,
 ) -> Option<SCTeleportUnitPacket> {
-    let portal = crate::systems::npcs::portal::closest_return_portal(server, player);
-    if portal.id != 0
-        && [portal.x, portal.y, portal.z]
-            .into_iter()
-            .all(f32::is_finite)
-        && !area.inside(instance_id, portal.x, portal.y)
-    {
-        let z = crate::systems::ai::collision::ground_height_or(
-            server,
-            instance_id,
-            portal.x,
-            portal.y,
-            portal.z,
-            || portal.z,
-        );
-        if z.is_finite() {
-            return Some(SCTeleportUnitPacket {
-                reason: TELEPORT_REASON_MOVE_TO_LOCATION,
-                error_message: error_message::SIEGE_NOT_PARTICIPANT,
-                x: portal.x,
-                y: portal.y,
-                z,
-                z2: portal.z_rot.to_radians(),
-            });
-        }
-    }
-    let mwp = player.data().main_world_position?;
-    if mwp.instance_id != instance_id
-        || ![mwp.x, mwp.y, mwp.z].into_iter().all(f32::is_finite)
-        || area.inside(instance_id, mwp.x, mwp.y)
-    {
+    let portal =
+        crate::systems::npcs::portal::closest_return_portal_matching(server, player, |portal| {
+            [portal.x, portal.y, portal.z]
+                .into_iter()
+                .all(f32::is_finite)
+                && !area.inside(instance_id, portal.x, portal.y)
+        });
+    // `id == 0` is the fail-safe of `closest_return_portal` (the character's own position).
+    if portal.id == 0 {
         return None;
     }
-    Some(SCTeleportUnitPacket {
+    let z = crate::systems::ai::collision::ground_height_or(
+        server,
+        instance_id,
+        portal.x,
+        portal.y,
+        portal.z,
+        || portal.z,
+    );
+    z.is_finite().then_some(SCTeleportUnitPacket {
         reason: TELEPORT_REASON_MOVE_TO_LOCATION,
-        error_message: error_message::SIEGE_NOT_PARTICIPANT,
-        x: mwp.x,
-        y: mwp.y,
-        z: mwp.z,
-        z2: mwp.rot_z,
+        // The text travels in an `SCErrorMsgPacket` (see `evict_non_participants`): no 1.2 code
+        // sends a non-zero `SCTeleportUnit` error message, so the field stays 0 like everywhere.
+        error_message: 0,
+        x: portal.x,
+        y: portal.y,
+        z,
+        z2: portal.z_rot.to_radians(),
     })
 }
 
-/// Move every online, living non-participant out of an active siege area. A teleport that is
-/// already pending is skipped: the server position only follows the client's acknowledgement,
-/// so re-sending would stack packets while the client loads.
+/// Move every online, living non-participant out of an active siege area, unless the
+/// `Housing.SiegeEvictNonParticipants` switch is off. GMs (`access_level >= 100`, the threshold
+/// of the closed-zone bypass) are never moved: they inspect the lodestone and the camps and run
+/// the siege tooling. A teleport that is already pending is skipped: the server position only
+/// follows the client's acknowledgement, so re-sending would stack packets while the client
+/// loads.
 ///
 /// `Character.ForceDismount` runs first (the same `PrefabChanged` call the move guard, the
 /// jail move and the GM teleport use), so a rider / driver / transfer passenger is not moved
-/// while attached to the mount or vehicle. Called once a second by the participant tick, and
+/// while attached to the mount or vehicle. Called once a second by the participant sweep, and
 /// by the tests.
 pub fn evict_non_participants(server: &GameServer) {
+    if !server.config.housing.siege_evict_non_participants {
+        return;
+    }
     let real_now = chrono::Utc::now().timestamp();
     let calendar_now = server.systems.housing.calendar.now();
+    let cache = &server.systems.housing.siege_areas;
+    let mut stuck = BTreeSet::new();
     for player in server.world.all_characters() {
-        let (online, dead, teleporting, transform) = {
+        let (online, dead, teleporting, gm, expedition, transform) = {
             let c = player.data();
             (
                 c.is_online,
                 c.unit.hp <= 0,
                 c.disabled_set_position,
+                c.access_level >= GM_ACCESS_LEVEL,
+                c.unit.expedition_id,
                 c.unit.transform,
             )
         };
-        if !online || dead || teleporting {
+        if !online || dead || teleporting || gm {
             continue;
         }
         let Some(zone) = server
@@ -287,7 +381,7 @@ pub fn evict_non_participants(server: &GameServer) {
         else {
             continue;
         };
-        let Some(area) = server.systems.housing.siege_areas.get(zone) else {
+        let Some(area) = cache.get(zone) else {
             continue;
         };
         if !area.active_at(real_now, calendar_now)
@@ -303,20 +397,25 @@ pub fn evict_non_participants(server: &GameServer) {
         if !area.inside(transform.instance_id, position.x, position.y) {
             continue;
         }
-        if server
-            .systems
-            .housing
-            .siege_areas
-            .is_participant(zone, player.character_id)
+        if cache
+            .participant_side(&area, player.character_id, expedition)
+            .is_some()
+            // The snapshot is up to a second old: a member who joined since must not be moved.
+            || is_participant_now(server, zone, player.character_id, expedition)
         {
             continue;
         }
         let Some(packet) = safe_destination(server, &player, &area, transform.instance_id) else {
-            tracing::warn!(
-                "Dominion {zone}: no safe point outside the siege area for '{}' ({}); not moved",
-                player.data().unit.name,
-                player.character_id
-            );
+            // Once per stuck character, not once per sweep: it would repeat every second for
+            // as long as they stay.
+            stuck.insert(player.character_id);
+            if cache.first_warning(player.character_id) {
+                tracing::warn!(
+                    "Dominion {zone}: no safe point outside the siege area for '{}' ({}); not moved",
+                    player.data().unit.name,
+                    player.character_id
+                );
+            }
             continue;
         };
         tracing::info!(
@@ -329,6 +428,10 @@ pub fn evict_non_participants(server: &GameServer) {
             &player,
             crate::systems::vehicles::slaves::attach_reason::PREFAB_CHANGED,
         );
-        session::send_teleport_unit(&player, packet);
+        // The client's own text for it (ui_texts 2505 "Not a siege participant"), through the
+        // channel every other client error uses.
+        send_error(&player, error_message::SIEGE_NOT_PARTICIPANT);
+        session::send_teleport_unit(server, &player, packet);
     }
+    cache.retain_warned(&stuck);
 }

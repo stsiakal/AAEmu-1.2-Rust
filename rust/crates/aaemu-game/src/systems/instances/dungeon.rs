@@ -1010,7 +1010,9 @@ fn destroy_dungeon_inner(server: &GameServer, dungeon: &Arc<Dungeon>) -> bool {
     }
     // Queued players never arrived: their charged ticket starts its restore window instead of
     // staying marked as an in-progress visit.
-    for p in dungeon.st().enter_requests.clone() {
+    // The guard of `st()` would live for the whole loop if it were the iterator expression.
+    let queued = dungeon.st().enter_requests.clone();
+    for p in queued {
         release_entry_ticket(server, dungeon, &p);
     }
     unregister_indun_events(server, dungeon, world.id);
@@ -1075,4 +1077,41 @@ pub fn area_clear_tick(server: &GameServer, dungeon: &Arc<Dungeon>) {
         }
         events.set_room_player_count(ev.id, world.id, count as u32);
     }
+}
+
+/// Registers a minimal live [`Dungeon`] for `world`: the runtime answer a spawner's one-run
+/// death freeze asks for (`Dungeon::is_system` / `indun_zone.client_driven`) without loading a
+/// full run. Tests only.
+#[cfg(test)]
+pub(crate) fn register_test_dungeon(
+    server: &GameServer,
+    world: &Arc<WorldInstance>,
+    is_system: bool,
+    client_driven: bool,
+) -> Arc<Dungeon> {
+    let dungeon = Arc::new(Dungeon {
+        uid: server.systems.instances.next_uid(),
+        indun_zone: IndunZone {
+            zone_group_id: 1,
+            client_driven,
+            ..IndunZone::default()
+        },
+        zone_instance_id: ZoneInstanceId {
+            zone_id: 0,
+            instance_id: world.id,
+        },
+        is_system,
+        create_time_ms: now_ms(),
+        operations: Mutex::new(()),
+        st: Mutex::new(DungeonState {
+            world_id: Some(world.id),
+            ..DungeonState::default()
+        }),
+    });
+    server
+        .systems
+        .instances
+        .dungeons
+        .insert(world.id, dungeon.clone());
+    dungeon
 }
