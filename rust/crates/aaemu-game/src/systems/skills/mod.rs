@@ -87,6 +87,8 @@ mod post_cast_tests;
 #[cfg(test)]
 mod quest_item_start_tests;
 #[cfg(test)]
+mod quest_item_use_flow_tests;
+#[cfg(test)]
 mod quest_machine_flow_tests;
 #[cfg(test)]
 mod reflect_tests;
