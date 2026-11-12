@@ -213,10 +213,12 @@ fn burnt_scripted_rows_are_placed_once() {
         !doodads.iter().any(|d| d.base.unit_id == 5723),
         "the Sharpwind Mines exit 5723 must not stand in Burnt Castle Armory"
     );
-    // Another lane owns the two Hieronimus's Secret Chests.
-    assert!(
-        !doodads.iter().any(|d| d.base.unit_id == 7659),
-        "7659 belongs to the quest-spawns lane"
+    // The two Hieronimus's Secret Chests come from the quest-spawns rows (quest_spawn_tests);
+    // this lane adds no third one.
+    assert_eq!(
+        doodads.iter().filter(|d| d.base.unit_id == 7659).count(),
+        2,
+        "7659 is placed only by the two quest-spawns rows"
     );
     // Summoned by the death / cutscene InteractionEffects (3499, 3657, 3602, 3611, 4416,
     // 4495, 4874); never a static placement.
