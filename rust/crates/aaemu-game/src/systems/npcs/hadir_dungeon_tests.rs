@@ -252,16 +252,21 @@ fn hadir_level_event_spawners_and_trigger_npcs_are_placed_once() {
             "trigger NPC {unit} of level spawner {level_spawner} at ({x}, {y}, {z})"
         );
     }
-    // Nothing plans the secret chest 7661 in this file (the quest lane owns it).
+    // The secret chest 7661 is a doodad (quest-spawns rows), never an NPC row.
     assert!(!defs.iter().any(|d| d.base.unit_id == 7661));
 }
 
 /// The 17 scripted doodads (5958 x15, 4143 x2) are placed exactly once at their level
-/// positions; the two farm exits keep their 1.2-era rows and the quest chest 7661 is absent.
+/// positions; the two farm exits keep their 1.2-era rows and the quest chest 7661 has only its
+/// two quest-spawns rows.
 #[test]
 fn hadir_scripted_doodads_are_placed_once() {
     let defs = doodad_defs();
-    assert_eq!(defs.len(), 19, "17 scripted + 2 kept exit rows");
+    assert_eq!(
+        defs.len(),
+        21,
+        "17 scripted + 2 kept exit rows + 2 quest-spawns chests"
+    );
 
     for (template, x, y, z) in SCRIPTED_DOODADS {
         let matches = defs
@@ -283,9 +288,10 @@ fn hadir_scripted_doodads_are_placed_once() {
         let placed = defs.iter().filter(|d| d.base.unit_id == template).count();
         assert_eq!(placed, count, "doodad {template} rows");
     }
-    assert!(
-        !defs.iter().any(|d| d.base.unit_id == 7661),
-        "the secret chest 7661 is quest-lane data"
+    assert_eq!(
+        defs.iter().filter(|d| d.base.unit_id == 7661).count(),
+        2,
+        "the secret chest 7661 is placed only by the two quest-spawns rows"
     );
 }
 
@@ -438,7 +444,10 @@ async fn real_compact_db_hadir_instance_loads_the_authored_spawns() {
     assert_eq!(stats.npc_spawners, 176);
     assert_eq!(stats.npc_event_only_spawners_skipped, 102);
     assert_eq!(stats.npc_cutscene_spawners_skipped, 0);
-    assert_eq!(stats.doodad_entries, 19, "17 scripted + 2 kept exit rows");
+    assert_eq!(
+        stats.doodad_entries, 21,
+        "17 scripted + 2 kept exit rows + 2 quest-spawns chests"
+    );
 
     let m = server.systems.npcs.spawns.get(INSTANCE_ID).unwrap();
     for (spawner, unit) in EVENT_SPAWNERS {
