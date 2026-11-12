@@ -1,9 +1,10 @@
 //! Hadir Farm (`instance_hadir_farm`, zone 241) dungeon conformance.
 //!
-//! The 1.2 compact data carries the whole level chain: the `SphereSkill` spheres 1284/1285/
+//! The 1.2 compact data carries the level chain: the `SphereSkill` spheres 1284/1285/
 //! 1298-1312/1331/1457/2246 cast their `sphere_skills` rows, the 13 `tags` rows select the
 //! invisible "Spawn Slave" / captive trigger NPCs, and the buff-trigger / command-set / NPC
-//! event skills name the level spawner ids. The shipped `npc_spawns.json` therefore needs the
+//! event skills name 74 of the 86 level spawner ids (the sphere 1298/1299 camps 60909-60911,
+//! 61146-61148 and 68235-68240 are 10.x-only effects; see `PORTING.md`). The shipped `npc_spawns.json` therefore needs the
 //! level's event rows (one per referenced spawner id, `NpcSpawnerIds`), the trigger NPCs whose
 //! level spawner is active at start as plain rows, and the scripted doodads of the golem and
 //! cauldron chains. The event rows are listed first in the file: the loader's duplicate filter
