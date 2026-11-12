@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 
 use crate::db_character::save_character;
 use crate::models::character::Character;
@@ -190,6 +190,96 @@ mod tests {
         );
     }
 
+    /// An account online across midnight keeps its pre-midnight seconds queued until the next
+    /// save. The daily claim resets `divine_clock_time` for the new day, so the flush must drop
+    /// them instead of adding them to the new total.
+    #[tokio::test]
+    async fn divine_clock_seconds_of_a_previous_day_are_dropped_at_flush() {
+        let s = test_server();
+        let today = Utc::now().date_naive();
+        let yesterday = today - chrono::Duration::days(1);
+        s.save.add_divine_clock_on(1, yesterday, 30);
+        // The only queued entry is stale: the flush has no statement to make, so no database is
+        // needed.
+        s.save.flush_divine_clock_on(&s, today).await;
+        assert_eq!(s.save.pending_divine_clock(), BTreeMap::new());
+    }
+
+    /// The reported sequence: the account is online across midnight, the daily claim resets its
+    /// clock, and the next save must not add the queued pre-midnight seconds to the new day.
+    #[tokio::test]
+    #[ignore = "requires private MySQL3317 via AAEMU_TEST_MYSQL; uses only temporary tables"]
+    async fn divine_clock_claim_drops_the_queued_previous_day() {
+        use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
+        use std::str::FromStr;
+
+        let Ok(url) = std::env::var("AAEMU_TEST_MYSQL") else {
+            return;
+        };
+        let options = MySqlConnectOptions::from_str(&url).expect("valid private MySQL URL");
+        assert_eq!(
+            options.get_port(),
+            3317,
+            "Only private MySQL3317 is allowed"
+        );
+        let pool = MySqlPoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("private MySQL");
+        sqlx::query(
+            "CREATE TEMPORARY TABLE accounts ( \
+             account_id INT NOT NULL PRIMARY KEY, credits INT NOT NULL DEFAULT 0, \
+             loyalty INT NOT NULL DEFAULT 0, last_daily_reward DATETIME NULL DEFAULT NULL, \
+             divine_clock_time INT UNSIGNED NOT NULL DEFAULT 0, \
+             divine_clock_taken INT UNSIGNED NOT NULL DEFAULT 0)",
+        )
+        .execute(&pool)
+        .await
+        .expect("temporary accounts table");
+        sqlx::query(
+            "INSERT INTO accounts (account_id, divine_clock_time, divine_clock_taken) \
+             VALUES (1, 120, 60)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let clock = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT CAST(divine_clock_time AS SIGNED) FROM accounts WHERE account_id = 1",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        let mut server = test_server();
+        server.db = pool.clone();
+        let today = Utc::now().date_naive();
+        let yesterday = today - chrono::Duration::days(1);
+        server.save.add_divine_clock_on(1, yesterday, 30);
+
+        // The midnight claim of the account that stayed online resets the clock.
+        assert!(
+            crate::db::claim_daily_reward(&pool, 1, today.and_hms_opt(0, 0, 0).unwrap(), 0, 0,)
+                .await
+                .is_some()
+        );
+        assert_eq!(clock().await, 0, "the claim zeroed the clock");
+
+        server.save.flush_divine_clock_on(&server, today).await;
+        assert_eq!(
+            clock().await,
+            0,
+            "seconds counted before the claim must not enter the new day"
+        );
+
+        // Seconds counted after the claim still flush.
+        server.save.add_divine_clock_on(1, today, 7);
+        server.save.flush_divine_clock_on(&server, today).await;
+        assert_eq!(clock().await, 7);
+        pool.close().await;
+    }
+
     #[tokio::test]
     async fn snapshot_saves_world_position_of_attached_character() {
         let s = test_server();
@@ -339,6 +429,66 @@ mod tests {
             .collect();
         assert_eq!(order, [(10, 11), (20, 10)]);
     }
+
+    /// A late `CSSaveUIDataPacket` requeues the departed character. If the next save captured
+    /// the old options and a second packet updated them while that save waited for the
+    /// database, committing the older snapshot must not drop the departure entry: the newer
+    /// value is only in the live character.
+    #[tokio::test]
+    async fn an_older_commit_keeps_a_departure_with_newer_ui_options() {
+        use crate::net::registry::ClientPacket;
+        use crate::systems::services::character_packets::CSSaveUIDataPacket;
+
+        let s = test_server();
+        let mut client = TestClient::new(&s, 1, 1);
+        let player = spawn_player(&s, &client, test_character(1, "Al", 10.0, 10.0), 0x100);
+        client.conn.active_char = Some(player.clone());
+        client.drain();
+        s.world.try_remove_character(player.obj_id);
+        let save = |data: &str| CSSaveUIDataPacket {
+            ui_data_type: 5,
+            id: 1,
+            data: data.into(),
+        };
+        save("old").handle(&s, &mut client.conn).await.unwrap();
+        assert!(s.save.pending_departure(1).is_some());
+
+        let snapshot = capture_financial_snapshot(&s);
+        let (_, captured) = snapshot
+            .characters
+            .iter()
+            .find(|(p, _)| p.character_id == 1)
+            .expect("the departed character is in the save");
+        assert_eq!(captured.get_option(5), "old");
+        let ack = CharacterSaveAck {
+            player: player.clone(),
+            updated: captured.updated,
+            removed: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+            money: (captured.money, captured.money2),
+            labor: captured.labor_power_unsaved,
+            learned_crafts: Vec::new(),
+            options: captured.options.clone(),
+        };
+
+        // The newer packet lands while the older snapshot is on its way to the database.
+        save("new").handle(&s, &mut client.conn).await.unwrap();
+        commit_character_save(&s, ack);
+        assert!(
+            s.save.pending_departure(1).is_some(),
+            "an older save must not clear the newer options from the departure set"
+        );
+        let next = capture_financial_snapshot(&s);
+        let (_, next) = next
+            .characters
+            .iter()
+            .find(|(p, _)| p.character_id == 1)
+            .expect("the departure stays in the next save");
+        assert_eq!(
+            next.get_option(5),
+            "new",
+            "the next save writes the newer value"
+        );
+    }
 }
 
 struct CharacterSaveAck {
@@ -351,6 +501,9 @@ struct CharacterSaveAck {
     labor: i32,
     /// The captured clone's learned crafts written by `save_character`.
     learned_crafts: Vec<u32>,
+    /// The captured clone's UI options. A late `CSSaveUIDataPacket` after the capture changes
+    /// the live map, and those newer options are not in this save.
+    options: BTreeMap<u16, String>,
 }
 
 pub(crate) struct FinancialSaveReceipt {
@@ -415,6 +568,7 @@ pub(crate) async fn write_financial_snapshot(
         let mut learned_crafts: Vec<u32> =
             character.learned_crafts_unsaved.iter().copied().collect();
         learned_crafts.sort_unstable();
+        let options = character.options.clone();
         if let Err(error) = save_character(tx, &mut character, Utc::now().timestamp()).await {
             tracing::error!(
                 "Failed to save character {} - {}: {error}",
@@ -430,6 +584,7 @@ pub(crate) async fn write_financial_snapshot(
             money: (character.money, character.money2),
             labor,
             learned_crafts,
+            options,
         });
     }
     systems += save_stage(server, tx, SaveStage::AfterCharacters).await?;
@@ -454,45 +609,54 @@ pub(crate) fn commit_financial_snapshot(server: &GameServer, receipt: FinancialS
         .schedule_items
         .commit_save(receipt.schedule_items);
     for ack in receipt.characters {
-        server
+        commit_character_save(server, ack);
+    }
+}
+
+/// Applies one committed character save. A departure entry is only dropped when the live
+/// character still matches the snapshot it wrote: money, labor and the UI options, which a late
+/// `CSSaveUIDataPacket` can update while the save waits for the database. Removing the entry
+/// then would lose the newer options from both the saved row and the pending departures.
+fn commit_character_save(server: &GameServer, ack: CharacterSaveAck) {
+    server
+        .save
+        .set_committed_money(ack.player.character_id, ack.money);
+    let mut live = ack.player.data();
+    let unchanged_money = (live.money, live.money2) == ack.money;
+    let options_unchanged = live.options == ack.options;
+    live.updated = ack.updated;
+    let [friends, blocked, skills, quests] = ack.removed;
+    live.removed_friends.retain(|id| !friends.contains(id));
+    live.removed_blocked.retain(|id| !blocked.contains(id));
+    live.skills.removed.retain(|id| !skills.contains(id));
+    live.quests.removed.retain(|id| !quests.contains(id));
+    let learned_crafts = ack.learned_crafts;
+    live.learned_crafts_unsaved
+        .retain(|id| !learned_crafts.contains(id));
+    // The saved snapshot flushed `ack.labor` into `accounts.labor`; whatever the live
+    // character spent since the capture stays pending for the next save.
+    live.labor_power_unsaved -= ack.labor;
+    let labor_pending = live.labor_power_unsaved != 0;
+    drop(live);
+    if unchanged_money && options_unchanged && !labor_pending {
+        let mut departing = server
             .save
-            .set_committed_money(ack.player.character_id, ack.money);
-        let mut live = ack.player.data();
-        let unchanged_money = (live.money, live.money2) == ack.money;
-        live.updated = ack.updated;
-        let [friends, blocked, skills, quests] = ack.removed;
-        live.removed_friends.retain(|id| !friends.contains(id));
-        live.removed_blocked.retain(|id| !blocked.contains(id));
-        live.skills.removed.retain(|id| !skills.contains(id));
-        live.quests.removed.retain(|id| !quests.contains(id));
-        let learned_crafts = ack.learned_crafts;
-        live.learned_crafts_unsaved
-            .retain(|id| !learned_crafts.contains(id));
-        // The saved snapshot flushed `ack.labor` into `accounts.labor`; whatever the live
-        // character spent since the capture stays pending for the next save.
-        live.labor_power_unsaved -= ack.labor;
-        let labor_pending = live.labor_power_unsaved != 0;
-        drop(live);
-        if unchanged_money && !labor_pending {
-            let mut departing = server
-                .save
-                .departing
-                .lock()
-                .expect("departure saves poisoned");
-            if departing
-                .get(&ack.player.character_id)
-                .is_some_and(|p| Arc::ptr_eq(p, &ack.player))
+            .departing
+            .lock()
+            .expect("departure saves poisoned");
+        if departing
+            .get(&ack.player.character_id)
+            .is_some_and(|p| Arc::ptr_eq(p, &ack.player))
+        {
+            departing.remove(&ack.player.character_id);
+            drop(departing);
+            server.save.forget_committed_money(ack.player.character_id);
+            if server
+                .world
+                .character_by_obj_id(ack.player.obj_id)
+                .is_some_and(|p| Arc::ptr_eq(&p, &ack.player))
             {
-                departing.remove(&ack.player.character_id);
-                drop(departing);
-                server.save.forget_committed_money(ack.player.character_id);
-                if server
-                    .world
-                    .character_by_obj_id(ack.player.obj_id)
-                    .is_some_and(|p| Arc::ptr_eq(&p, &ack.player))
-                {
-                    server.world.try_remove_character(ack.player.obj_id);
-                }
+                server.world.try_remove_character(ack.player.obj_id);
             }
         }
     }
@@ -511,11 +675,14 @@ pub struct SaveManager {
     /// `(money, money2)` last committed to (or loaded from) the database per online character.
     /// A character without an entry counts as financially dirty. Never held with a data lock.
     committed_money: Mutex<HashMap<u32, (i64, i64)>>,
-    /// Online-tracking seconds not yet committed to `accounts.divine_clock_time`, per account.
-    /// The 5 s tracking task queues them and the next financial save writes them after its
-    /// commit: as a separate 5 s statement the clock update waited on the account rows the
-    /// save's transaction held (1-2.5 s on the 2026-11-11 cloud run).
-    pending_divine_clock: Mutex<BTreeMap<u32, u32>>,
+    /// Online-tracking seconds not yet committed to `accounts.divine_clock_time`, per account,
+    /// tagged with the UTC day they were counted in. The 5 s tracking task queues them and the
+    /// next financial save writes them after its commit: as a separate 5 s statement the clock
+    /// update waited on the account rows the save's transaction held (1-2.5 s on the 2026-11-11
+    /// cloud run). Seconds of a day the account no longer plays in are dropped: the daily claim
+    /// resets `divine_clock_time` to zero, so a pre-midnight backlog must not enter the new day's
+    /// total.
+    pending_divine_clock: Mutex<BTreeMap<u32, (NaiveDate, u32)>>,
 }
 
 /// Account ids per `UPDATE ... IN (...)` statement of the divine-clock flush.
@@ -524,6 +691,12 @@ const CLOCK_UPDATE_CHUNK: usize = 500;
 impl SaveManager {
     /// Queues online-tracking seconds for an account; the next financial save writes them.
     pub(crate) fn add_divine_clock(&self, account_id: u32, delta: u32) {
+        self.queue_divine_clock(account_id, Utc::now().date_naive(), delta);
+    }
+
+    /// Queues seconds counted on `day`. A new day starts a new total: an older day's backlog is
+    /// dropped, because `claim_daily_reward` reset the account's clock when the day changed.
+    fn queue_divine_clock(&self, account_id: u32, day: NaiveDate, delta: u32) {
         if delta == 0 {
             return;
         }
@@ -531,8 +704,17 @@ impl SaveManager {
             .pending_divine_clock
             .lock()
             .expect("divine clock poisoned");
-        let total = pending.entry(account_id).or_insert(0);
-        *total = total.saturating_add(delta);
+        let total = pending.entry(account_id).or_insert((day, 0));
+        if total.0 != day {
+            *total = (day, 0);
+        }
+        total.1 = total.1.saturating_add(delta);
+    }
+
+    /// Test hook: queue seconds with an explicit day.
+    #[cfg(test)]
+    pub(crate) fn add_divine_clock_on(&self, account_id: u32, day: NaiveDate, delta: u32) {
+        self.queue_divine_clock(account_id, day, delta);
     }
 
     /// Pending per-account seconds (tests).
@@ -541,16 +723,25 @@ impl SaveManager {
         self.pending_divine_clock
             .lock()
             .expect("divine clock poisoned")
-            .clone()
+            .iter()
+            .map(|(account, (_, delta))| (*account, *delta))
+            .collect()
     }
 
     /// Writes the queued divine-clock seconds, one statement per distinct delta (accounts with
     /// the same number of seconds share it). Called after a save committed while the caller
     /// still holds the save transaction lock: the committed save no longer holds the account
-    /// rows, so no statement waits for its commit. A failed statement puts its accounts back
-    /// for the next save.
+    /// rows, so no statement waits for its commit. Seconds of an earlier day are dropped (the
+    /// daily claim reset the clock); a failed statement puts its accounts back for the next
+    /// save, keeping the day they were counted in.
     async fn flush_divine_clock(&self, server: &GameServer) {
-        let pending: BTreeMap<u32, u32> = std::mem::take(
+        self.flush_divine_clock_on(server, Utc::now().date_naive())
+            .await;
+    }
+
+    /// [`flush_divine_clock`] for an explicit UTC day (tests pin it).
+    async fn flush_divine_clock_on(&self, server: &GameServer, today: NaiveDate) {
+        let pending: BTreeMap<u32, (NaiveDate, u32)> = std::mem::take(
             &mut *self
                 .pending_divine_clock
                 .lock()
@@ -559,19 +750,20 @@ impl SaveManager {
         if pending.is_empty() {
             return;
         }
-        let mut groups: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-        for (account, delta) in pending {
-            if delta != 0 {
-                groups.entry(delta).or_default().push(account);
+        let mut groups: BTreeMap<u32, Vec<(u32, NaiveDate)>> = BTreeMap::new();
+        for (account, (day, delta)) in pending {
+            if delta != 0 && day == today {
+                groups.entry(delta).or_default().push((account, day));
             }
         }
-        for (delta, ids) in groups {
-            for chunk in ids.chunks(CLOCK_UPDATE_CHUNK) {
-                if !crate::systems::services::accounts::add_divine_clock_time(server, chunk, delta)
+        for (delta, accounts) in groups {
+            for chunk in accounts.chunks(CLOCK_UPDATE_CHUNK) {
+                let ids: Vec<u32> = chunk.iter().map(|(account, _)| *account).collect();
+                if !crate::systems::services::accounts::add_divine_clock_time(server, &ids, delta)
                     .await
                 {
-                    for &id in chunk {
-                        self.add_divine_clock(id, delta);
+                    for &(id, day) in chunk {
+                        self.queue_divine_clock(id, day, delta);
                     }
                 }
             }
